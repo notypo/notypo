@@ -10,10 +10,13 @@ compare.py.
     cargo build --release
     cargo bench --bench engine            # in-process stages
     python3 benchmarks/structured.py      # writes benchmarks/structured-results.md
+    python3 benchmarks/structured.py --shell-fixtures --case shell \
+        --output benchmarks/shell-results.md
 """
 
 import argparse
 import json
+import math
 import os
 import shutil
 import statistics
@@ -55,7 +58,7 @@ def run(command, env):
 
 def summarize(times):
     times = sorted(times)
-    p95 = times[min(len(times) - 1, max(0, round(len(times) * 0.95) - 1))]
+    p95 = times[math.ceil(len(times) * 0.95) - 1]
     return statistics.median(times) * 1000, p95 * 1000
 
 
@@ -72,18 +75,81 @@ def environment(cache):
     return env
 
 
+def shell_fixtures(scratch):
+    """Installed native shell handlers; no app startup or cloud writes."""
+    app = "notypo-shell-fixture"
+    root = scratch / "shell-fixtures"
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True)
+    marker = root / "operation-marker"
+    executable = bin_dir / app
+    executable.write_text("#!/bin/sh\nprintf ran > \"$NOTYPO_BENCH_MARKER\"\nexit 99\n")
+    executable.chmod(0o755)
+    source = f"{app} nodes lsit --foramt jsno"
+    expected = f"{app} nodes list --format json"
+    cases = []
+    for shell in ("fish", "zsh"):
+        if shutil.which(shell) is None:
+            print(f"skip {shell} shell handler: {shell} is not installed")
+            continue
+        completions = root / shell
+        completions.mkdir()
+        if shell == "fish":
+            (completions / f"{app}.fish").write_text(f"""complete -c {app} -f
+complete -c {app} -n 'not __fish_seen_subcommand_from nodes' -a nodes
+complete -c {app} -n '__fish_seen_subcommand_from nodes; and not __fish_seen_subcommand_from list' -a list
+complete -c {app} -n '__fish_seen_subcommand_from list' -l format -x -a 'json yaml'
+""")
+            path_key = "NOTYPO_FISH_COMPLETE_PATH"
+        else:
+            (completions / f"_{app}").write_text(f"""#compdef {app}
+case ${{(Q)words[2]}} in
+  '') compadd -- nodes;;
+  nodes)
+    case ${{(Q)words[3]}} in
+      '') compadd -- list;;
+      list) _arguments '1:group:(nodes)' '2:command:(list)' '--format[Format]:format:(json yaml)' '*:argument:';;
+    esac;;
+esac
+""")
+            path_key = "NOTYPO_ZSH_FPATH"
+        overrides = {
+            "TF_SHELL": shell,
+            "PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", os.defpath),
+            path_key: str(completions),
+            "NOTYPO_TRUSTED_COMPLETERS": app,
+            "NOTYPO_DISABLED_SOURCES": "help:man:history:legacy",
+            "NOTYPO_BENCH_MARKER": str(marker),
+            "XDG_CONFIG_HOME": str(root / "config"),
+            "XDG_DATA_HOME": str(root / "data"),
+        }
+        cases.append((f"{shell} shell handler", shell, source, overrides, expected))
+    return cases, marker
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--output", default=str(ROOT / "benchmarks" / "structured-results.md"))
+    parser.add_argument("--shell-fixtures", action="store_true", help="include isolated fish/Zsh handlers")
+    parser.add_argument("--case", help="only run labels containing this text")
     options = parser.parse_args()
+    if options.samples < 1:
+        parser.error("--samples must be positive")
     if not BINARY.exists():
         sys.exit("build first: cargo build --release")
 
     rows = []
     with tempfile.TemporaryDirectory(prefix="notypo-bench-") as scratch:
         scratch = Path(scratch)
-        for label, app, command in CASES:
+        cases = [(label, app, command, {}, None) for label, app, command in CASES]
+        marker = None
+        if options.shell_fixtures:
+            fixtures, marker = shell_fixtures(scratch)
+            cases.extend(fixtures)
+        for label, app, command, overrides, expected in cases:
+            if options.case and options.case not in label:
+                continue
             if shutil.which(app) is None:
                 print(f"skip {label}: {app} is not installed")
                 continue
@@ -93,16 +159,20 @@ def main():
             for n in range(options.samples):
                 cache = scratch / f"cold-{label}-{n}"
                 cache.mkdir()
-                elapsed, peak, report = run(command, environment(cache))
+                elapsed, peak, report = run(command, environment(cache) | overrides)
                 cold.append(elapsed)
                 rss.append(peak)
                 probes_cold = report["probes"]
                 suggestion = (report["candidates"] or [{}])[0].get("command")
+                if expected and suggestion != expected:
+                    sys.exit(f"{label}: expected {expected!r}, got {suggestion!r}")
             cache = scratch / f"warm-{label}"
             cache.mkdir()
-            run(command, environment(cache))
+            run(command, environment(cache) | overrides)
             for _ in range(options.samples):
-                elapsed, peak, report = run(command, environment(cache))
+                elapsed, peak, report = run(command, environment(cache) | overrides)
+                if expected and report["candidates"][0]["command"] != expected:
+                    sys.exit(f"{label}: warm correction changed")
                 warm.append(elapsed)
                 rss.append(peak)
                 probes_warm = report["probes"]
@@ -117,14 +187,18 @@ def main():
             }
             rows.append(row)
             print(json.dumps(row))
+        if marker is not None and marker.exists():
+            sys.exit("the shell fixture operation was executed")
 
+    fixture_only = bool(rows) and all(r["case"].endswith(" shell handler") for r in rows)
     lines = [
+        "# Correction benchmark with installed shell handlers" if fixture_only else
         "# Correction benchmark against installed CLIs",
         "",
         f"{options.samples} processes per mode; times in ms (median / p95). Cold runs",
         "start with an empty cache directory; warm runs reuse one. Probes are",
-        "completer subprocesses (cold / warm). Peak RSS is the largest process in",
-        "the tree, which for cloud CLIs is the app's own completer. In-process",
+        "completer subprocesses (cold / warm). RSS uses the process usage returned",
+        "by wait4; child accounting depends on the OS. In-process",
         "stage timings: `cargo bench --bench engine`.",
         "",
         "| Case | Correction | Cold | Warm | Probes | Peak RSS |",
@@ -137,6 +211,18 @@ def main():
                 *r["probes"], r["rss_kib"] / 1024,
             )
         )
+    if fixture_only:
+        lines.extend([
+            "",
+            "Isolated fixture apps use the installed shells' real native completion",
+            "handlers. Each correction fixes a nested command, option, and enum value.",
+            "The harness checks every result and an operation marker; suggestions are",
+            "never executed. This measures shell-handler overhead, not a cloud CLI.",
+            "",
+            "Handwritten handlers provide partial evidence and use request-local memoization.",
+            "Warm runs reuse the cache directory but repeat their native probes.",
+            "Zsh's completion-system initialization dominates its elapsed time.",
+        ])
     Path(options.output).write_text("\n".join(lines) + "\n")
     print(f"wrote {options.output}")
 

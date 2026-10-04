@@ -56,6 +56,7 @@ pub fn main(argv: &[String]) -> ExitCode {
     } else if args.force_command.is_some()
         || !args.command.is_empty()
         || env::var_os("TF_HISTORY").is_some()
+        || env::var_os("NOTYPO_CURRENT_COMMAND").is_some()
     {
         return fix_command(&args);
     } else if let Some(path) = &args.shell_logger {
@@ -125,6 +126,21 @@ fn print_alias(args: &Args, alias: &str) {
 fn raw_command(args: &Args, ctx: &Context) -> (Vec<String>, bool) {
     if let Some(command) = &args.force_command {
         return (vec![command.clone()], false);
+    }
+    if ctx.shell == Shell::Fish
+        && let Ok(current) = env::var("NOTYPO_CURRENT_COMMAND")
+        && !current.trim().is_empty()
+    {
+        return (vec![current], true);
+    }
+    // tcsh's alias exports the previous event (and its status) for the
+    // duration of the call; a command given explicitly still wins.
+    if ctx.shell == Shell::Tcsh
+        && args.command.is_empty()
+        && let Ok(current) = env::var("NOTYPO_CURRENT_COMMAND")
+        && !current.trim().is_empty()
+    {
+        return (vec![current], true);
     }
     // Zsh's `fc -ln -10` omits a multiline paste while it is executing.
     // The shell function supplies that event separately, with real newlines.
@@ -225,8 +241,12 @@ fn fix_with_engine(
         None => CapturedOutput::Unknown,
     };
     let inspecting = args.explain || args.json;
-    if output == CapturedOutput::Unknown && ctx.settings.replay_for_diagnosis && !inspecting {
-        let gate = safety::assess_replay(expanded);
+    if output == CapturedOutput::Unknown
+        && ctx.settings.replay_for_diagnosis
+        && !inspecting
+        && let Some(dialect) = engine::parser::Dialect::for_shell(ctx.shell)
+    {
+        let gate = safety::assess_replay_with_dialect(expanded, dialect);
         if gate.decision == Decision::Allow {
             if let Some(text) = output_readers::get_output(script, expanded, &ctx.settings) {
                 output = CapturedOutput::Combined {
@@ -265,6 +285,10 @@ fn fix_with_engine(
         eprint!("{}", explain(&failure, &report));
         return ExitCode::SUCCESS;
     }
+    if engine::parser::Dialect::for_shell(ctx.shell).is_none() {
+        logs::failed(&report.outcome.describe());
+        return ExitCode::FAILURE;
+    }
     let command = Command::new(expanded, failure.output.diagnostic_text(), ctx);
     let mut suggestions = EngineSuggestions::new(&report, &command);
     match ui::select_command(
@@ -272,7 +296,7 @@ fn fix_with_engine(
         ctx.settings.require_confirmation,
         &ctx.alias,
     ) {
-        Some(selected) => match revalidate(ctx, &report, &selected) {
+        Some(selected) => match revalidate(ctx, &failure, &report, &selected) {
             Ok(()) => {
                 run_corrected(&command, &selected);
                 ExitCode::SUCCESS
@@ -286,35 +310,24 @@ fn fix_with_engine(
     }
 }
 
-/// Rechecks, right before the shell runs it, that the programs a selected
-/// engine correction introduced still resolve. This narrows (but can't
-/// close) the window between discovery and execution.
-fn revalidate(ctx: &Context, report: &Report, selected: &Choice) -> Result<(), String> {
-    let Some(candidate) = report
+/// Rechecks a selected engine correction right before the shell runs it
+/// (see [`engine::revalidate`]). Legacy rule suggestions carry no facts to
+/// recheck; their effects were declared to the safety gate instead.
+fn revalidate(
+    ctx: &Context,
+    failure: &FailureContext,
+    report: &Report,
+    selected: &Choice,
+) -> Result<(), String> {
+    match report
         .outcome
         .candidates()
         .iter()
         .find(|c| c.script == selected.script)
-    else {
-        return Ok(());
-    };
-    for edit in &candidate.edits {
-        if edit.role != engine::TokenRole::Executable
-            || ctx.shell.get_builtin_commands().contains(&edit.to.as_str())
-            || ctx.shell.get_aliases().contains_key(&edit.to)
-            || ctx.shell.get_functions().contains(&edit.to)
-        {
-            continue;
-        }
-        // `which` is memoized for the run; stat the file it found again.
-        if !ctx
-            .which(&edit.to)
-            .is_some_and(|path| utils::is_executable_file(&path))
-        {
-            return Err(format!("{} is no longer installed", edit.to));
-        }
+    {
+        Some(candidate) => engine::revalidate(candidate, failure, ctx),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Engine candidates and legacy rule suggestions, each with the reason it
@@ -377,7 +390,10 @@ impl<'c, 'a> EngineSuggestions<'c, 'a> {
             legacy_first: None,
             legacy_done: false,
             pending: Vec::new(),
-            original: engine::parser::parse(&command.script),
+            original: engine::parser::parse_with_dialect(
+                &command.script,
+                engine::parser::Dialect::for_shell(command.shell()).unwrap_or_default(),
+            ),
         }
     }
 
@@ -550,6 +566,9 @@ fn explain(failure: &FailureContext, report: &Report) -> String {
                 edit.score.distance,
                 edit.score.hint
             );
+            if let Some(description) = &edit.description {
+                let _ = writeln!(out, "      `{}`: {description}", edit.to);
+            }
         }
         for evidence in &candidate.evidence {
             let _ = writeln!(
@@ -609,6 +628,7 @@ fn report_json(failure: &FailureContext, report: &Report) -> serde_json::Value {
                 "from": e.from,
                 "to": e.to,
                 "via": e.via,
+                "description": e.description,
                 "start": e.span.start,
                 "end": e.span.end,
                 "similarity": e.score.similarity,

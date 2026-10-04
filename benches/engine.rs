@@ -4,10 +4,10 @@
 //! Driven by `benchmarks/structured.py`; prints one JSON line per stage.
 
 use notypo::engine::native::{
-    Capabilities, CompletionError, CompletionItem, NativeCompletionBackend,
+    Capabilities, CompletionError, CompletionItem, NativeCompletionBackend, Trust,
 };
 use notypo::engine::probe::Budget;
-use notypo::engine::{self, FailureContext, diagnosis, parser, ranking};
+use notypo::engine::{self, FailureContext, diagnosis, docs, parser, ranking};
 use notypo::settings::Settings;
 use notypo::shells::Shell;
 use notypo::types::Context;
@@ -38,6 +38,10 @@ impl NativeCompletionBackend for Tree {
             option_prefix: "--",
             short_options: false,
             complete_options: true,
+            complete_subcommands: true,
+            descriptions: false,
+            query_dialect: None,
+            trust: Trust::Bridge,
         }
     }
 
@@ -56,6 +60,7 @@ impl NativeCompletionBackend for Tree {
             .map(|w| CompletionItem {
                 value: w.clone(),
                 takes_value: None,
+                description: None,
             })
             .collect())
     }
@@ -125,9 +130,28 @@ fn main() {
     measure("parse", iterations, samples, || {
         black_box(parser::parse(black_box(line)));
     });
+    let fish_line = "AWS_PAGER='' aws --region eu-west-1 ec2 describ-instances --filters 'Name=x,Values=y' 2>| cat >? 'out\\'s.json'; and echo '[literal]' # list";
+    measure("parse fish", iterations, samples, || {
+        black_box(parser::parse_with_dialect(
+            black_box(fish_line),
+            parser::Dialect::Fish,
+        ));
+    });
+    measure("quote fish", iterations, samples, || {
+        black_box(parser::quote_word_with_dialect(
+            black_box("it's a \\ path; (literal)"),
+            parser::Dialect::Fish,
+        ));
+    });
     let output = "aws: [ERROR]: argument operation: Found invalid choice 'describ-instances'\n\nusage: aws [options] <command> <subcommand> [<subcommand> ...] [parameters]\nTo see help text, you can run:\n\n  aws help\n";
     measure("diagnose output", iterations, samples, || {
         black_box(diagnosis::diagnose_output(black_box(output)));
+    });
+    let help = "Usage: tool nodes [COMMAND] [OPTIONS]\n\nCommands:\n  list    List nodes\n  show    Show a node\n\nOptions:\n  -p, --profile <PROFILE>  Select profile\n  -o, --output <FORMAT>  Output [possible values: json, yaml, text]\n  --region <REGION>  Select region\n  --verbose         Talk\n";
+    measure("read help vocabulary", iterations, samples, || {
+        black_box(docs::options(black_box(help)));
+        black_box(docs::subcommands(black_box(help)));
+        black_box(docs::option_values(black_box(help), "--output"));
     });
     let none = |_: &str| 0;
     measure(

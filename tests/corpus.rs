@@ -1,11 +1,12 @@
 //! A labeled correction corpus for the structured engine.
 //!
 //! Real command vocabularies, captured once from installed aws, gcloud,
-//! az, git, kubectl, docker, and helm (`data/corpus/vocabulary.txt`), plus
-//! the system's `/bin` and `/usr/bin` names (`executables.txt`), are
-//! served by in-memory completers. Deterministic typos (deletion,
-//! insertion, substitution, transposition) of sampled words become
-//! failed commands whose intended correction is known.
+//! az, git, kubectl, docker, and helm (`data/corpus/vocabulary.txt`), long
+//! option names of fifteen of their commands (`options.txt`, from their own
+//! offline completion), plus the system's `/bin` and `/usr/bin` names
+//! (`executables.txt`), are served by in-memory completers. Deterministic
+//! typos (deletion, insertion, substitution, transposition) of sampled
+//! words become failed commands whose intended correction is known.
 //!
 //! The test reports top-1/top-3 accuracy, how often the engine decides
 //! alone, asks, or abstains, and how often a decision alone would run the
@@ -14,7 +15,7 @@
 //! Run with `--nocapture` to see the report.
 
 use notypo::engine::native::{
-    Capabilities, CompletionError, CompletionItem, NativeCompletionBackend,
+    Capabilities, CompletionError, CompletionItem, NativeCompletionBackend, Trust,
 };
 use notypo::engine::probe::Budget;
 use notypo::engine::{self, FailureContext, Outcome, ranking};
@@ -25,6 +26,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 const VOCABULARY: &str = include_str!("data/corpus/vocabulary.txt");
+const OPTIONS: &str = include_str!("data/corpus/options.txt");
 const EXECUTABLES: &str = include_str!("data/corpus/executables.txt");
 
 /// Answers completion from a captured vocabulary: words keyed by the
@@ -43,13 +45,17 @@ impl NativeCompletionBackend for Tree {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             subcommands: true,
-            options: false,
+            options: true,
             option_arity: false,
             values: false,
             resources: false,
             option_prefix: "--",
             short_options: false,
             complete_options: true,
+            complete_subcommands: true,
+            descriptions: false,
+            query_dialect: None,
+            trust: Trust::Bridge,
         }
     }
 
@@ -69,6 +75,7 @@ impl NativeCompletionBackend for Tree {
             .map(|w| CompletionItem {
                 value: w.clone(),
                 takes_value: None,
+                description: None,
             })
             .collect())
     }
@@ -129,7 +136,8 @@ fn cases(trees: &HashMap<String, Tree>, executables: &[&str]) -> Vec<Case> {
         .collect();
     groups.sort();
     for (app, context, words) in groups {
-        let valid: HashSet<&str> = words.iter().map(String::as_str).collect();
+        let words: Vec<&String> = words.iter().filter(|w| !w.starts_with('-')).collect();
+        let valid: HashSet<&str> = words.iter().map(|w| w.as_str()).collect();
         // About a tenth of each level, at least three words.
         let step = (words.len() / 10).max(1);
         for word in words.iter().step_by(step).take(30) {
@@ -153,7 +161,7 @@ fn cases(trees: &HashMap<String, Tree>, executables: &[&str]) -> Vec<Case> {
             });
             // Two edits in one longer word.
             let twice = typo(&typo(word, &mut rng), &mut rng);
-            if word.chars().count() >= 7 && !valid.contains(twice.as_str()) && twice != *word {
+            if word.chars().count() >= 7 && !valid.contains(twice.as_str()) && twice != **word {
                 cases.push(Case {
                     tier: "two edits",
                     command: format!("{prefix} {twice}"),
@@ -217,6 +225,37 @@ fn cases(trees: &HashMap<String, Tree>, executables: &[&str]) -> Vec<Case> {
             status: 127,
         });
     }
+    // A typo in a long option's name: `kubectl get --namspace`.
+    let mut levels: Vec<(&String, &String, Vec<&String>)> = trees
+        .iter()
+        .flat_map(|(app, tree)| {
+            tree.levels.iter().map(move |(context, words)| {
+                let options = words.iter().filter(|w| w.starts_with("--")).collect();
+                (app, context, options)
+            })
+        })
+        .filter(|(_, _, options): &(_, _, Vec<_>)| !options.is_empty())
+        .collect();
+    levels.sort();
+    for (app, context, options) in levels {
+        let valid: HashSet<&str> = options.iter().map(|w| w.as_str()).collect();
+        for option in options.iter().step_by((options.len() / 10).max(1)).take(30) {
+            let name = &option[2..];
+            if name.chars().count() < 3 {
+                continue;
+            }
+            let typed = format!("--{}", typo(name, &mut rng));
+            if valid.contains(typed.as_str()) {
+                continue;
+            }
+            cases.push(Case {
+                tier: "option",
+                command: format!("{app} {context} {typed}"),
+                expected: format!("{app} {context} {option}"),
+                status: 1,
+            });
+        }
+    }
     cases
 }
 
@@ -240,7 +279,7 @@ impl Tally {
 #[test]
 fn labeled_corpus_accuracy_and_threshold_calibration() {
     let mut trees: HashMap<String, Tree> = HashMap::new();
-    for line in VOCABULARY.lines() {
+    for line in VOCABULARY.lines().chain(OPTIONS.lines()) {
         let mut fields = line.splitn(3, '|');
         let (Some(app), Some(context), Some(word)) = (fields.next(), fields.next(), fields.next())
         else {

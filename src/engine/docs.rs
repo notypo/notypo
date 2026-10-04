@@ -4,6 +4,36 @@
 
 use super::native::CompletionItem;
 
+fn option_declaration(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    (line.len() > trimmed.len() && trimmed.starts_with('-')).then(|| {
+        regex!(r"(?: {2,}|\t+)")
+            .split(trimmed)
+            .next()
+            .unwrap_or(trimmed)
+    })
+}
+
+/// Separate aliases without splitting commas/pipes inside value placeholders.
+fn aliases(head: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in head.char_indices() {
+        match c {
+            '[' | '{' | '<' => depth += 1,
+            ']' | '}' | '>' => depth = depth.saturating_sub(1),
+            ',' | '|' if depth == 0 => {
+                parts.push(head[start..i].trim());
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(head[start..].trim());
+    parts
+}
+
 /// Removes terminal overstrike formatting (`X\bX` bold, `_\bX` underline).
 pub fn strip_overstrike(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -50,24 +80,27 @@ pub fn options(text: &str) -> Vec<CompletionItem> {
             None => items.push(CompletionItem {
                 value: name.to_owned(),
                 takes_value,
+                description: None,
             }),
         }
     };
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        if line.len() > trimmed.len() && trimmed.starts_with('-') {
+        if let Some(head) = option_declaration(line) {
             // `-l, --long=VALUE   Description` or `-D format`.
-            let head = trimmed.split("  ").next().unwrap_or(trimmed);
-            for part in head.split([',', '|']) {
-                let part = part.trim();
-                let (name, rest) = part.split_once([' ', '=', '[']).unwrap_or((part, ""));
-                let takes_value = if part.contains('[') {
-                    Some(false)
-                } else if part.contains('=') || !rest.trim().is_empty() {
-                    Some(true)
-                } else {
-                    Some(false)
-                };
+            let declarations: Vec<_> = aliases(head)
+                .into_iter()
+                .map(|part| {
+                    let (name, rest) = part.split_once([' ', '=', '[']).unwrap_or((part, ""));
+                    (
+                        name,
+                        !part[name.len()..].trim_start().starts_with('[')
+                            && (part.contains('=') || !rest.trim().is_empty()),
+                    )
+                })
+                .collect();
+            // A placeholder on the long spelling applies to its short alias.
+            let takes_value = Some(declarations.iter().any(|(_, valued)| *valued));
+            for (name, _) in declarations {
                 add(name, takes_value);
             }
         }
@@ -78,6 +111,61 @@ pub fn options(text: &str) -> Vec<CompletionItem> {
         }
     }
     items
+}
+
+/// Finite option choices explicitly documented as `{json,yaml}` or
+/// `[possible values: json, yaml]` / `[choices: json, yaml]`. Descriptive
+/// prose and arbitrary placeholders are not a vocabulary of values.
+pub fn option_values(text: &str, option: &str) -> Vec<CompletionItem> {
+    let choices = regex!(r"(?i)\[(?:possible values|choices):\s*([^\[\]]+)\]");
+    let braces = regex!(r"\{([^{}]+)\}");
+    let mut active_indent = None;
+    let mut values = Vec::new();
+    for line in text.lines() {
+        let declaration = option_declaration(line);
+        if let Some(head) = declaration {
+            active_indent = aliases(head)
+                .iter()
+                .any(|part| part.split([' ', '=', '[']).next() == Some(option))
+                .then_some(line.len() - line.trim_start().len());
+        } else if line.trim().is_empty()
+            || active_indent.is_some_and(|indent| line.len() - line.trim_start().len() <= indent)
+        {
+            active_indent = None;
+        }
+        if active_indent.is_none() {
+            continue;
+        }
+        let list = choices.captures(line).map(|c| c[1].to_owned()).or_else(|| {
+            declaration.and_then(|head| braces.captures(head).map(|c| c[1].to_owned()))
+        });
+        let Some(list) = list else { continue };
+        let words: Vec<_> = list.split([',', '|']).map(str::trim).collect();
+        // Broken or shell-shaped metadata must not introduce executable text.
+        if words.is_empty()
+            || words.iter().any(|w| {
+                w.is_empty()
+                    || !w
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || "-_.:@%+/".contains(c))
+            })
+        {
+            continue;
+        }
+        for word in words {
+            if !values
+                .iter()
+                .any(|item: &CompletionItem| item.value == word)
+            {
+                values.push(CompletionItem {
+                    value: word.to_owned(),
+                    takes_value: None,
+                    description: None,
+                });
+            }
+        }
+    }
+    values
 }
 
 /// Subcommands listed under a `Commands:` style heading in help output.
@@ -109,6 +197,7 @@ pub fn subcommands(help: &str) -> Vec<CompletionItem> {
             items.push(CompletionItem {
                 value: caps[1].to_owned(),
                 takes_value: None,
+                description: None,
             });
         }
     }
@@ -161,5 +250,74 @@ mod tests {
         assert_eq!(names(&subcommands(help)), ["build", "check", "test"]);
         let cobra = "Available Commands:\n  completion  Generate completion\n  get         Display resources\n\nFlags:\n  -h, --help   help\n";
         assert_eq!(names(&subcommands(cobra)), ["completion", "get"]);
+    }
+
+    #[test]
+    fn option_aliases_share_the_documented_value_relationship() {
+        let items = options("  -o, --output <FORMAT>\tOutput format\n  -v, --verbose\tTalk\n");
+        assert_eq!(names(&items), ["-o", "--output", "-v", "--verbose"]);
+        assert_eq!(
+            items.iter().map(|i| i.takes_value).collect::<Vec<_>>(),
+            [Some(true), Some(true), Some(false), Some(false)]
+        );
+    }
+
+    #[test]
+    fn reads_only_explicit_choices_for_the_requested_option() {
+        let help = "Options:\n  -o, --output <FORMAT>  Output\n                        [possible values: json, yaml]\n  --color {auto,always,never}  Color\n  --mode <MODE>  Mode [choices: local, remote]\n  --path <PATH>  A path such as local or remote\n";
+        assert_eq!(names(&option_values(help, "--output")), ["json", "yaml"]);
+        assert_eq!(names(&option_values(help, "-o")), ["json", "yaml"]);
+        assert_eq!(
+            names(&option_values(help, "--color")),
+            ["auto", "always", "never"]
+        );
+        assert_eq!(names(&option_values(help, "--mode")), ["local", "remote"]);
+        assert!(option_values(help, "--path").is_empty());
+        assert!(option_values(help, "--absent").is_empty());
+    }
+
+    #[test]
+    fn ignores_malformed_or_shell_shaped_help_choices() {
+        for list in [
+            "json,",
+            "json;touch marker",
+            "$(touch marker)",
+            "json, `id`",
+            "json, \u{1b}[31myaml",
+        ] {
+            assert!(
+                option_values(
+                    &format!("  --output <FORMAT>  [possible values: {list}]\n"),
+                    "--output"
+                )
+                .is_empty(),
+                "{list}"
+            );
+        }
+    }
+
+    #[test]
+    fn choice_lists_do_not_define_aliases_or_belong_to_options_mentioned_in_prose() {
+        let help = "  -m, --mode {fast,--other,slow}  Mode [possible values: fast, slow]\n  --optional[=one,two words]  Optional\n  --path <PATH>  Unlike --mode [possible values: local, remote]\n";
+        let items = options(help);
+        assert!(
+            !names(&items).contains(&"--other"),
+            "an enum word is not an option"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .find(|i| i.value == "--optional")
+                .unwrap()
+                .takes_value,
+            Some(false)
+        );
+        assert_eq!(names(&option_values(help, "--mode")), ["fast", "slow"]);
+        assert_eq!(names(&option_values(help, "-m")), ["fast", "slow"]);
+        let help = "  --output <FORMAT>  Format\n  Arguments:\n    FILE  [possible values: local, remote]\n";
+        assert!(
+            option_values(help, "--output").is_empty(),
+            "another section's choices do not describe the option"
+        );
     }
 }

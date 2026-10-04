@@ -97,9 +97,9 @@ pub(super) fn from_log(script: &str) -> Option<String> {
             return None;
         }
     };
-    let output = output_for_script(script, &prompt, &log);
+    let output = output_for_script(script, &prompt, &log, &crate::utils::get_alias());
     if output.is_none() {
-        logs::warn("Script not found in output log");
+        logs::warn("The last command in the output log isn't the one being corrected");
     }
     output
 }
@@ -119,9 +119,12 @@ fn read_log(path: &Path) -> io::Result<String> {
         .to_owned())
 }
 
-fn output_for_script(script: &str, prompt: &str, log: &str) -> Option<String> {
-    let parts = shlex::split(script).ok()?;
-    if parts.is_empty() {
+/// The output of the last command before the correction call, when that
+/// command is `script`. An older run of the same command, or a different
+/// command, never lends its output: it may have failed differently.
+fn output_for_script(script: &str, prompt: &str, log: &str, alias: &str) -> Option<String> {
+    let first = script.lines().next()?.trim();
+    if first.is_empty() || shlex::split(script).is_err() {
         return None;
     }
     let prompt_lines = prompt.matches("\\n").count() + prompt.matches('\n').count();
@@ -146,11 +149,34 @@ fn output_for_script(script: &str, prompt: &str, log: &str) -> Option<String> {
             lines.push(line);
         }
     }
-    groups
-        .into_iter()
+    let (_, lines) = groups
+        .iter()
         .rev()
-        .find(|(script_line, _)| parts.iter().all(|part| script_line.contains(part.as_ref())))
-        .map(|(_, lines)| render_terminal(&lines.join("\n")))
+        .find(|(script_line, _)| !is_correction_call(&render_terminal(script_line), alias))?;
+    let typed = render_terminal(lines[0]);
+    names(&typed, first).then(|| render_terminal(&lines.join("\n")))
+}
+
+/// Whether the visible prompt line contains `command` as whole words.
+/// Prompts can surround it (a right-hand prompt), but `ls` is not `lsof`.
+fn names(line: &str, command: &str) -> bool {
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/');
+    line.match_indices(command).any(|(at, _)| {
+        !line[..at].chars().next_back().is_some_and(word)
+            && line[at + command.len()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+    })
+}
+
+/// A prompt line running the correction alias itself, possibly with flags.
+fn is_correction_call(line: &str, alias: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words
+        .iter()
+        .rposition(|w| *w == alias || crate::shells::DEFAULT_ALIASES.contains(w))
+        .is_some_and(|at| words[at + 1..].iter().all(|w| w.starts_with('-')))
 }
 
 fn render_terminal(output: &str) -> String {
@@ -184,16 +210,47 @@ mod tests {
         let log = format!(
             "{mark}$ git push\r\nold error\r\n{mark}$ ls\r\na\r\n{mark}$ git push\r\nnew error\r\n{mark}$ fuck"
         );
-        let output = output_for_script("git push", mark, &log).unwrap();
+        let output = output_for_script("git push", mark, &log, "fuck").unwrap();
         assert!(output.contains("new error"));
         assert!(!output.contains("old error"));
         assert!(!output.contains("fuck"));
         let log = format!("{mark}path\r\n$ git push\r\nnew error\r\n{mark}path\r\n$ fuck");
         assert_eq!(
-            output_for_script("git push", &format!("{mark}path\\n$ "), &log).as_deref(),
+            output_for_script("git push", &format!("{mark}path\\n$ "), &log, "fuck").as_deref(),
             Some("$ git push\nnew error")
         );
-        assert!(output_for_script("git pull", mark, &log).is_none());
+        assert!(output_for_script("git pull", mark, &log, "fuck").is_none());
+    }
+
+    #[test]
+    fn output_belongs_to_the_event_right_before_the_call() {
+        let mark = logs::USER_COMMAND_MARK;
+        let log =
+            format!("{mark}$ ls\r\nmissing\r\n{mark}$ lsof -i\r\nCOMMAND PID\r\n{mark}$ fuck -y");
+        assert_eq!(
+            output_for_script("lsof -i", mark, &log, "fuck").as_deref(),
+            Some("$ lsof -i\nCOMMAND PID")
+        );
+        assert!(
+            output_for_script("ls", mark, &log, "fuck").is_none(),
+            "neither a later `lsof` nor an older `ls` lends its output"
+        );
+        // A right-hand prompt and line-editor redraws around the command.
+        let log = format!(
+            "{mark}~ ❯ \x1b[32mgit\x1b[39m pss\x08h  [12:01]\r\ngit: 'psh' is not a git command\r\n{mark}~ ❯ fix"
+        );
+        assert_eq!(
+            output_for_script("git psh", mark, &log, "fix").as_deref(),
+            Some("~ ❯ git psh  [12:01]\ngit: 'psh' is not a git command")
+        );
+        // A pasted block: each line has its own prompt.
+        let log = format!(
+            "{mark}$ cd /tmp\r\n{mark}$ gti status\r\ngti: command not found\r\n{mark}$ fuck"
+        );
+        assert_eq!(
+            output_for_script("gti status", mark, &log, "fuck").as_deref(),
+            Some("$ gti status\ngti: command not found")
+        );
     }
 
     #[test]

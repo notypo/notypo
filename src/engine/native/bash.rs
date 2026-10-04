@@ -60,9 +60,11 @@ pub(super) fn complete(
     name: &str,
     words: &[&str],
     prefix: &str,
-    env: Vec<(OsString, Option<OsString>)>,
+    mut env: Vec<(OsString, Option<OsString>)>,
     budget: &mut Budget,
 ) -> Result<Vec<CompletionItem>, CompletionError> {
+    // Noninteractive bash reads BASH_ENV even with --norc/--noprofile.
+    env.extend(["BASH_ENV", "ENV"].map(|name| (name.into(), None)));
     let mut args: Vec<OsString> = vec![
         "--norc".into(),
         "--noprofile".into(),
@@ -75,10 +77,14 @@ pub(super) fn complete(
     args.extend(words.iter().map(OsString::from));
     args.push(prefix.into());
     let text = run_stdout(bash, args, env, budget, true).map_err(|error| match error {
-        CompletionError::Failed(_) => CompletionError::Unsupported(format!(
-            "{} registers no usable completion function for {name}",
-            script.display()
-        )),
+        CompletionError::Failed(why)
+            if ["exited with Some(4)", "exited with Some(5)"].contains(&why.as_str()) =>
+        {
+            CompletionError::Unsupported(format!(
+                "{} registers no usable completion function for {name}",
+                script.display()
+            ))
+        }
         other => other,
     })?;
     Ok(super::normalize(
@@ -136,5 +142,34 @@ complete -F _tool tool
             backend.complete(&[], "", &mut budget),
             Err(CompletionError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn never_loads_startup_configuration_and_reports_output_limits() {
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let dir = Dir::new("bash-startup");
+        let marker = dir.0.join("startup-marker");
+        let config = dir.script(
+            "config",
+            &format!(
+                "printf loaded > {}\n",
+                crate::shlex::quote(marker.to_str().unwrap())
+            ),
+        );
+        let script = dir.script(
+            "tool",
+            "_tool() { COMPREPLY=(build release deploy); }\ncomplete -F _tool tool\n",
+        );
+        let mut budget = Budget::new(Duration::from_secs(10), Duration::from_secs(3), 4);
+        let env = vec![("BASH_ENV".into(), Some(config.into()))];
+        let result = complete(&bash, &script, "tool", &[], "", env, &mut budget).unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(!marker.exists());
+        budget.max_output = 4;
+        assert!(
+            matches!(complete(&bash, &script, "tool", &[], "", Vec::new(), &mut budget), Err(CompletionError::Failed(why)) if why.contains("probe limit"))
+        );
     }
 }

@@ -31,3 +31,16 @@ can also be run on its own with `cargo bench --bench correction`.
 PATH caches and filesystem caches are warmed. A separate CLI case disables the
 Rust PATH cache. Recorded-output fixtures use the same 1 MiB log in both programs.
 Peak RSS is collected on macOS. No dependencies are installed globally.
+
+To measure the structured pipeline with installed fish/Zsh completion handlers,
+use isolated fixture apps. This checks the expected corrections and confirms
+their operations were never executed. Missing shells are skipped.
+
+```sh
+cargo build --locked --release
+python3 benchmarks/structured.py --shell-fixtures --case shell --samples 11 --output benchmarks/shell-results.md
+```
+
+[shell-results.md](shell-results.md) records cold/warm latency, native probe
+counts, and RSS. Partial shell handlers keep answers within one request, so
+reusing a disk cache directory does not reduce their probe count.

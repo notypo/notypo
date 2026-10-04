@@ -1,14 +1,21 @@
 NOTYPO: STRUCTURED COMMAND CORRECTION PLAN
 
-Status: first and second slices implemented in src/engine/ behind
-        engine = 'native' (NOTYPO_ENGINE=native) on branch
-        structured-engine; the legacy engine stays the default.
-        Third slice in progress: bash completion functions and
-        upgrade coverage for every protocol; fish/PowerShell dialects
-        and the default switch are not started.
+Status: first and second slices implemented in src/engine/ on branch
+        structured-engine. Since 0b5ebd1 every correction uses the structured
+        pipeline; legacy rules remain a candidate source behind its safety
+        gate. The engine setting has been removed.
+        Third slice in progress: Bash/fish/Zsh completion handlers, fish and
+        tcsh parsing/quoting, POSIX compound commands and fish blocks, upgrade
+        coverage for implemented native protocols, parent-shell function
+        names, nested help with option values, role-aware ranking, and
+        pre-execution revalidation. The PowerShell dialect and completion
+        adapter, broader app coverage, and rollout validation remain
+        unfinished.
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.
         [ ] NOT DONE = work required to deliver this plan.
+        [-] SKIPPED = deferred on the project owner's decision (2026-10-04);
+            not required to complete this plan.
 Keep this checklist updated in the implementation commit that completes a task.
 
 TARGET FLOW
@@ -87,8 +94,9 @@ CURRENT BASELINE
     from crates.io packages.
 [x] DONE: Lossless AST, token diagnosis, unified providers, explainable
     ranking, and a mandatory safety gate are integrated end to end.
-    Integrated in the opt-in engine for sh/bash/zsh; three of the seven
-    sources exist so far (see section 5).
+    Integrated in the default pipeline for sh/bash/zsh. Native completion,
+    history, filesystem, help, man pages, stderr, and program-specific native
+    bridges exist; plugin registration and helper migration are skipped.
 
 1. DEFINE THE ENGINE CONTRACT AND MIGRATION BOUNDARY
 
@@ -112,29 +120,41 @@ CURRENT BASELINE
     no matches from unavailable/unsupported completion and probe failures.
 [x] DONE: Define outcomes for a suggestion, ambiguity, unsupported
     syntax, insufficient evidence, unsafe correction, and no correction.
-[x] DONE: Keep the existing rule registry behind the compatibility engine,
+[x] DONE: Keep the existing rule registry as a compatibility source,
     preserving rule names, enable/exclude settings, and priority overrides.
     Whole-script replacements and opaque side effects need explicit metadata.
     The new app-native path must not depend on a matching legacy rule, and no
     cloud command catalogs or cloud-specific spelling rules should be added.
     Legacy suggestions carry their rule name; side-effect callbacks are
     declared as safety::DeclaredEffect.
-[x] DONE: Initially expose the new engine through an opt-in setting;
-    keep the compatibility engine available during measured migration.
+[x] DONE: Initially expose the new engine through an opt-in setting.
+    Historical migration step: 0b5ebd1 removed the engine setting and made
+    the structured pipeline mandatory; legacy rules remain available as a
+    source, preserving their configuration and regression fixtures.
 
 Acceptance: existing fixture results remain available through the legacy
-engine, and a provider can return structured edits with recorded provenance.
+source, and a provider can return structured edits with recorded provenance.
 
 2. CAPTURE FAILURE CONTEXT WITHOUT REPLAYING THE COMMAND
 
 [ ] NOT DONE: Extend shell integration to preserve the preceding exit status
     before alias setup changes it, and pass shell/cwd/session context to Rust.
-    PARTIAL: bash and zsh capture $? and the pipeline status first (tested in real
-    shells); fish captures them but is untested here; PowerShell, tcsh, and
-    the generic alias don't. The cwd is the process cwd. A status counts only
-    when nothing but the correction call ran after the command.
-[ ] NOT DONE: Associate captured output with the correct history event;
+    PARTIAL: Bash, zsh, and fish capture exit and pipeline statuses first
+    (tested in real shells). tcsh captures $status first (it has no pipeline
+    statuses) and exports the previous event for the call; tested in real
+    tcsh 6.21. The generic POSIX function captures $? and passes recent fc
+    history, skipping its own line (tested in ksh93; dash has no fc).
+    PowerShell doesn't. The cwd is the process cwd. A status counts only when
+    nothing but the correction call ran after the command.
+[x] DONE: Associate captured output with the correct history event;
     retain the existing zsh pasted-command regression behavior.
+    Instant-mode/PTY logs: output comes only from the last prompt group
+    before the correction call, and only when its visible (rendered) prompt
+    line names the command as whole words; an older run of the same command
+    or a later lsof for ls never lends output. Right-hand prompts and line
+    redraws are tolerated; the zsh paste regression still passes. External
+    shell-logger sockets are matched by exact command text, in the order the
+    logger lists its records.
 [x] DONE: Preserve separate stdout/stderr when the capture method can;
     mark terminal-log output as combined rather than treating it as stderr.
     No current capture method separates the streams; logs are Combined.
@@ -162,10 +182,16 @@ does not create that marker during context capture or candidate discovery.
     for the first slice; a corpus-based comparison is still pending.
 [x] DONE: Start with simple commands for sh/bash/zsh: words, assignments,
     quotes, escapes, options, arguments, and command wrappers such as sudo/env.
-[ ] NOT DONE: Represent pipelines, lists, &&/||, redirections, and grouping
+[x] DONE: Represent pipelines, lists, &&/||, redirections, and grouping
     so the engine can identify command boundaries and affected stages.
-    PARTIAL: pipelines, lists, and redirections are represented; grouping and
-    compound commands are reported as unsupported.
+    Simple commands stay a flat list; Script::compounds records groups,
+    subshells, if/while/until/for/select/case, function definitions, and
+    negation with their reserved words, loop items, case patterns, and
+    redirections. Edits and legacy replacements must keep that shape (or
+    need confirmation); pipe statuses aren't mapped onto compound stages.
+    Arithmetic, [[ ]], coproc, and zsh-only forms (for x (a b), { ls },
+    then;, always) stay unsupported. Fixtures check that every accepted form
+    parses in real bash/zsh and every malformed one fails bash -n.
 [x] DONE: Keep comments, whitespace, quote boundaries, and UTF-8 byte
     spans. Unchanged parts of a command must remain byte-for-byte intact.
 [x] DONE: Treat substitutions, expansions, globs, and here-doc bodies as
@@ -176,8 +202,19 @@ does not create that marker during context capture or candidate discovery.
 [ ] NOT DONE: Add fish and PowerShell dialect adapters with their own quoting
     and operators; document tcsh/generic-shell limitations. Never apply POSIX
     quoting to another dialect without validating equivalent behavior.
-    PARTIAL: fish/PowerShell/tcsh lines get an UnsupportedSyntax outcome (documented
-    in README); no adapters yet.
+    tcsh: a Tcsh dialect reads simple commands, pipelines (|&), lists, and
+    redirections (>&, >!, and the spaced forms tcsh's history prints) with
+    tcsh quoting (no comments, prefix assignments, or descriptor numbers;
+    \! literals); words round-trip through real interactive tcsh and eval.
+    Control words, ( ), ambiguous redirects, quoted newlines, and recorded
+    `!` that tcsh would substitute again are unsupported (README).
+    PARTIAL: fish commands have dialect-specific quotes/escapes,
+    assignments, opaque expansions/substitutions/slices, descriptor pipes,
+    redirections, and and/or lists, inside begin/if/else if/while/for/
+    switch/function blocks and not/! negation. Edits reparse with the
+    selected dialect; literal quotes round-trip through real fish 4.9.3, and
+    block fixtures agree with fish -n. Fish { } blocks, PowerShell, and tcsh
+    remain unsupported. Other fish versions are unverified.
 [x] DONE: Apply nonoverlapping span edits, then reparse the result and
     validate the intended structural change before accepting a candidate.
 
@@ -198,9 +235,14 @@ Unsupported syntax produces an explicit outcome and cannot execute silently.
 [ ] NOT DONE: Resolve executable identity through PATH, aliases, and supplied
     shell-function/wrapper metadata. Select the app's completion backend from
     that identity rather than from loose substring matching on command text.
-    PARTIAL: PATH, aliases, builtins, package runners, and Go module identity;
-    shell-function names are not supplied yet (a non-127 exit status is
-    treated as a shell-defined name).
+    PARTIAL: PATH, aliases, builtins, package runners, and package identity
+    (Go module, Python entry module, npm package; reported in --explain);
+    Bash/zsh/fish shell-function names are supplied by the parent and tested.
+    Fish discovery no longer starts an interactive shell or loads user config.
+    Function bodies and arbitrary wrapper metadata are not supplied; the
+    PowerShell dialect remains unfinished. An alias naming another program
+    (ls=eza) doesn't yet select that program's vocabulary (section 5B).
+    Corrections invoked directly, outside the alias, see no function names.
 [x] DONE: Use the app's completion results to understand valid next tokens
     at each command level; do not embed AWS/GCP/Azure command trees in diagnosis.
 [x] DONE: Map error hints to exact token spans, including repeated tokens;
@@ -221,29 +263,48 @@ and ls --colro=auto the option name while preserving its value.
 
 5. BUILD THE CANDIDATE PROVIDERS
 
-[ ] NOT DONE: Executable/completion provider: reuse the PATH index, builtins,
+[x] DONE: Executable/completion provider: reuse the PATH index, builtins,
     aliases, and supplied shell-function names. Add argument-position context.
-    PARTIAL: PATH index, builtins, aliases, and argument context (a program whose
-    completer accepts the next word ranks first); shell-function names are
-    not supplied.
+    PATH index, builtins, aliases, supplied Bash/zsh/fish function names, and
+    argument context (a program whose completer accepts the next word ranks
+    first); tests/cli.rs exercises function discovery and correction.
 [ ] NOT DONE: Shell completion adapters: collect bounded results from native
     completion facilities for bash/zsh/fish/PowerShell. Completion functions
     can execute code, so invocation must obey the shared probe trust policy.
-    PARTIAL: bash completion functions (sourced scripts, opt-in via
-    trusted_completers) are bridged; zsh, fish, and PowerShell are not.
+    PARTIAL: Bash functions, Zsh autoload handlers in real ZLE widgets, and
+    fish complete --do-complete (sourced scripts,
+    opt-in via trusted_completers) are bridged with shared probe limits.
+    Fish conditions, option arity, and values work; descriptions are dropped.
+    User startup configuration is skipped. PowerShell is pending.
+[x] DONE: Bridge installed Zsh #compdef autoload handlers on Unix with a
+    private controlling terminal and real completion widgets. vared accepts
+    a variable without executing the failed command. Parent fpath discovery,
+    shared/service aliases, commands/options/values, upgrade freshness, literal
+    arguments/results, closed widget stdin, and timeout tree cleanup are tested.
+    Results are partial and require confirmation; rich ranges/nonempty affixes,
+    option arity, descriptions, and in-memory registrations remain unsupported.
+    Reference: https://zsh.sourceforge.io/Doc/Release/Completion-Widgets.html
+    Discovery prefers the parent shell's handler, then other installed shell
+    protocols; a Bash-to-Zsh fallback is covered through the CLI. Missing app
+    identity never gives an installed shell handler audited automatic trust.
 [ ] NOT DONE: Discover the active shell's registered handler or the app's
     documented completion entry point automatically. Preserve full command
     context, target token, cursor position, cwd, dialect, and relevant options;
     correctly translate cursor units and quoting for each native protocol.
     PARTIAL: documented entry points (aws_completer, argcomplete, git helpers,
     cobra __complete, posener COMP_LINE) are discovered with per-protocol
-    cursor units; shell-registered handlers are not.
+    cursor units. Installed Bash/fish/Zsh handlers are located; fish and Zsh
+    supply their completion search paths from the parent. Embedded fish handlers,
+    handlers registered only in memory, and PowerShell registrations are pending.
 [ ] NOT DONE: Make app-native completion the primary command/argument provider.
     Normalize plain/rich results, replacement ranges, descriptions, enum values,
     and quoting hints. A new operation must work when the app exposes it even
     if notypo has never encountered that operation before.
-    PARTIAL: primary for commands, options, and values; enum values are used,
-    descriptions and replacement ranges are dropped.
+    PARTIAL: primary for commands, options, and values; enum values are used.
+    cobra and fish descriptions are kept (control and bidi characters
+    removed, one line, capped), cached, and shown in --explain/--json and
+    choice reasons. Replacement ranges and other protocols' descriptions are
+    still dropped.
 [ ] NOT DONE: AWS adapter: invoke the installed aws_completer (or its Windows
     equivalent) with the native completion context. Use its service/operation,
     flag, and value results; support CLI v1/v2 capabilities without recreating
@@ -281,7 +342,9 @@ and ls --colro=auto the option name while preserving its value.
     completion usable when offline, unauthenticated, or access is denied.
     network_completion (off by default) runs value queries with the user's
     credentials, under the probe timeouts and without prompts; command and
-    option queries stay offline. Not exercised against live accounts here.
+    option queries stay offline. Words the offline answer lacks are resource
+    names, and an edit choosing a different one needs approval (-y can't
+    accept it). Not exercised against live accounts here.
 [x] DONE: History provider: propose edits from relevant recent commands,
     matching program/subcommand/cwd where available. Use recency/frequency as
     evidence; label success only when captured exit status supports it.
@@ -292,24 +355,34 @@ and ls --colro=auto the option name while preserving its value.
     bound listings. Handle symlinks, inaccessible paths, and non-UTF-8 names.
     cd targets, explicit program paths, reported-missing paths, and other
     paths after a known failure; component by component, bounded listing.
-[ ] NOT DONE: CLI --help provider: parse options/subcommands from local help
+[x] DONE: CLI --help provider: parse options/subcommands from local help
     output, including nested subcommand help and option-value relationships.
-    PARTIAL: options and first-level subcommands, for programs in trusted_help;
-    nested subcommand help is not read.
+    For programs in trusted_help, follow only commands listed in each parent's
+    help and probe the documented path plus --help, without failed positional
+    arguments or option values. Ancestor options remain available; leaf option
+    declarations override them. Short aliases share option arity. Explicit
+    {a,b}, [possible values: a, b], and [choices: a, b] lists supply values;
+    arbitrary placeholders/prose do not. Help stays partial evidence needing
+    confirmation. Queries are memoized per executable/path within a request;
+    failures, timeouts, and truncated output are discarded and reported.
 [x] DONE: Man-page provider: extract options/subcommands from locally
     installed documentation; handle formatting/backspaces and disable pagers.
     Missing man support, including on Windows, must degrade gracefully.
     Options from `man` with MANPAGER=cat, overstrike removed, cached by the
     program's fingerprint; absent man (Windows) contributes nothing.
-[ ] NOT DONE: Program-specific plugin provider: implement trusted Rust bridges
+[-] SKIPPED: Program-specific plugin provider: implement trusted Rust bridges
     to native completion and app-specific diagnostic formats, starting with
     aws/gcloud/az and then git. Migrate applicable helpers from src/specific/;
     command knowledge must come from the installed app rather than rule tables.
-    PARTIAL: aws/gcloud/az/git bridges exist as native backends; src/specific/
-    helpers are not migrated.
-[ ] NOT DONE: Define plugin registration, supported program identities,
+    Skipped as a plugin system. The aws/gcloud/az/git bridges already exist as
+    native backends and serve as the program-specific source; src/specific/
+    helpers stay with the legacy rules that use them.
+[-] SKIPPED: Define plugin registration, supported program identities,
     diagnostic hooks, candidate metadata, and declared effects. External
     executable plugins remain opt-in and use a versioned bounded protocol.
+    Skipped: no plugin registry or external plugin protocol will be built in
+    this plan. App identity and trust policy are recorded per native backend
+    (native::identity, Capabilities::trust) instead.
 [x] DONE: Stderr provider: turn explicit correction hints into candidate
     edits. Treat printed commands as untrusted text, not executable instructions.
 [x] DONE: Normalize provider results into the shared Candidate type;
@@ -610,39 +683,575 @@ SHARED IMPLEMENTATION AND COVERAGE TASKS
     Python completion protocols, and PowerShell completion/cmdlet metadata.
     Reuse a protocol bridge across apps instead of writing one rule per service.
     PARTIAL: completion subprocess protocols (aws_completer, git, cobra, posener),
-    argcomplete, and bash completion functions are implemented;
-    app-generated scripts beyond bash and PowerShell are pending.
+    argcomplete, Bash/Zsh completion functions, and installed fish scripts are
+    implemented; app-generated scripts and PowerShell remain pending.
 [x] DONE: Detect package-runner invocations (npx, npm exec, pnpm exec,
     yarn, uvx, pipx run) and obtain the target app's installed identity without
     downloading a package or executing its failed operation during discovery.
     npx, pnpx, bunx, npm exec/x, pnpm exec/dlx, yarn exec/dlx, bun x, uvx,
     pipx run, uv run, poetry run, bundle exec: the target is resolved from
     $PATH or node_modules/.bin only; scoped packages are not resolved.
-[ ] NOT DONE: Resolve basename collisions using executable path, package/app
+[x] DONE: Resolve basename collisions using executable path, package/app
     metadata, and completion registration. Add fixtures for hcloud, cf, metal,
     atlas, exo, stackit, s, and unrelated tools with the same name.
-    PARTIAL: Go module identity separates hcloud (tested); cf, metal, atlas, exo,
-    stackit, and s have no fixtures yet.
-[ ] NOT DONE: Track each app/backend's capabilities: commands, nested groups,
+    native::identity reads a Go binary's main module, a Python console
+    script's entry module (or setuptools distribution), and a Node bin's npm
+    package; trusted_completers entries may name an identity, which follows a
+    renamed app and never reaches another app sharing the basename. A fixture
+    pair per name (Go/Go, Go/npm, Go/Python, npm/Python) checks identity,
+    pinned trust, renaming, and that hcloud's audit covers Hetzner's module
+    only. Fixture identities stand in for the real packages until each client
+    is verified; a bare-name entry still trusts whatever has that name.
+[x] DONE: Track each app/backend's capabilities: commands, nested groups,
     flags, values, resources, descriptions, dialects, and required trust/network
     policy. Do not infer that every named CLI supports every completion feature.
-    PARTIAL: native::Capabilities records commands, options, arity, values,
-    resources (network policy), short options, and list completeness;
-    dialects are not tracked.
+    native::Capabilities records commands, options, arity, values, resources
+    (network policy), short options, separate command/option list
+    completeness (handwritten Bash/fish/Zsh handlers are partial),
+    descriptions, the query line's quoting dialect (none for argv protocols),
+    and the trust policy (built-in bridge, audited module, trusted_completers),
+    which --explain reports with the app's identity.
 [ ] NOT DONE: Test upgrades, installed plugins, provider endpoints, and renamed
     executables. Fresh native results must expose new command surfaces without
     a notypo release or cloud-specific Rust command-table change.
     PARTIAL: fake aws/gcloud/az completers gain operations, groups, and extensions
-    between requests; endpoints and renamed executables are untested.
+    between requests; renamed Go/Python apps keep identity-pinned trust
+    (fixture-tested). Provider endpoints are untested.
 [x] DONE: Discover unlisted CLIs using supported native completion protocols
     and registrations; inventory updates must not be required for their routing.
     argcomplete markers and Go module dependencies route by protocol; trust
     for unaudited apps comes from trusted_completers, not the inventory.
 
+5B. DEVELOPER AND DEVOPS TOOL INVENTORY
+
+The tools developers and operators type most often, beyond the cloud CLIs of
+section 5A. The same rules apply: each entry is an integration/verification
+task; the list names apps and test targets, not a dispatch allowlist; and
+command knowledge comes from the installed app (its native completer, an
+installed shell handler under the trust policy, or its own --help/man
+output), never from tables kept in notypo. A tool without a completer must
+report that and fall back to help, man pages, and history.
+
+An entry is done when each installed app is discovered by identity, its
+command/option/value surface is verified (or its real limits recorded), a
+regression fixture covers a typo at each exposed level, and probes stay
+offline and free of side effects. Protocols named "expected" below are
+unverified until their entry is done.
+
+Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
+  native and verified: kubectl, helm, kind, docker, gh, git, terraform,
+    tofu, packer (tests/installed_clis.rs);
+  cobra apps awaiting trust or an audit: velero, k9s;
+  clap dynamic completion under the app's own variable: sofka
+    (SOFKA_COMPLETE; answered offline, see the Kubernetes entry);
+  installed zsh/bash handler (opt-in via trusted_completers): sqlite3, svn,
+    npm, deno, pipx, gem, brew, make, cmake, just, ansible,
+    ansible-playbook, jq, curl, wget, ssh, rsync;
+  no completer found: node, pip3, cargo, rustup, go, bundle, openssl
+    (cargo still lists its commands offline with `cargo --list`).
+
+[ ] NOT DONE: Databases and data stores: psql, pg_dump, pg_restore, pg_ctl,
+    createdb/dropdb; mysql, mysqldump, mariadb; sqlite3; redis-cli,
+    valkey-cli; mongosh; cqlsh; clickhouse (client); duckdb; etcdctl.
+    Most have no argv completion protocol (psql's tab completion lives in
+    its REPL), so options come from trusted --help/man output and installed
+    shell handlers; typos are mostly program and option names
+    (psql --hots -> psql --host). Hosts, databases, and users are resources:
+    never invented, and changing one needs approval. Discovery never opens
+    a database connection. etcdctl is expected to be cobra.
+[ ] NOT DONE: Kubernetes and OpenShift, extending section 5A's clients: oc
+    (OpenShift; expected cobra, built on kubectl), kustomize, minikube, k3d,
+    kubectx/kubens, stern, k9s and sofka (TUIs: flags, subcommands, and the
+    resource to open), velero, istioctl, linkerd, kubeseal, and
+    krew-installed kubectl plugins (kubectl-<name> on PATH). Keep
+    --context/--namespace/--kubeconfig, and oc's --server and project, in
+    every query; cluster lookups stay off unless network_completion allows
+    them. Observed: velero and k9s are cobra apps awaiting trust.
+    sofka (Rust; github.com/nklmilojevic/sofka, 0.29.7 via Homebrew) uses
+    clap's dynamic completion under SOFKA_COMPLETE, as its own
+    `sofka completion <shell>` script declares ("without connecting to a
+    cluster"). With KUBECONFIG=/dev/null it answers subcommands, built-in
+    resource aliases (po -> po, pod, poddisruptionbudgets, pods), options,
+    and option values, so `sofka posd` can become `sofka pods`. Bare
+    `sofka`, or a guessed protocol such as COMPLETE=bash, starts the TUI and
+    tries to connect to a cluster: only its declared entry point may run.
+    PARTIAL: kubectl, helm, and kind are audited cobra apps (verified).
+[ ] NOT DONE: Containers, images, and registries: docker (with compose,
+    buildx, and other CLI plugins), podman and podman compose, buildah,
+    skopeo, nerdctl, colima, limactl, crane, cosign, trivy, dive, and an
+    installed docker-compose v1. podman, buildah, skopeo, nerdctl, colima,
+    limactl, crane, cosign, and trivy are expected to be cobra. Daemon,
+    registry, and image lookups stay off without network_completion;
+    --context/--host/remote connection choices are preserved.
+    PARTIAL: docker is an audited cobra app (verified; plugin commands come
+    from each plugin's own metadata).
+[ ] NOT DONE: Version control and code hosting: git, gh, glab, hub, git-lfs,
+    svn, hg, pre-commit. glab is expected to be cobra; svn and hg rely on
+    installed shell handlers or help output. Remotes, branches on remote
+    hosts, and repository names are resources. Observed: svn has a zsh
+    handler.
+    PARTIAL: git (built-in bridge, aliases included) and gh (audited cobra)
+    are verified.
+[ ] NOT DONE: JavaScript and TypeScript: node, npm, npx, yarn, pnpm, bun,
+    deno, and package-runner targets (section 5A's runner support). npm has
+    its own completion protocol (`npm completion` with COMP_CWORD, COMP_LINE,
+    and COMP_POINT); deno and bun generate completion scripts; node has none
+    and falls back to --help. `npm run` script names come from the project's
+    package.json: reading it is allowed, running lifecycle scripts is not.
+    Observed: npm (identified as npm:npm) and deno have zsh handlers; node
+    has no completer.
+[ ] NOT DONE: Python: python/python3, pip/pip3, pipx, uv/uvx, poetry, conda,
+    tox, nox, pytest, ruff, black. pip answers its own protocol
+    (PIP_AUTO_COMPLETE with COMP_WORDS/COMP_CWORD); pipx and pytest are
+    expected to support argcomplete; uv and ruff (clap) and poetry generate
+    scripts. Observed: pipx (python:pipx) has a zsh handler; pip3 has no
+    completer found.
+[ ] NOT DONE: Rust toolchain and cargo ecosystem: cargo, rustup, rustc,
+    rustdoc, rustfmt, cargo clippy, rust-analyzer, cargo miri, cross, and
+    installed cargo-* subcommands (cargo-nextest, cargo-watch, cargo-audit,
+    cargo-deny, cargo-outdated, cargo-edit/cargo-upgrade, cargo-expand,
+    cargo-machete, cargo-bloat, cargo-tarpaulin, cargo-llvm-cov,
+    cargo-binstall, cargo-make, cargo-release, cargo-dist, cargo-zigbuild,
+    cargo-generate, cargo-insta, cargo-sqlx, cargo-tauri), plus wasm-pack,
+    trunk, maturin, mdbook, sqlx-cli, diesel, sea-orm-cli, dx (Dioxus),
+    cargo-leptos, sccache, and bacon.
+    Sources of truth, all offline: `cargo --list` names builtin commands,
+    installed external subcommands (cargo-* on PATH), and .cargo/config.toml
+    aliases, with descriptions; `cargo <command> --help` gives options, and
+    an external subcommand answers for itself. `cargo +toolchain` is
+    context kept in every query; toolchain names come from
+    `rustup toolchain list`. Package, binary, example, test, bench, and
+    feature names (-p, --bin, --example, --features) come from
+    `cargo metadata --offline --no-deps --format-version 1`, which reads
+    the manifests without building or running build scripts; discovery never
+    runs cargo build, test, or run. Native completion (CARGO_COMPLETE) is
+    nightly-only: stable cargo 1.98 treats it as a command name, so it is
+    used only where the installed cargo supports it. rustup generates
+    zsh/bash scripts for itself and cargo (`rustup completions`); rustc lint
+    names come from `rustc -W help`. Check that the stderr provider reads
+    cargo's current hint ("help: a command with a similar name exists:
+    `build`"). Observed: cargo 1.98.1 and rustup 1.29.1, with 15 external
+    subcommands in `cargo --list` and no shell handler installed.
+[ ] NOT DONE: Rust rewrites of classic tools, by the tool they replace:
+    grep -> rg (ripgrep) and rga (ripgrep-all); find -> fd; cat/less -> bat;
+    ls -> eza, lsd; du -> dust; ps -> procs; top -> btm (bottom);
+    cd -> zoxide (z, zi); sed -> sd; cut/awk -> choose; tldr -> tealdeer;
+    time -> hyperfine; cloc -> tokei; diff -> delta, difftastic (difft);
+    curl/httpie -> xh; xxd -> hexyl; dig -> dog; ping -> gping;
+    mtr -> trippy; tmux -> zellij; vim -> helix (hx); fzf -> skim (sk);
+    jq -> jaq; tar/zip -> ouch; history search -> atuin; GNU coreutils ->
+    uutils coreutils (coreutils multicall or uu-<tool>); sudo -> sudo-rs;
+    shells -> fish 4 and nushell (nu); file managers -> yazi, broot.
+    Rules: (1) A classic name aliased to a rewrite (ls=eza, cat=bat,
+    grep=rg, find=fd, cd=z) takes its vocabulary from the alias target:
+    resolve the alias to its program before choosing completion, help, or
+    man sources. Observed: with `ls` aliased to `eza`, `ls --colro` was
+    repaired from the BSD `ls` man page instead. (2) Similar names don't
+    mean similar options (rg -E is --encoding, not grep's extended regex;
+    fd takes a pattern, not find's expression), so a rewrite never borrows
+    the classic tool's vocabulary; uutils coreutils is the exception that
+    aims for GNU compatibility, and is still verified per tool. (3) Most
+    rewrites generate scripts offline (rg --generate complete-<shell>,
+    fd --gen-completions, bat --completion, just --completions); clap's
+    dynamic completion is used only when the app declares it (see sofka).
+    (4) A rewrite that is a shell function or alias stays shell-defined:
+    run outside the alias, with no function names passed, a function `rg`
+    looked missing and `rm` ranked first (offered for a choice and flagged
+    for approval), so function names must reach every entry point.
+    Observed here: tokei (no completer found), just (zsh handler), and
+    fish 4.9.3 are installed; ripgrep 14.1.1 was only available as an agent
+    shell function, so rg stays unverified until it is on PATH.
+[ ] NOT DONE: Other Rust-built developer CLIs: starship, typst, jj
+    (jujutsu), gitui, watchexec. Most use clap: some generate static
+    scripts, others answer clap's dynamic completion under a variable they
+    choose. That variable is read from the app's own generated script,
+    never guessed (see sofka).
+[ ] NOT DONE: Go, JVM, .NET, Ruby, PHP, and Elixir toolchains: go,
+    gradle/gradlew, mvn/mvnw, java/javac, dotnet, gem, bundle, rake, rails,
+    composer, php artisan, mix. Expected protocols to verify: `dotnet
+    complete` and Symfony Console's `_complete` command (composer, artisan).
+    go has no completer; `go help` lists its commands. Project-defined tasks
+    (gradle, mvn, rake, and mix tasks; artisan commands) run project code
+    when listed, so they follow the workspace trust policy. Observed: go and
+    bundle have no completer found; gem has a zsh handler.
+[ ] NOT DONE: Build and task runners: make, cmake, ninja, bazel/bazelisk,
+    just, task (go-task), mage, earthly. Targets and recipes come from
+    project files (Makefile, justfile, Taskfile.yml, BUILD); listing them
+    can evaluate project code (make's $(shell ...), Bazel queries), so those
+    probes follow the workspace trust policy and never run automatically in
+    an untrusted directory. Observed: make and just have zsh handlers; cmake
+    has a bash handler.
+[ ] NOT DONE: Infrastructure and configuration management, extending
+    section 5A: pulumi, terragrunt, vagrant, ansible, ansible-playbook,
+    ansible-galaxy, ansible-vault, chef/knife, puppet, salt. Observed:
+    ansible and ansible-playbook are identified as python:ansible with zsh
+    handlers.
+    PARTIAL: terraform, tofu, and packer are audited posener apps (verified).
+[ ] NOT DONE: HashiCorp runtime tools: vault, consul, nomad, boundary,
+    waypoint, expected to answer posener/complete like terraform. Audit each
+    before trusting it: vault's predictors can list secret paths from the
+    server, so VAULT_ADDR, CONSUL_HTTP_ADDR, and NOMAD_ADDR lookups stay off
+    unless network_completion allows them, and tokens are never logged.
+[ ] NOT DONE: CI/CD and GitOps: argocd, flux, tkn (section 5A), act,
+    circleci, glab ci, gitlab-runner, buildkite-agent, dagger, goreleaser.
+    act, circleci, dagger, and goreleaser are expected to be cobra;
+    pipeline, job, workflow, and application names are resources.
+[ ] NOT DONE: Security, secrets, and supply chain: sops, age, gpg, openssl,
+    ssh-keygen, step, op (1Password), bw, gopass, cosign, syft, grype,
+    trivy. openssl has subcommands but no completer (`openssl help` lists
+    them). Secret names, key IDs, and vault items are resources; probes must
+    never unlock a vault or prompt for a passphrase. Observed: openssl has
+    no completer found.
+[ ] NOT DONE: Network, remote access, and HTTP: ssh, scp, sftp, rsync, mosh,
+    curl, wget, httpie (http/https), grpcurl, dig, nc, mtr, tailscale, wg.
+    Hosts from ssh config and known_hosts are local evidence only; changing
+    a host still needs approval (enforced for remote programs). Observed:
+    ssh, rsync, curl, and wget have zsh handlers.
+[ ] NOT DONE: Service operation, observability, and load testing:
+    systemctl, journalctl, launchctl, promtool, amtool, logcli, k6, hey,
+    tmux, screen. Unit and service names are local resources: listing them
+    must not start or stop anything, and stop/restart verbs already need
+    approval in the safety gate.
+[ ] NOT DONE: System and application package managers: apt, apt-get,
+    apt-cache, aptitude, dpkg (Debian/Ubuntu); dnf, dnf5, yum, microdnf, rpm
+    (Fedora/RHEL); zypper (SUSE); pacman, makepkg, yay, paru (Arch); apk
+    (Alpine); emerge (Gentoo); xbps-install/xbps-query (Void); eopkg
+    (Solus); nix, nix-env, nix-shell, nixos-rebuild; guix; brew (Homebrew)
+    and port (MacPorts); pkg (FreeBSD), pkg_add (OpenBSD), pkgin (NetBSD);
+    snap, flatpak; mas and softwareupdate (macOS); winget, choco, scoop
+    (Windows). Version and toolchain managers: asdf, mise, pyenv, rbenv,
+    nvm, fnm, volta, sdkman (sdk), rustup (see the Rust entry). Language
+    package managers not listed elsewhere: cabal, stack, opam, cpanm,
+    luarocks, vcpkg, conan, nuget. Requirements:
+    - Commands and options come from each tool: expected native protocols
+      to verify are dnf's completion helper (dnf 4), flatpak's
+      `flatpak complete`, winget's `winget complete --word --commandline
+      --position`, nix's NIX_GET_COMPLETIONS, and snap's go-flags
+      completion; the rest use installed shell handlers, --help, and man
+      pages. Homebrew lists its own commands with `brew commands`.
+    - Package names (`apt install pyhton3`, `brew install jqq`, today not
+      checked) come only from local, offline sources: installed packages
+      and the configured repositories' cached indexes (`apt-cache
+      --no-generate pkgnames`, `pacman -Slq`/`-Qq`, `dnf -C`, `brew
+      formulae`/`brew casks` with HOMEBREW_NO_AUTO_UPDATE=1, `zypper
+      --no-refresh`, `apk --no-network`). Community or remote sources (AUR,
+      PPAs, taps, remote search) are network lookups under
+      network_completion. A near name can be a typosquatted package, so a
+      corrected package name always needs approval and names its source.
+    - Discovery never refreshes metadata (apt update, dnf makecache,
+      pacman -Sy, brew update, zypper refresh, apk update), never runs sudo
+      or asks for a password, and never waits on a package database lock
+      (dpkg, pacman db.lck, rpm) beyond the probe timeout.
+    - `sudo`, `doas`, and `run0` prefixes are kept; nvm and sdk are shell
+      functions, so they stay shell-defined and use their own scripts.
+    - Installing, removing, upgrading, or switching versions already needs
+      approval (safety::PACKAGE_MANAGERS); add the managers it lacks
+      (dpkg, rpm, microdnf, dnf5, emerge, xbps-install, eopkg, makepkg, nix,
+      guix, pkg, pkg_add, pkgin, mas, softwareupdate, asdf, mise, sdk).
+    - The ported thefuck rules stay as an output-based source: apt,
+      apt_get, apt_get_search, apt_invalid_operation, apt_list_upgradable,
+      apt_upgrade, brew_* (7), dnf_no_such_command, yum_invalid_operation,
+      pacman, pacman_invalid_option, pacman_not_found, choco_install,
+      conda_mistype, nixos_cmd_not_found, port_already_in_use, and the
+      npm/pip/gem/yarn/composer/cargo rules.
+    Observed on 2026-10-05 (macOS, Homebrew only): `brew instal jq` ->
+    `brew install jq` and `brew upgade` -> `brew upgrade` (with `brew
+    update` offered as well), all needing approval; `brew install jqq`
+    gets no correction because package names aren't checked; brew has a
+    zsh handler (opt-in).
+[ ] NOT DONE: Archives and compression: tar (GNU tar, and bsdtar/libarchive,
+    which is tar on macOS, FreeBSD, and Windows), zip, unzip, zipinfo, 7z,
+    7za, 7zr, 7zz (7-Zip and p7zip), rar, unrar, unar/lsar (The
+    Unarchiver), atool (aunpack, apack, als), dtrx, ouch, gzip/gunzip/zcat,
+    pigz, bzip2/bunzip2, pbzip2, xz/unxz/xzcat, lzma, pixz, zstd/unzstd/
+    zstdcat/pzstd, lz4, lzip/plzip, lzop, brotli, compress/uncompress, cpio,
+    ar, pax, jar, cabextract, mksquashfs/unsquashfs, ditto (macOS), and
+    PowerShell's Expand-Archive/Compress-Archive (with the PowerShell
+    backend). Requirements:
+    - None of these has a native completer. Options come from trusted
+      --help output, man pages, and installed shell handlers; GNU tar and
+      bsdtar have different option sets, so tar is identified by its own
+      banner (`tar --version`), never assumed from the name.
+    - tar's old-style modes (`tar xvzf a.tgz`, no dash) are flags, not a
+      subcommand; option clusters (`-cf`, `-xvzf`) and attached values
+      (7z's `-o<dir>`, `-t<type>`, `-mx=9`) are never split or shortened.
+      Fixed on 2026-10-05: the help/man fallback used to offer `tar -c x.tar`
+      for `tar -cf x.tar` (and `ls -L` for `ls -la`); clusters whose first
+      letter is a listed short option are now valid, others compare only
+      with multi-letter options (regression test in src/engine/mod.rs).
+    - 7z's commands are single letters (a, x, e, l, t, u, d, rn) read from
+      its own usage text; a word such as `extarct` is not a spelling of
+      `x`, so it gets no correction rather than a guess.
+    - Archive paths: a misspelled archive name (`7z x dat.7z`,
+      `tar xvzf backpu.tar.gz`, `unzip photso.zip`) gets no repair today
+      without captured output, because the filesystem provider only checks
+      arguments containing `/` or named missing by the output. After a
+      known failure, also check file-like arguments with a sibling of the
+      same extension, and parse each tool's "cannot open" message.
+    - Members inside an archive (`unzip a.zip dir/file`, `tar xf a.tar
+      dir/file`, `7z x a.7z name`) are resources, read only from the
+      archive's own listing (tar -tf, unzip -Z1, 7z l -ba) under probe
+      limits; listing never extracts.
+    - Passwords (`7z -p<pwd>`, `unzip -P`, `zip -P`, `rar -hp<pwd>`) are
+      secrets: never cached, logged, or shown in --explain/--json (redact
+      to `-p***`), and probes never prompt (zip -e, 7z without -p).
+    - Writes need approval when a correction changes them: an extraction
+      target (`-C`, `-d`, `-o`), an archive being created, overwrite flags
+      (unzip -o, 7z -y/-aoa, tar --overwrite), and in-place compressors
+      that replace or delete their input (gzip, gunzip, bzip2, xz, zstd
+      --rm). The legacy dirty_untar/dirty_unzip effects keep needing
+      approval.
+    Observed on 2026-10-05 (macOS): tar is bsdtar 3.5.3 (libarchive
+    3.7.4); 7-Zip 25.01, zip/unzip, gzip, bzip2, xz/lzma, zstd, lz4,
+    brotli, compress, cpio, ar, pax, and ditto are installed. The man
+    fallback repairs long options for tar, zip, gzip, bzip2, xz, and cpio
+    (`--verbsoe` -> `--verbose`, needing confirmation); unzip has a zsh
+    handler; ditto and 7z have no completer.
+[ ] NOT DONE: Data and text CLIs chained in pipelines: jq, yq, fzf,
+    xsv/qsv, gron, miller (mlr), csvkit (rg, fd, bat, jaq, and other
+    rewrites are in the Rust rewrites entry). yq (mikefarah) is expected to
+    be cobra. Observed: jq has a zsh handler.
+[ ] NOT DONE: Core shell tools: cp, mv, rm, mkdir, rmdir, chmod, chown,
+    chgrp, ln, touch, cat, head, tail, sort, uniq, wc, cut, tr, paste, join,
+    xargs, tee, find, grep, sed, awk/gawk/mawk, diff, patch, cmp, comm,
+    split, stat, readlink, realpath, basename, dirname, date, sleep,
+    timeout, watch, nohup, kill, pkill, pgrep, killall, ps, top, htop, df,
+    du, free, uname, uptime, whoami, id, env, printenv, which, whereis,
+    file, md5sum/shasum/sha256sum, base64, iconv, column, nl, seq, expr,
+    printf, echo, test, man, info, crontab, at. Requirements:
+    - Identify the implementation from the binary (GNU coreutils/findutils/
+      sed/grep, BSD as on macOS and FreeBSD, BusyBox, uutils) and use only
+      its options: `sed -i ''` vs `sed -i`, `date -v`/`-j` vs `date -d`,
+      `stat -f` vs `stat -c`, `xargs -r`, `grep -P`, `cp -t`, and `sort -h`
+      differ. GNU man pages can be stubs that defer to info, so GNU tools
+      also read --help.
+    - rm, rmdir, chmod/chown/chgrp -R, kill/pkill/killall, and crontab -r
+      keep needing approval; a changed target path or signal does too.
+    thefuck covers a few failures from output only: cp_omitting_directory,
+    cp_create_destination, no_such_file (mv/cp), mkdir_p, rm_dir, rm_root,
+    ln_no_hard_link, ln_s_order, touch, cat_dir, ls_all, ls_lah,
+    grep_arguments_order, grep_recursive, sed_unterminated_s, chmod_x, man,
+    and man_no_space (all ported). Observed (macOS, BSD tools): tail, sort,
+    and xargs option typos are repaired from man pages; cp, mv, mkdir,
+    chmod, head, date, sed, df, and crontab have zsh handlers (opt-in).
+[ ] NOT DONE: Editors and IDE launchers: vi, vim, nvim, emacs, emacsclient,
+    nano, micro, code (VS Code), cursor, zed, subl, the JetBrains launchers
+    (idea, pycharm, goland, ...), open (macOS), and xdg-open. Options come
+    from --help and man pages; file arguments are paths for the filesystem
+    provider; `+N`, `-c`/`--cmd` arguments are opaque; extension IDs
+    (`code --install-extension`) are marketplace resources (network).
+    Observed: vim and emacs option typos are repaired from man pages; nano
+    has no completer.
+[ ] NOT DONE: Network diagnostics, firewalls, and tunnels: ping, ping6,
+    traceroute, tracepath, netstat, ss, ip (iproute2), ifconfig, route, arp,
+    nslookup, whois, telnet, socat, nmap, masscan, tcpdump, tshark,
+    iptables, ip6tables, nft, ufw, firewall-cmd, pfctl, iw, nmcli,
+    networksetup (macOS), resolvectl, and ngrok. Requirements: interfaces
+    (`ifconfig en0`, `ip link show eth0`) are local resources listed
+    read-only; hosts are resources; ip's objects come from `ip help` and
+    iproute2's bash completion; nmcli is expected to answer
+    `nmcli --complete-args`. Firewall changes (adding, deleting, flushing
+    rules; ufw disable/reset) need approval, and discovery never needs
+    root. thefuck: ifconfig_device_not_found repairs interface names from
+    `ifconfig -a` (ported). Observed: ping, traceroute, netstat, ifconfig,
+    and nslookup have zsh handlers; nmap and tcpdump option typos are
+    repaired from man pages.
+[ ] NOT DONE: System administration, users, disks, and kernel: su, doas,
+    run0, useradd, usermod, userdel, groupadd, passwd, chpasswd, visudo,
+    shutdown, reboot, poweroff, hostnamectl, timedatectl, localectl,
+    loginctl, lsblk, blkid, fdisk, gdisk, parted, mkfs.*, fsck, mount,
+    umount, findmnt, swapon, LVM (pvcreate, vgcreate, lvcreate, lvremove),
+    mdadm, cryptsetup, zfs/zpool, btrfs, wipefs, shred, dd, diskutil
+    (macOS), dmesg, sysctl, modprobe, lsmod, chroot, nsenter, and unshare.
+    Requirements: device names (/dev/sdb, disk2), users, and pools are
+    resources listed read-only (lsblk, diskutil list); a correction that
+    changes which device, user, or pool is written always needs approval
+    and says so. Formatting, partitioning, wiping, removing volumes or
+    users, and shutting down need approval even unchanged by the edit; no
+    probe ever runs with sudo. thefuck: sudo, sudo_command_from_user_path,
+    and unsudo (ported). Observed: dd, mount, dmesg, and sysctl have zsh
+    handlers.
+[ ] NOT DONE: Compilers, linkers, and debuggers: gcc, g++, cc, c++, clang,
+    clang++, clang-tidy, clang-format, swiftc, tsc, zig, nasm, as, ld, lld,
+    meson, autoconf, automake, ./configure, pkg-config, gdb, lldb,
+    valgrind, perf, strace, ltrace, dtruss, dtrace, bpftrace, rr, objdump,
+    nm, readelf, ldd, otool, install_name_tool, codesign, lipo, strings,
+    addr2line, and c++filt. Requirements: compiler flags carry attached
+    values (-I/x, -L/x, -lfoo, -Wall, -Werror=x, -std=c++20, -O2,
+    -march=native, -fno-x) and are never split or shortened; flag families
+    come from the compiler itself (`gcc --help=warnings`,
+    `--help=optimizers`, `clang --help`) and clang's own "did you mean"
+    hints for unknown arguments; sources and objects are paths; debugger
+    REPL commands are out of scope. thefuck: cpp11 adds -std=c++11 for
+    g++/clang++ (ported). Observed: gcc and clang share a zsh handler;
+    lldb, objdump, otool, and pkg-config option typos are repaired from man
+    pages; g++ has no option source; zig has no completer (`zig help`
+    lists its commands).
+[ ] NOT DONE: Languages and REPLs: ruby/irb, perl/prove/cpan, lua/luajit,
+    R/Rscript, julia, kotlin/kotlinc, scala/scalac/scala-cli/sbt, swift
+    (build, test, package, run), ghc/ghci, erlang (erl, rebar3), elixir/iex,
+    dart, flutter, ipython, jupyter (lab, notebook, nbconvert, ...),
+    clojure/clj, lein, ocaml/dune, nim, and crystal. Requirements: subcommand
+    tools take commands from their own help or scripts (flutter is expected to
+    generate one with `flutter bash-completion`); jupyter's subcommands are
+    jupyter-<name> executables on PATH, discovered like git's and cargo's;
+    script files are paths. thefuck: prove_recursively, lein_not_task,
+    python_command, python_execute, java, and javac (ported). Observed: ruby
+    option typos are repaired from its man page; perl, lua, and swift have zsh
+    handlers.
+[ ] NOT DONE: Web framework CLIs: ng (Angular), vue, create-vite and vite,
+    next, nuxi, astro, svelte-kit, remix, nest, nx, turbo, lerna,
+    react-native, ionic, cordova, django-admin and manage.py, flask,
+    uvicorn, gunicorn, symfony, wp (WP-CLI), and drush. Requirements:
+    project-defined commands (manage.py commands, nx targets, turbo tasks,
+    ng schematics) come from the project, and listing them may run project
+    code, so they follow the workspace trust policy. Expected protocols:
+    yargs's --get-yargs-completions (the Angular CLI and other yargs apps)
+    and oclif's autocomplete plugin. thefuck (ported):
+    react_native_command_unrecognized, grunt_task_not_found, gulp_not_task,
+    django_south_ghost, django_south_merge, and rails_migrations_pending.
+[ ] NOT DONE: Mobile and device tools: adb, fastboot, emulator, avdmanager,
+    sdkmanager, xcodebuild, xcrun (simctl, notarytool, altool),
+    xcode-select, xcodes, pod (CocoaPods), carthage, fastlane, ios-deploy,
+    and libimobiledevice's idevice* tools. Requirements: device serials,
+    emulators (AVD names), simulators (`xcrun simctl list`), and schemes
+    and targets (`xcodebuild -list`) are local resources read offline;
+    `adb shell` arguments are opaque; fastlane lanes come from the project's
+    Fastfile (workspace trust). thefuck: adb_unknown_command reads adb's
+    printed command list (ported). Observed: xcodebuild and xcrun option
+    typos are repaired from man pages.
+[ ] NOT DONE: Media, documents, and static sites: ffmpeg, ffprobe, ffplay,
+    ImageMagick (magick, convert, identify, mogrify), gm, exiftool, sox,
+    yt-dlp, gifsicle, optipng, jpegoptim, cwebp, pandoc, latexmk, pdflatex,
+    xelatex, lualatex, tectonic, qpdf, pdftk, gs, hugo, jekyll, mkdocs,
+    sphinx-build, docusaurus, and eleventy. Requirements: ffmpeg's options
+    depend on position (input vs output) and stream specifiers (-c:v,
+    -b:a); codecs, formats, filters, and pixel formats come from ffmpeg
+    itself (-codecs, -formats, -filters, -pix_fmts); ImageMagick's
+    single-dash long options (-resize, -quality) and `magick -list` values;
+    pandoc's formats from --list-input-formats/--list-output-formats.
+    Output files are writes, and changing one needs approval. hugo is
+    expected to be cobra and mkdocs click. Observed: ffmpeg has a zsh
+    handler; magick and convert option typos are repaired from man pages.
+[ ] NOT DONE: Messaging and streaming: Apache Kafka's tools (kafka-topics,
+    kafka-console-producer, kafka-console-consumer, kafka-consumer-groups,
+    kafka-configs, kafka-acls, kafka-storage, and their .sh forms), kcat,
+    kafkactl, kaf, rpk (Redpanda), rabbitmqctl, rabbitmqadmin,
+    rabbitmq-plugins, nats, nats-server, mosquitto_pub, mosquitto_sub,
+    emqx, and pulsar-admin. Requirements: Kafka's Java tools have no
+    completer, so options come from --help; topics, consumer groups, and
+    brokers are resources looked up only with network_completion;
+    --bootstrap-server and --command-config stay in context; discovery
+    never connects to a broker. Expected protocols: cobra (kafkactl, kaf,
+    rpk), kingpin/fisk's --completion-bash (nats), and
+    `rabbitmqctl autocomplete`. Deleting topics or groups and resetting
+    offsets need approval.
+[ ] NOT DONE: Web servers, proxies, and certificates: nginx, apachectl/
+    apache2ctl, httpd, a2enmod/a2ensite, caddy, traefik, haproxy, envoy,
+    varnishadm, certbot, acme.sh, and mkcert. Requirements: config checks
+    (nginx -t, apachectl configtest, caddy validate, haproxy -c) are
+    commands like any other and never run during discovery; signal values
+    (`nginx -s stop|quit|reload|reopen`) come from help; stopping a server
+    and deleting or revoking certificates need approval; modules and sites
+    (a2enmod) are local resources; certificate names and domains are
+    resources. caddy is expected to be cobra.
+[ ] NOT DONE: Lint, format, and test runners: eslint, prettier, biome,
+    oxlint, stylelint, shellcheck, shfmt, hadolint, yamllint, markdownlint,
+    golangci-lint, staticcheck, mypy, pyright, rubocop, ktlint, swiftlint,
+    jest, vitest, mocha, playwright, cypress, phpunit, rspec, locust, wrk,
+    ab, vegeta, lefthook, and husky. Requirements: rule and linter names
+    (shellcheck SC codes, hadolint DL codes, `golangci-lint linters`) are
+    values listed by the tools offline; test names and files come from the
+    filesystem; discovery never runs tests or loads test configs that
+    execute code (jest --listTests does); npx/pnpm runners resolve to the
+    installed package. golangci-lint is expected to be cobra. Observed: ab
+    has no completer.
+[ ] NOT DONE: Database migrations and ORMs: flyway, liquibase, alembic,
+    prisma, goose, migrate (golang-migrate), dbmate, knex, sequelize-cli,
+    typeorm, dotnet ef, and the Rust/Ruby/Django tools in their entries.
+    Requirements: migration names and versions come from local files;
+    database state is a resource; discovery never connects to a database
+    or runs a migration; destructive verbs (flyway clean, liquibase
+    dropAll, prisma migrate reset, alembic downgrade, dbmate drop) need
+    approval.
+[ ] NOT DONE: Backup and sync: restic, borg, borgmatic, duplicity, kopia,
+    rsnapshot, tarsnap, and tmutil (macOS), alongside rclone (5A) and rsync.
+    Requirements: repositories and snapshots are resources; repository
+    passwords (RESTIC_PASSWORD, BORG_PASSPHRASE) are never logged or
+    cached; discovery never opens a repository; forget/prune/delete need
+    approval. Expected protocols: cobra (restic) and kingpin (kopia).
+[ ] NOT DONE: Security scanners and auditing: semgrep, gitleaks, trufflehog,
+    snyk, nikto, bandit, pip-audit, osv-scanner, checkov, tfsec, kube-bench,
+    lynis, and clamscan (trivy, grype, syft, and cargo audit/deny are in
+    their entries). Requirements: rule IDs and config names come from the
+    tools; scans that upload code or fetch rules (snyk test/monitor,
+    semgrep --config auto) are network operations that discovery never
+    triggers; scan targets (hosts, URLs) are resources, and scanning a
+    different one needs approval. Expected protocols: cobra (gitleaks),
+    kingpin (trufflehog), and click (semgrep).
+[ ] NOT DONE: Kubernetes development loop: skaffold, tilt, telepresence,
+    okteto, devspace, garden, kubefwd, and mirrord. Requirements: profiles
+    and modules come from project config (skaffold.yaml, Tiltfile);
+    cluster lookups need network_completion; connecting or intercepting
+    (telepresence connect/intercept) changes cluster state and needs
+    approval. skaffold, tilt, telepresence, okteto, and devspace are
+    expected to be cobra.
+[ ] NOT DONE: Dotfiles and environment managers: direnv, chezmoi, stow,
+    yadm, home-manager, dotbot, and rcm. Requirements: `direnv allow`
+    trusts and runs a project's .envrc, so a correction into it needs
+    approval; chezmoi apply and stow write files, and changing their target
+    needs approval. chezmoi is expected to be cobra.
+[ ] NOT DONE: Git and container TUIs and helpers: tig, lazygit, lazydocker,
+    ctop, git-flow, git-extras, git-absorb, and git-branchless (gitui, dive,
+    k9s, and sofka are in their entries). TUIs get only their argv flags and
+    subcommands and are never launched during discovery; git-* helpers on
+    PATH already appear through the git bridge (`git --list-cmds=others`).
+[ ] NOT DONE: AI and developer assistants: ollama, llm, claude (Claude
+    Code), aider, codex, gemini, opencode, goose, sgpt, and gh copilot.
+    Requirements: model names come from local listings only, and
+    discovery never starts a model server (`ollama list` talks to one); API
+    keys are secrets; prompts are free text and never corrected. ollama is
+    expected to be cobra and llm click. Observed: claude has no completer.
+[ ] NOT DONE: Remote access and VPN: tmate, tsh (Teleport), openvpn,
+    openconnect, wg-quick, zerotier-cli, netbird, sshuttle, and autossh
+    (ssh, mosh, tailscale, wg, cloudflared, and boundary are in their
+    entries). Requirements: profiles, peers, and nodes are resources;
+    connecting or bringing a tunnel up or down changes network state and
+    needs approval when the target changes. tsh is expected to use kingpin.
+[ ] NOT DONE: Extend the safety gate for the destructive operations named
+    in section 5B (disk formatting and wiping, user removal, shutdown,
+    firewall flushes, server stops, certificate deletion, migration resets,
+    backup pruning, tunnel and intercept changes), each with a fixture
+    showing that it needs approval and that -y can't bypass it.
+[ ] NOT DONE: Add the shared protocol bridges these entries need, each once
+    for every app that speaks it: npm's completion protocol, pip's
+    PIP_AUTO_COMPLETE, clap's dynamic completion, Symfony Console's
+    `_complete`, `dotnet complete`, urfave/cli's
+    --generate-bash-completion, cargo's command list (`cargo --list`), and
+    the package-manager protocols (dnf's completion helper, `flatpak
+    complete`, `winget complete`, NIX_GET_COMPLETIONS, go-flags), and the
+    remaining library protocols: click (_<PROG>_COMPLETE), yargs
+    (--get-yargs-completions), oclif's autocomplete, kingpin/fisk
+    (--completion-bash), `nmcli --complete-args`, and
+    `rabbitmqctl autocomplete`.
+    Record each protocol's offline behavior and capabilities before auditing
+    any app that uses it. clap's bridge takes the variable name and argument
+    layout from the app's generated script (`sofka completion zsh` runs
+    `SOFKA_COMPLETE=zsh _CLAP_COMPLETE_INDEX=<n> _CLAP_IFS=<sep> sofka --
+    <words>`, answering `value:description`); an app without that script is
+    never probed this way, since an unknown variable just runs the app.
+[ ] NOT DONE: Extend tests/installed_clis.rs (--ignored) with one typo per
+    installed 5B tool, and keep a per-tool record of discovery, protocol,
+    trust policy, and verified version. Tools missing locally are reported
+    as unverified, never as passed.
+
 6. CONTROL PROBES, CACHES, AND LATENCY
 
 [x] DONE: Centralize help/completion/plugin subprocesses with timeouts,
     process-tree cleanup, stdin disabled, output caps, and bounded concurrency.
+    ZLE uses a private controlling terminal with no input sent; completion
+    widgets themselves receive closed stdin. Screen refreshes are drained
+    separately from the bounded answer descriptor.
     engine::probe; probes run one at a time. Legacy rules keep their own
     subprocess helpers.
 [x] DONE: Spawn programs with explicit argument arrays; never interpolate
@@ -663,6 +1272,10 @@ SHARED IMPLEMENTATION AND COVERAGE TASKS
     engine::cache: per-backend fingerprint (completer and app files,
     extension/component directories, locale); a week's lifetime, bounded
     files, corruption ignored. git (cwd-dependent aliases) is not cached.
+    Disk caching is limited to command-only contexts from complete protocols;
+    preceding option/positional values and partial Bash/fish/Zsh handlers stay in
+    request memory. The cache namespace changed so old argument-bearing keys
+    are not reloaded/resaved. Privacy and within-request reuse have regressions.
 [x] DONE: Invalidate native metadata when the app, completer, installed
     components/extensions, or completion registration changes. Query fresh
     completion on unknown tokens or empty cached matches before abstaining;
@@ -682,7 +1295,10 @@ SHARED IMPLEMENTATION AND COVERAGE TASKS
     gcloud falls back to networked completion (disabled by
     _ARGCOMPLETE_TRACE=static); az checks for updates at startup (HTTP is
     routed to a closed port) and its resource completers need a login (a
-    private AZURE_CONFIG_DIR has none). Nothing is cached yet.
+    private AZURE_CONFIG_DIR has none). Native command/option lists and man
+    options are cached; values, credentials, and full help output are not
+    written to disk. Arbitrary opt-in scripts have blocked HTTP proxies but
+    retain the user's environment; they are not sandboxed or audited offline.
 [x] DONE: Ensure a chosen candidate's ranking is settled before allowing
     automatic acceptance. Later provider results cannot silently change a
     command already presented for execution.
@@ -692,12 +1308,17 @@ requests reuse applicable metadata without hiding changes to tool identity.
 
 7. RANK CANDIDATES AND ABSTAIN WHEN UNCERTAIN
 
-[ ] NOT DONE: Rank using token similarity, edit size, token role, command
+[x] DONE: Rank using token similarity, edit size, token role, command
     validity, explicit diagnostic hints, provider agreement, and relevant
     history. Use the selected app's current completion results as authoritative
     command vocabulary; native validation must constrain spelling candidates.
-    PARTIAL: similarity, edit size, native validity, hints, agreement, history,
-    and context fit; token role is not weighted.
+    Similarity, edit size, native validity, hints, agreement, history, and
+    context fit. Roles choose the comparison (ranking::Comparison: option
+    names compare without their dashes, so -x is not half of -v, and a
+    different dash style is one edit) and their evidence weights (missing
+    executable or path, app rejection, split discount). On the corpus's
+    long-option tier both comparisons score 100%; the difference shows on
+    short names and at stricter margins.
 [x] DONE: Favor a small correction to the diagnosed token over unrelated
     whole-command replacements. Handle transpositions and case sensitivity.
 [x] DONE: Deduplicate structurally equivalent edits with stable tie
@@ -706,9 +1327,10 @@ requests reuse applicable metadata without hiding changes to tool identity.
     scores are ranking signals, not calibrated probabilities of correctness.
 [x] DONE: Establish evidence thresholds and a best/second-best margin
     using a labeled corpus. Return ambiguity or abstention when unmet.
-    tests/corpus.rs: 715 labeled typos; ACCEPT 0.6 / MARGIN 0.08 decide
-    95.9% alone with no wrong decisions; equally supported alternatives are
-    a tie.
+    tests/corpus.rs: 934 labeled typos (163 in long option names captured
+    from fifteen commands' own completion); ACCEPT 0.6 / MARGIN 0.08 decide
+    96.5% alone with no wrong decisions; equally supported alternatives with
+    the same kind of repair are a tie.
 [x] DONE: Keep risk separate from confidence: a highly ranked candidate
     still has to pass the safety gate.
 
@@ -731,18 +1353,23 @@ history entry, and close competing candidates require user selection.
     Candidate generation and print-only output must not run those callbacks.
     dirty_untar/dirty_unzip delete extracted files; ssh_known_hosts deletes
     known_hosts keys. Each is a declared effect needing approval in the
-    native engine; the legacy engine is unchanged.
+    structured pipeline, including legacy rule suggestions; -y cannot bypass
+    approval for these callbacks.
 [x] DONE: Validate candidates from every provider, including completion,
     plugins, help, history, and stderr, through the same gate.
 [x] DONE: Define -y/alias behavior explicitly: ordinary low-risk fixes may
     use normal acceptance; ambiguity or elevated risk cannot bypass the gate
     merely because confirmation is disabled. Noninteractive refusal emits a
     diagnostic and no command for the alias to execute.
-[ ] NOT DONE: Revalidate required executable/path facts immediately before
+[x] DONE: Revalidate required executable/path facts immediately before
     approved effects and execution. Document unavoidable race conditions and
     that static analysis is not a proof that an arbitrary command is harmless.
-    PARTIAL: executables introduced by an engine edit are rechecked before
-    printing; races and the gate's limits are documented in README.
+    engine::revalidate rechecks, after selection and before printing, that
+    introduced programs (including split ones such as gitstatus) resolve to
+    executable files and repaired paths still exist (directories for cd,
+    executables in program position); a unit test changes each fact between
+    discovery and execution. README documents the remaining race and the
+    gate's limits. Legacy rule effects are declared to the gate instead.
 
 Acceptance: suggestions adding sudo, rm -rf, git reset --hard, or > to a
 different file need explicit approval; untrusted hints cannot inject another
@@ -762,7 +1389,10 @@ command, and rejection leaves command effects/history untouched.
 [x] DONE: Make print-only mode free of correction side effects/history
     writes. Generated shell functions execute only an approved selection in
     the parent shell so commands such as cd retain their behavior.
-    --explain runs no callbacks and writes no history.
+    --explain runs no callbacks and writes no history. Rust no longer appends
+    fish history files; the parent uses history append on fish 4+, retains the
+    original entry on older fish, and honors private sessions. Fish history
+    reads use XDG_DATA_HOME/session identity and decode escaped newlines/slashes.
 [x] DONE: Preserve fuck/typo/custom aliases, cancellation, history updates,
     confirmation settings, and existing shell integration regressions.
 [x] DONE: Document compatibility changes, provider/probe settings,
@@ -776,10 +1406,15 @@ executes it once. Aborting or a denied safety decision executes nothing.
 10. VALIDATE, MEASURE, AND ROLL OUT
 
 [x] DONE: Keep existing rule fixtures passing through the compatibility
-    engine; record deliberate behavior changes separately during migration.
+    source; record deliberate behavior changes separately during migration.
 [ ] NOT DONE: Add parser/edit fixtures for nested quotes, Unicode, pipelines,
     wrappers, redirects, substitutions, malformed input, and each dialect.
-    PARTIAL: sh/bash/zsh fixtures exist; other dialects are pending.
+    PARTIAL: sh/Bash/zsh, fish, and tcsh fixtures exist, including malformed
+    escapes, quotes, substitutions, byte escapes, operators, actual quote
+    execution, and compound commands/blocks checked against the installed
+    shells; tests/cli.rs repairs a loop body through real bash/zsh/fish
+    aliases and a quoted tcsh event through the real tcsh alias.
+    PowerShell remains pending.
 [x] DONE: Add meaningful provider fixtures with isolated directories,
     history, fake executables, help/man text, unavailable tools, and timeouts.
 [x] DONE: Add fake native completers for aws/gcloud/az that introduce
@@ -789,13 +1424,19 @@ executes it once. Aborting or a denied safety decision executes nothing.
     family and every provider/client entry in section 5A. Keep per-executable
     discovery, completion, correction, and environment coverage records.
     PARTIAL: every protocol family (aws_completer, argcomplete, git, cobra,
-    posener) has an upgrade fixture; most 5A clients have no check.
+    posener, Bash/Zsh functions, fish scripts) has an upgrade fixture; shell handler
+    cache identities change on app/registration upgrades. Most 5A clients have
+    no check.
 [ ] NOT DONE: Test mid-command token replacement, empty-prefix enumeration,
     multiple typos, nested groups, global flags, enum/resource values, quoting,
     and shell-specific native completion responses.
     PARTIAL: mid-command, empty-prefix, multiple typos, nested groups, global
-    options, enum values, and quoting are covered; resource values and
-    shell-specific responses are not.
+    options, enum values, and quoting are covered, including Bash/fish/Zsh native
+    responses and quoted attached values. Resource values are covered with a
+    fake completer that lists them only online: offline they are never looked
+    up; with network_completion they are, and an edit picking a different
+    resource needs approval while fixed values stay ordinary. PowerShell
+    responses are pending.
 [x] DONE: Verify context separation and graceful outcomes for absent CLIs,
     absent completers, expired credentials, offline mode, denied API reads,
     extension changes, and slow or malformed completion output.
@@ -804,38 +1445,67 @@ executes it once. Aborting or a denied safety decision executes nothing.
     without credentials; use explicit test context for any live resource reads.
     PARTIAL: tests/installed_clis.rs (--ignored) covers the 13 installed clients;
     the rest of the inventory has no check yet.
-[ ] NOT DONE: Test side-effect-free discovery/print-only paths and denied
+[x] DONE: Test side-effect-free discovery/print-only paths and denied
     execution using marker files and instrumented fake subprocesses.
-    PARTIAL: marker tests cover capture, discovery, --explain, and refusal; an
-    instrumented subprocess fake is pending.
-[ ] NOT DONE: Test injection attempts, risky legacy callbacks, ambiguous
+    Marker tests cover capture, discovery, --explain, and refusal. Instrumented
+    help fakes record exact argv for nested discovery and JSON/denied -y paths;
+    no failed arguments, operation marker, or history writes appear.
+[x] DONE: Test injection attempts, risky legacy callbacks, ambiguous
     diagnoses, malicious completion/help output, and noninteractive refusal.
-    PARTIAL: hint injection, declared callbacks, ambiguity, and noninteractive
-    refusal are tested; malicious completion/help output is not.
+    Hint injection, declared callbacks, ambiguity, and noninteractive refusal
+    are tested; malformed/shell-shaped help choices are ignored. Native words
+    with operators, quotes, or substitutions stay literal in POSIX/fish edits;
+    control characters, invalid UTF-8, failed and truncated answers are rejected.
+    Existing substitutions (including redirection targets) require approval,
+    and marker tests show they are neither replayed nor accepted by -y.
+    Unsupported shell dialects cannot bypass the gate through legacy rules;
+    removing unsupported original syntax still requires confirmation.
 [x] DONE: Build a labeled correction corpus; report top-1/top-3 accuracy,
     ambiguity/abstention rates, and unsafe automatic acceptances.
-    tests/corpus.rs: top-1 98.7%, top-3 100%, asked 4.1%, abstained 0%,
+    tests/corpus.rs: top-1 99.0%, top-3 100%, asked 3.5%, abstained 0%,
     wrong automatic decisions 0%.
 [ ] NOT DONE: Benchmark each pipeline stage and end-to-end cold/warm CLI
     latency (median and p95), subprocess counts, cache behavior, and RSS.
     Compare with the current Rust engine and the existing Python baseline.
     PARTIAL: benches/engine.rs (stages) and benchmarks/structured.py (cold/warm,
-    probes, RSS, rule engine where rerunning is harmless); not yet compared
-    with the Python baseline.
+    probes, RSS), plus help-vocabulary and fish parse/quote stages;
+    benchmarks/shell-results.md records eleven cold/warm runs through installed
+    fish/Zsh handlers using isolated apps, with four probes per run and operation
+    markers. Warm medians: fish 43 ms, Zsh 600 ms; RSS 5.8/5.2 MiB on macOS.
+    benchmarks/compare.py/results.md compare the default pipeline
+    with Python thefuck 3.32 (6-33x faster, 6.8 MiB vs 40.5 MiB). Remaining
+    shell/protocol paths and provider-stage measurements are still pending.
 [x] DONE: Set latency/memory budgets from measurements; preserve the
     inexpensive common-command path and report quality/performance tradeoffs.
     Engine work stays under ~2 ms per correction; probes are bounded by
-    probe_timeout (3 s each, 9 s total); the rule engine path is unchanged.
+    probe_timeout (3 s each, 9 s total). Native completer startup remains the
+    dominant cost on the default pipeline; legacy rule evaluation is unchanged.
 [x] DONE: Run cargo fmt --all -- --check; cargo test --locked --all-targets;
     cargo clippy --locked --all-targets --all-features -- -D warnings; and
     relevant benchmarks. Keep Linux Clippy verification in CI.
 [ ] NOT DONE: Validate Linux/macOS/Windows/FreeBSD builds and available real
     shell integrations. Report unavailable runtime coverage explicitly.
-[ ] NOT DONE: Verify cargo package and cargo publish --dry-run --locked;
+    PARTIAL: local macOS Bash/Zsh 5.9/fish 4.9.3 runtime checks pass, including
+    real ZLE queries. cargo check --locked --all-targets passes locally for
+    aarch64-unknown-linux-gnu, x86_64-pc-windows-msvc, and x86_64-unknown-freebsd;
+    these checks do not link or execute target binaries. CI installs
+    available Bash/zsh/fish for Linux/macOS/FreeBSD (plus tcsh and ksh on
+    Linux; macOS and FreeBSD ship tcsh); fish alias fixtures require
+    the fish 4 append API. Those CI runs and Windows runtime are unverified here.
+    All-target/all-feature Clippy with -D warnings also passes for these three
+    targets and the macOS host. 166 local tests pass (140 unit, 22 CLI,
+    one correction corpus, three rule fixture tests), plus benchmark smoke runs.
+[x] DONE: Verify cargo package and cargo publish --dry-run --locked;
     retain exclusions for /benches/ and /benchmarks/ and update public docs.
-[ ] NOT DONE: Switch the new engine on by default only after corpus, execution
-    policy, platform checks, and performance criteria pass. Retire migrated
+    Verified on macOS with --allow-dirty for the implementation worktree;
+    the 72-file archive includes the fish/Zsh handlers and shared Unix terminal
+    support, and excludes /plan/. No crate was uploaded.
+[ ] NOT DONE: Complete default-engine rollout validation against corpus,
+    execution policy, platform checks, and performance criteria. Retire migrated
     legacy paths gradually with documented compatibility behavior.
+    PARTIAL: 0b5ebd1 already made the structured pipeline mandatory, with legacy
+    rules behind the same gate. The corpus and measured POSIX paths pass;
+    non-POSIX dialects and complete platform/app coverage remain outstanding.
 
 IMPLEMENTATION ORDER
 
@@ -849,6 +1519,11 @@ Second slice: metadata/cache freshness + history/filesystem/stderr support
              + help/man fallback + git bridge + enabled resource completion.
 Third slice: broader shell syntax/dialects + additional native protocols
              + upgrade/extension coverage + default-engine rollout.
+Fourth slice: section 5B developer/DevOps tools: shared protocol bridges
+             (npm, pip, clap, cargo, Symfony Console, dotnet, urfave/cli,
+             dnf, flatpak, winget, nix, go-flags, click, yargs, oclif,
+             kingpin) first, then per-tool verification and installed-CLI
+             checks.
 Add relevant acceptance tests with each slice; testing and safety are not
 deferred until all providers exist. All seven requested candidate sources
 must be integrated before this plan is marked complete.
@@ -864,6 +1539,10 @@ DEFINITION OF DONE
     cloud command lists or a notypo update for each CLI update. Record real
     native capability limits for each client rather than claiming unsupported
     features work; generic discovery also handles unlisted supported-protocol apps.
+[ ] NOT DONE: Every tool in the developer/DevOps inventory (section 5B) gets
+    its vocabulary from its installed completer or a trusted handler, or
+    reports the missing completer and falls back to help, man pages, and
+    history, with the verified version recorded per tool.
 [ ] NOT DONE: Discovery does not replay failed commands, approved execution
     happens once, and unsupported/ambiguous/risky cases follow explicit policy.
 [ ] NOT DONE: Regression/platform/package checks pass, measured performance

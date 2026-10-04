@@ -57,6 +57,7 @@ fn encode(module: Option<&GoModule>) -> Vec<CompletionItem> {
                 .map(|value| CompletionItem {
                     value,
                     takes_value: None,
+                    description: None,
                 })
                 .collect()
         })
@@ -137,6 +138,19 @@ fn parse(info: &str) -> Option<GoModule> {
         path: path?,
         libraries,
     })
+}
+
+/// A file carrying Go module information, for tests of identification.
+#[cfg(all(test, unix))]
+pub(crate) fn fake_binary(path: &str, dependencies: &[&str]) -> Vec<u8> {
+    let mut data = vec![0u8; 64];
+    data.extend_from_slice(START);
+    data.extend_from_slice(format!("path\t{path}\nmod\t{path}\t(devel)\t\n").as_bytes());
+    for dependency in dependencies {
+        data.extend_from_slice(format!("dep\t{dependency}\tv1.0.0\th1:x\n").as_bytes());
+    }
+    data.extend_from_slice(END);
+    data
 }
 
 #[cfg(test)]

@@ -41,6 +41,9 @@ pub struct Vocabulary {
     pub source: Source,
     /// The answer came from the on-disk cache and may be out of date.
     pub cached: bool,
+    /// Words only a networked lookup listed: resource names (instances,
+    /// buckets) rather than the app's own fixed values.
+    pub resources: Vec<String>,
 }
 
 impl Vocabulary {
@@ -90,6 +93,7 @@ impl CandidateProvider for Executables<'_> {
             .map(|w| CompletionItem {
                 value: w.to_owned(),
                 takes_value: None,
+                description: None,
             })
             .collect();
         Answer::Words(Vocabulary {
@@ -98,6 +102,7 @@ impl CandidateProvider for Executables<'_> {
             via: "installed executables".into(),
             source: Source::Executables,
             cached: false,
+            resources: Vec::new(),
         })
     }
 }
@@ -116,6 +121,7 @@ pub struct NativeCompletion<'c> {
     caches: HashMap<String, Option<CompletionCache>>,
     memo: Memo,
     notes: Vec<String>,
+    shell: crate::shells::Shell,
 }
 
 impl<'c> NativeCompletion<'c> {
@@ -127,7 +133,13 @@ impl<'c> NativeCompletion<'c> {
             caches: HashMap::new(),
             memo: HashMap::new(),
             notes: Vec::new(),
+            shell: crate::shells::Shell::Bash,
         }
+    }
+
+    pub fn with_shell(mut self, shell: crate::shells::Shell) -> Self {
+        self.shell = shell;
+        self
     }
 
     /// Values the app lists for the option ending `context`. Never cached
@@ -159,9 +171,33 @@ impl<'c> NativeCompletion<'c> {
             .into_iter()
             .filter(|i| !i.is_option())
             .collect();
-        if words.is_empty() || words.iter().any(|w| w.value.contains('/')) {
+        if words.is_empty() {
             return None;
         }
+        // With network lookups on, words the offline answer lacks are
+        // resource names. If that answer fails, every word counts as one.
+        let resources = if backend.capabilities().resources {
+            let key = (program.to_owned(), context.to_vec(), "\0offline".to_owned());
+            let offline = match self.memo.get(&key) {
+                Some((hit, _)) => hit.clone(),
+                None => {
+                    let query: Vec<&str> = context.iter().map(String::as_str).collect();
+                    let result = backend.complete_offline_values(&query, budget);
+                    self.memo.insert(key, (result.clone(), false));
+                    result
+                }
+            };
+            let fixed: Vec<String> = offline
+                .map(|items| items.into_iter().map(|i| i.value).collect())
+                .unwrap_or_default();
+            words
+                .iter()
+                .filter(|w| !fixed.contains(&w.value))
+                .map(|w| w.value.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         Some(Vocabulary {
             words,
             // Value lists can lag the service (new regions, formats).
@@ -177,6 +213,7 @@ impl<'c> NativeCompletion<'c> {
             ),
             source: Source::NativeCompletion,
             cached: false,
+            resources,
         })
     }
 
@@ -223,30 +260,42 @@ impl<'c> NativeCompletion<'c> {
         if !self.backends.contains_key(program) {
             let found = match path {
                 None => None,
-                Some(path) => match native::discover(program, path, self.trusted) {
-                    Discovery::Found(mut backend) => {
-                        backend.network = self.network;
-                        self.note(format!(
-                            "{program}: native completion via {} ({} protocol); {}",
-                            backend.location(),
-                            backend.id(),
-                            if backend.network {
-                                "resource names may be looked up with your credentials"
-                            } else {
-                                "resource names are not looked up offline"
-                            }
-                        ));
-                        Some(Rc::new(backend) as Rc<dyn NativeCompletionBackend>)
+                Some(path) => {
+                    match native::discover_for_shell(program, path, self.trusted, self.shell) {
+                        Discovery::Found(mut backend) => {
+                            backend.network = self.network;
+                            self.note(format!(
+                                "{program}: native completion via {} ({} protocol{}, {}); {}",
+                                backend.location(),
+                                backend.id(),
+                                backend
+                                    .identity
+                                    .as_deref()
+                                    .map(|identity| format!(", app {identity}"))
+                                    .unwrap_or_default(),
+                                match backend.trust {
+                                    native::Trust::Bridge => "built-in bridge",
+                                    native::Trust::Audited => "audited",
+                                    native::Trust::UserTrusted => "trusted_completers",
+                                },
+                                if backend.network {
+                                    "resource names may be looked up with your credentials"
+                                } else {
+                                    "resource names are not looked up offline"
+                                }
+                            ));
+                            Some(Rc::new(backend) as Rc<dyn NativeCompletionBackend>)
+                        }
+                        Discovery::None => {
+                            self.note(format!("{program}: no native completion found"));
+                            None
+                        }
+                        Discovery::NotTrusted(why) | Discovery::Unavailable(why) => {
+                            self.note(format!("{program}: {why}"));
+                            None
+                        }
                     }
-                    Discovery::None => {
-                        self.note(format!("{program}: no native completion found"));
-                        None
-                    }
-                    Discovery::NotTrusted(why) | Discovery::Unavailable(why) => {
-                        self.note(format!("{program}: {why}"));
-                        None
-                    }
-                },
+                }
             };
             self.backends.insert(program.to_owned(), found);
         }
@@ -277,6 +326,13 @@ impl CandidateProvider for NativeCompletion<'_> {
         } else {
             ""
         };
+        // Arguments (including global option values) can carry secrets.
+        // Handwritten handlers may mix command words and resource names.
+        // Only an authoritative command-only context may reach disk.
+        let capabilities = backend.capabilities();
+        let cacheable = capabilities.complete_subcommands
+            && capabilities.complete_options
+            && slot.context == slot.command_path;
         let key = (
             slot.program.to_owned(),
             slot.context.to_vec(),
@@ -286,7 +342,7 @@ impl CandidateProvider for NativeCompletion<'_> {
         let (result, cached) = match self.memo.get(&key) {
             Some((hit, cached)) if !(slot.fresh && *cached) => (hit.clone(), *cached),
             _ => {
-                let from_disk = (!slot.fresh)
+                let from_disk = (cacheable && !slot.fresh)
                     .then(|| self.cache(slot.program, &*backend))
                     .flatten()
                     .and_then(|cache| cache.get(&disk_key).map(<[_]>::to_vec));
@@ -295,7 +351,8 @@ impl CandidateProvider for NativeCompletion<'_> {
                     None => {
                         let words: Vec<&str> = slot.context.iter().map(String::as_str).collect();
                         let result = backend.complete(&words, prefix, budget);
-                        if let Ok(items) = &result
+                        if cacheable
+                            && let Ok(items) = &result
                             && let Some(cache) = self.cache(slot.program, &*backend)
                         {
                             cache.put(disk_key, items.clone());
@@ -313,10 +370,15 @@ impl CandidateProvider for NativeCompletion<'_> {
                     .into_iter()
                     .filter(|i| i.is_option() == options)
                     .collect(),
-                authoritative: !options || backend.capabilities().complete_options,
+                authoritative: if options {
+                    backend.capabilities().complete_options
+                } else {
+                    backend.capabilities().complete_subcommands
+                },
                 via,
                 source: Source::NativeCompletion,
                 cached,
+                resources: Vec::new(),
             }),
             // The protocol has no data for this position (gcloud's static
             // tree and positionals): nothing here is a subcommand.
@@ -326,6 +388,7 @@ impl CandidateProvider for NativeCompletion<'_> {
                 via,
                 source: Source::NativeCompletion,
                 cached: false,
+                resources: Vec::new(),
             }),
             Err(error) => {
                 self.note(format!(
@@ -363,6 +426,7 @@ impl CandidateProvider for ErrorHints {
             .map(|s| CompletionItem {
                 value: s.clone(),
                 takes_value: None,
+                description: None,
             })
             .collect();
         if words.is_empty() {
@@ -374,6 +438,7 @@ impl CandidateProvider for ErrorHints {
             via: "error output".into(),
             source: Source::Stderr,
             cached: false,
+            resources: Vec::new(),
         })
     }
 }
@@ -400,9 +465,17 @@ pub struct History {
 impl History {
     /// Indexes `lines`, skipping those `skip` rejects (correction calls).
     pub fn new(lines: &[String], skip: impl Fn(&str) -> bool) -> History {
+        Self::with_dialect(lines, super::parser::Dialect::Posix, skip)
+    }
+
+    pub fn with_dialect(
+        lines: &[String],
+        dialect: super::parser::Dialect,
+        skip: impl Fn(&str) -> bool,
+    ) -> History {
         let mut history = History::default();
         for line in lines.iter().filter(|l| !skip(l)) {
-            for command in super::parser::parse(line).commands {
+            for command in super::parser::parse_with_dialect(line, dialect).commands {
                 let Some(p) = super::diagnosis::effective_program(&command.words) else {
                     continue;
                 };
@@ -471,6 +544,7 @@ impl CandidateProvider for History {
                         .map(|(w, _)| CompletionItem {
                             value: w.clone(),
                             takes_value: None,
+                            description: None,
                         })
                         .collect()
                 })
@@ -485,6 +559,7 @@ impl CandidateProvider for History {
             via: "shell history".into(),
             source: Source::History,
             cached: false,
+            resources: Vec::new(),
         })
     }
 }
@@ -572,15 +647,18 @@ impl CandidateProvider for ManPages {
             via: "man page".into(),
             source: Source::ManPage,
             cached: false,
+            resources: Vec::new(),
         })
     }
 }
 
-/// Options and subcommands from `<program> --help`, for programs the user
-/// listed in `trusted_help` (running a program can always have effects).
+/// Options, subcommands, and documented values from
+/// `<program> [commands] --help`, for programs listed in `trusted_help`.
+/// Running a program can always have effects.
 pub struct HelpText<'c> {
     pub trusted: &'c [String],
-    texts: HashMap<String, Option<String>>,
+    texts: HashMap<(PathBuf, Vec<String>), Option<String>>,
+    notes: Vec<String>,
 }
 
 impl<'c> HelpText<'c> {
@@ -588,26 +666,72 @@ impl<'c> HelpText<'c> {
         HelpText {
             trusted,
             texts: HashMap::new(),
+            notes: Vec::new(),
         }
     }
 
-    fn text(&mut self, program: &str, path: &PathBuf, budget: &mut Budget) -> Option<&str> {
-        if !self.texts.contains_key(program) {
-            let text = self.read(program, path, budget);
-            self.texts.insert(program.to_owned(), text);
-        }
-        self.texts[program].as_deref()
-    }
-
-    fn read(&self, program: &str, path: &PathBuf, budget: &mut Budget) -> Option<String> {
+    fn text(
+        &mut self,
+        program: &str,
+        path: &PathBuf,
+        commands: &[String],
+        budget: &mut Budget,
+    ) -> Option<&str> {
         let trusted = self.trusted.iter().any(|t| t == "*" || t == program);
         if !trusted || !super::probe::is_trusted_location(path) {
             return None;
         }
+        // Walk iteratively, so even malformed paths supplied by an embedder
+        // cannot cause unbounded recursion before the first budgeted probe.
+        for depth in 0..=commands.len() {
+            let key = (path.clone(), commands[..depth].to_vec());
+            if let Some(text) = self.texts.get(&key) {
+                text.as_ref()?;
+                continue;
+            }
+            if depth > 0 {
+                // Only a word listed as a command by its parent's help may
+                // be passed to a probe. History and positional values cannot
+                // authorize running an operation to obtain documentation.
+                let documented = self
+                    .texts
+                    .get(&(path.clone(), commands[..depth - 1].to_vec()))
+                    .and_then(|text| text.as_deref())
+                    .is_some_and(|text| {
+                        super::docs::subcommands(text)
+                            .iter()
+                            .any(|item| item.value == commands[depth - 1])
+                    });
+                if !documented {
+                    self.texts.insert(key, None);
+                    return None;
+                }
+            }
+            let text = self.read(program, path, &commands[..depth], budget);
+            let failed = text.is_none();
+            self.texts.insert(key, text);
+            if failed {
+                return None;
+            }
+        }
+        self.texts[&(path.clone(), commands.to_vec())].as_deref()
+    }
+
+    fn read(
+        &mut self,
+        program: &str,
+        path: &PathBuf,
+        commands: &[String],
+        budget: &mut Budget,
+    ) -> Option<String> {
         let output = super::probe::run(
             &super::probe::Probe {
                 program: path,
-                args: vec!["--help".into()],
+                args: commands
+                    .iter()
+                    .map(Into::into)
+                    .chain(["--help".into()])
+                    .collect(),
                 env: [
                     "HTTP_PROXY",
                     "HTTPS_PROXY",
@@ -622,8 +746,27 @@ impl<'c> HelpText<'c> {
                 capture: super::probe::Capture::Combined,
             },
             budget,
-        )
-        .ok()?;
+        );
+        let output = match output {
+            Ok(output) if output.status == Some(0) && !output.truncated => output,
+            Ok(output) => {
+                self.notes.push(format!(
+                    "{program} {} --help: {}",
+                    commands.join(" "),
+                    if output.truncated {
+                        "output exceeded the probe limit".to_owned()
+                    } else {
+                        format!("exited with {:?}", output.status)
+                    }
+                ));
+                return None;
+            }
+            Err(error) => {
+                self.notes
+                    .push(format!("{program} {} --help: {error}", commands.join(" ")));
+                return None;
+            }
+        };
         Some(super::docs::strip_overstrike(&String::from_utf8_lossy(
             &output.data,
         )))
@@ -640,19 +783,64 @@ impl CandidateProvider for HelpText<'_> {
             return Answer::NotApplicable;
         };
         let role = slot.role;
-        if role == TokenRole::Executable
-            || (role == TokenRole::Subcommand && !slot.command_path.is_empty())
-        {
+        if !matches!(
+            role,
+            TokenRole::Subcommand | TokenRole::OptionName | TokenRole::OptionValue
+        ) {
             return Answer::NotApplicable;
         }
-        let Some(text) = self.text(slot.program, path, budget) else {
-            return Answer::NotApplicable;
-        };
-        let words = if role == TokenRole::OptionName {
-            super::docs::options(text)
+        let option = if role == TokenRole::OptionValue {
+            let Some(option) = slot
+                .context
+                .last()
+                .filter(|w| w.starts_with('-') && !w.contains('='))
+            else {
+                return Answer::NotApplicable;
+            };
+            Some(option.as_str())
         } else {
-            super::docs::subcommands(text)
+            None
         };
+        let mut words = Vec::new();
+        // Options from ancestors may be global; leaf declarations take
+        // precedence. Subcommands belong only to the requested level.
+        let depths: Vec<_> = if role == TokenRole::Subcommand {
+            vec![slot.command_path.len()]
+        } else {
+            (0..=slot.command_path.len()).rev().collect()
+        };
+        for depth in depths {
+            let Some(text) = self.text(slot.program, path, &slot.command_path[..depth], budget)
+            else {
+                continue;
+            };
+            let items = match role {
+                TokenRole::OptionName => super::docs::options(text),
+                TokenRole::OptionValue => {
+                    let option = option.unwrap();
+                    if !super::docs::options(text)
+                        .iter()
+                        .any(|item| item.value == option)
+                    {
+                        continue;
+                    }
+                    // A leaf's declaration shadows an ancestor's enum, even
+                    // when the leaf does not document a finite vocabulary.
+                    words = super::docs::option_values(text, option);
+                    break;
+                }
+                _ => super::docs::subcommands(text),
+            };
+            for item in items {
+                if !words
+                    .iter()
+                    .any(|known: &CompletionItem| known.value == item.value)
+                {
+                    words.push(item);
+                }
+            }
+        }
+        words.truncate(budget.max_candidates);
         if words.is_empty() {
             return Answer::NotApplicable;
         }
@@ -662,7 +850,12 @@ impl CandidateProvider for HelpText<'_> {
             via: "--help output".into(),
             source: Source::Help,
             cached: false,
+            resources: Vec::new(),
         })
+    }
+
+    fn notes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notes)
     }
 }
 
@@ -759,4 +952,239 @@ pub fn repair_path(
             (text, score)
         })
         .collect()
+}
+
+#[cfg(all(test, unix))]
+mod completion_cache_tests {
+    use super::*;
+    use crate::engine::native::{Backend, Flavor, tests::Dir};
+    use std::time::Duration;
+
+    #[test]
+    fn option_values_never_reach_disk_but_requests_still_memoize_answers() {
+        let dir = Dir::new("cache-arguments");
+        let app = dir.script("app", "#!/bin/sh\nprintf '%s\\n' '--verbose' ':4'\n");
+        let backend = Backend::new(Flavor::Cobra, "app", app);
+        let cache_path = crate::utils::cache_dir()
+            .join("completion")
+            .join(format!("cobra-{}.json", backend.cache_identity().unwrap()));
+        let mut completion =
+            NativeCompletion::new(&[], false).with_backend("app", Rc::new(backend));
+        let command_path = vec!["build".into()];
+        let context = vec!["build".into(), "--token".into(), "private-argument".into()];
+        let slot = Slot {
+            role: TokenRole::OptionName,
+            program: "app",
+            path: None,
+            context: &context,
+            command_path: &command_path,
+            typed: "--verbose",
+            fresh: false,
+        };
+        let mut budget = Budget::new(Duration::from_secs(5), Duration::from_secs(2), 8);
+        for _ in 0..2 {
+            let Answer::Words(words) = completion.vocabulary(&slot, &mut budget) else {
+                panic!("native answers must remain usable")
+            };
+            assert!(words.contains("--verbose"));
+            assert!(!words.cached);
+        }
+        assert_eq!(
+            budget.spawned(),
+            1,
+            "memoize within this request without persisting arguments"
+        );
+        completion.persist();
+        assert!(!cache_path.exists());
+        let safe_slot = Slot {
+            context: &command_path,
+            ..slot
+        };
+        assert!(matches!(
+            completion.vocabulary(&safe_slot, &mut budget),
+            Answer::Words(_)
+        ));
+        completion.persist();
+        let cached = std::fs::read_to_string(&cache_path).unwrap();
+        assert!(cached.contains("--verbose"));
+        assert!(!cached.contains("private-argument"));
+        let _ = std::fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn partial_shell_handler_lists_are_never_written_to_disk() {
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let dir = Dir::new("cache-shell-resources");
+        let script = dir.script(
+            "completion",
+            "_app() { COMPREPLY=(private-resource); }\ncomplete -F _app app\n",
+        );
+        let backend = Backend::new(Flavor::BashFunction, "app", bash).with_helper(script);
+        let cache_path = crate::utils::cache_dir()
+            .join("completion")
+            .join(format!("bash-{}.json", backend.cache_identity().unwrap()));
+        let mut completion =
+            NativeCompletion::new(&[], false).with_backend("app", Rc::new(backend));
+        let slot = Slot {
+            role: TokenRole::Subcommand,
+            program: "app",
+            path: None,
+            context: &[],
+            command_path: &[],
+            typed: "private-resoruce",
+            fresh: false,
+        };
+        let mut budget = Budget::new(Duration::from_secs(5), Duration::from_secs(2), 4);
+        let Answer::Words(words) = completion.vocabulary(&slot, &mut budget) else {
+            panic!("handler answer")
+        };
+        assert!(words.contains("private-resource"));
+        assert!(!words.authoritative);
+        completion.persist();
+        assert!(!cache_path.exists());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod help_tests {
+    use super::*;
+    use crate::engine::native::tests::Dir;
+    use std::time::Duration;
+
+    fn slot<'a>(path: &'a PathBuf, commands: &'a [String]) -> Slot<'a> {
+        Slot {
+            role: TokenRole::Subcommand,
+            program: "tool",
+            path: Some(path),
+            context: commands,
+            command_path: commands,
+            typed: "biuld",
+            fresh: false,
+        }
+    }
+
+    fn budget() -> Budget {
+        Budget::new(Duration::from_secs(2), Duration::from_secs(1), 4)
+    }
+
+    #[test]
+    fn history_words_and_untrusted_aliases_cannot_authorize_help_probes() {
+        let dir = Dir::new("help-trust");
+        let path = dir.script(
+            "tool",
+            r#"#!/bin/sh
+if [ "$*" = --help ]; then
+  printf 'Commands:\n  build    Build\n'
+else
+  touch "$(dirname "$0")/ran"
+fi
+"#,
+        );
+        let trusted = vec!["tool".into()];
+        let mut help = HelpText::new(&trusted);
+        let mut budget = budget();
+        let commands = vec!["history-word".into()];
+        assert_eq!(
+            help.vocabulary(&slot(&path, &commands), &mut budget),
+            Answer::NotApplicable
+        );
+        assert_eq!(budget.spawned(), 1, "only root help may be read");
+        let mut alias = slot(&path, &[]);
+        alias.program = "untrusted-alias";
+        assert_eq!(
+            help.vocabulary(&alias, &mut budget),
+            Answer::NotApplicable,
+            "the trusted name's memo must not bypass the alias's trust policy"
+        );
+        assert!(!dir.0.join("ran").exists());
+    }
+
+    #[test]
+    fn failed_truncated_and_timed_out_help_is_reported_and_not_used() {
+        let trusted = vec!["tool".into()];
+        for (script, max_output, per_probe, reason) in [
+            (
+                "#!/bin/sh\nprintf 'Commands:\\n  build    Build\\n'\nexit 4\n",
+                4096,
+                1.0,
+                "exited with",
+            ),
+            (
+                "#!/bin/sh\nprintf 'Commands:\\n  build    Build\\n'\ni=0\nwhile [ $i -lt 100 ]; do printf '  build    Build\\n'; i=$((i + 1)); done\n",
+                32,
+                1.0,
+                "probe limit",
+            ),
+            (
+                "#!/bin/sh\nsleep 2\ntouch \"$(dirname \"$0\")/ran\"\n",
+                4096,
+                0.03,
+                "timed out",
+            ),
+        ] {
+            let dir = Dir::new("help-failure");
+            let path = dir.script("tool", script);
+            let mut help = HelpText::new(&trusted);
+            let mut budget = Budget::new(
+                Duration::from_secs(2),
+                Duration::from_secs_f64(per_probe),
+                2,
+            );
+            budget.max_output = max_output;
+            assert_eq!(
+                help.vocabulary(&slot(&path, &[]), &mut budget),
+                Answer::NotApplicable,
+                "{reason}"
+            );
+            assert!(
+                help.notes().iter().any(|note| note.contains(reason)),
+                "{reason}"
+            );
+            assert_eq!(
+                help.vocabulary(&slot(&path, &[]), &mut budget),
+                Answer::NotApplicable
+            );
+            assert_eq!(
+                budget.spawned(),
+                1,
+                "failed queries aren't retried in the same request"
+            );
+            assert!(!dir.0.join("ran").exists());
+        }
+    }
+
+    #[test]
+    fn leaf_options_shadow_global_choices_and_candidates_are_bounded() {
+        let dir = Dir::new("help-shadow");
+        let path = dir.script("tool", r#"#!/bin/sh
+case "$*" in
+  '--help') printf 'Commands:\n  build    Build\n  deploy   Deploy\n\nOptions:\n  --format {json,yaml}  Format\n';;
+  'build --help') printf 'Options:\n  --format <FORMAT>  Free-form format\n';;
+  *) touch "$(dirname "$0")/ran";;
+esac
+"#);
+        let trusted = vec!["tool".into()];
+        let mut help = HelpText::new(&trusted);
+        let mut budget = budget();
+        budget.max_candidates = 1;
+        let Answer::Words(words) = help.vocabulary(&slot(&path, &[]), &mut budget) else {
+            panic!("root commands missing")
+        };
+        assert_eq!(words.words.len(), 1);
+        let commands = vec!["build".into()];
+        let context = vec!["build".into(), "--format".into()];
+        let value_slot = Slot {
+            role: TokenRole::OptionValue,
+            context: &context,
+            ..slot(&path, &commands)
+        };
+        assert_eq!(
+            help.vocabulary(&value_slot, &mut budget),
+            Answer::NotApplicable,
+            "a free-form leaf value must not be repaired to a global enum"
+        );
+        assert!(!dir.0.join("ran").exists());
+    }
 }

@@ -1,8 +1,9 @@
 //! Bounded discovery subprocesses, such as native completers.
 //!
-//! Probes never run through a shell: the program and its arguments form an
-//! explicit argument vector, so candidate text cannot become shell syntax.
-//! stdin is closed, captured output is capped, and a probe that outlives its
+//! Programs and arguments form an explicit argument vector. Shell adapters
+//! use fixed drivers with candidate text passed as literal arguments.
+//! stdin is closed (ZLE has a private terminal), captured output is capped,
+//! and a probe that outlives its
 //! timeout is killed together with every process it started. A shared
 //! [`Budget`] bounds the number of probes and their total running time.
 
@@ -123,6 +124,35 @@ pub fn is_trusted_location(path: &Path) -> bool {
 }
 
 pub fn run(probe: &Probe, budget: &mut Budget) -> Result<ProbeOutput, ProbeError> {
+    run_inner(probe, budget, false)
+}
+
+/// A private controlling terminal for native ZLE widgets. No input is sent
+/// to it: `vared` runs a completion widget from its line-init hook, and the
+/// completion function itself receives closed stdin. Answers use the same
+/// bounded capture pipe as every other probe.
+pub(crate) fn run_completion_terminal(
+    probe: &Probe,
+    budget: &mut Budget,
+) -> Result<ProbeOutput, ProbeError> {
+    #[cfg(unix)]
+    {
+        run_inner(probe, budget, true)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (probe, budget);
+        Err(ProbeError::Unsupported(
+            "ZLE completion requires a Unix terminal",
+        ))
+    }
+}
+
+fn run_inner(
+    probe: &Probe,
+    budget: &mut Budget,
+    completion_terminal: bool,
+) -> Result<ProbeOutput, ProbeError> {
     #[cfg(windows)]
     if matches!(probe.capture, Capture::Descriptor(_)) {
         return Err(ProbeError::Unsupported(
@@ -181,7 +211,23 @@ pub fn run(probe: &Probe, budget: &mut Budget) -> Result<ProbeOutput, ProbeError
         }
     }
     #[cfg(unix)]
-    process.process_group(0);
+    let terminal = if completion_terminal {
+        let size = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let (master, slave) = crate::platform::unix::open_pty(&size).map_err(ProbeError::Spawn)?;
+        process.stdin(slave);
+        crate::platform::unix::controlling_terminal(&mut process);
+        Some(master)
+    } else {
+        process.process_group(0);
+        None
+    };
+    #[cfg(not(unix))]
+    let _ = completion_terminal;
     #[cfg(windows)]
     process.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
     let spawned = process.spawn();
@@ -197,6 +243,15 @@ pub fn run(probe: &Probe, budget: &mut Budget) -> Result<ProbeOutput, ProbeError
         }
     };
     drop(process);
+
+    #[cfg(unix)]
+    if let Some(mut master) = terminal {
+        // ZLE writes screen refreshes to its tty, independently of the
+        // completion answer pipe. Drain them so rendering cannot hang it.
+        thread::spawn(move || {
+            let _ = io::copy(&mut master, &mut io::sink());
+        });
+    }
 
     let limit = budget.max_output;
     let (done, finished) = mpsc::channel();

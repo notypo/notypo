@@ -25,7 +25,8 @@ pub struct SafetyAssessment {
 }
 
 impl SafetyAssessment {
-    fn flag(&mut self, decision: Decision, reason: String) {
+    /// Raises the decision to at least `decision`, recording why.
+    pub(crate) fn flag(&mut self, decision: Decision, reason: String) {
         self.decision = self.decision.max(decision);
         if !self.reasons.contains(&reason) {
             self.reasons.push(reason);
@@ -161,6 +162,7 @@ fn output_redirections(script: &Script) -> HashSet<(String, String)> {
         .commands
         .iter()
         .flat_map(|c| &c.redirections)
+        .chain(script.compounds.iter().flat_map(|c| &c.redirections))
         .filter(|r| r.operator.of(&script.source).contains('>'))
         .map(|r| {
             (
@@ -181,10 +183,27 @@ fn substitutions(script: &Script) -> HashSet<&str> {
     script
         .commands
         .iter()
-        .flat_map(|c| c.assignments.iter().chain(&c.words))
+        .flat_map(|c| {
+            c.assignments
+                .iter()
+                .chain(&c.words)
+                .chain(c.redirections.iter().filter_map(|r| r.target.as_ref()))
+        })
+        // Loop items, case subjects, and compound redirections expand too.
+        .chain(script.compounds.iter().flat_map(|c| {
+            c.words
+                .iter()
+                .chain(c.redirections.iter().filter_map(|r| r.target.as_ref()))
+        }))
         .filter(|w| w.literal().is_none())
         .map(|w| w.span.of(&script.source))
-        .filter(|raw| ["$(", "`", "<(", ">("].iter().any(|s| raw.contains(s)))
+        .filter(|raw| {
+            if script.dialect == parser::Dialect::Fish {
+                raw.contains('(')
+            } else {
+                ["$(", "`", "<(", ">("].iter().any(|s| raw.contains(s))
+            }
+        })
         .collect()
 }
 
@@ -210,12 +229,32 @@ pub fn assess(original: &Script, candidate: &str, effects: &[DeclaredEffect]) ->
     for effect in effects {
         gate.flag(Decision::Confirm, effect.describe());
     }
-    let new = parser::parse(candidate);
+    if !original.is_fully_supported() {
+        gate.flag(
+            Decision::Confirm,
+            "the original command uses syntax notypo can't analyze".into(),
+        );
+    }
+    let new = parser::parse_with_dialect(candidate, original.dialect);
+    if new.commands.iter().any(|command| {
+        command.words.first().is_some_and(|w| w.literal().is_none())
+            || effective_program(&command.words).is_none()
+                && command.words.iter().any(|word| word.literal().is_none())
+    }) {
+        gate.flag(
+            Decision::Confirm,
+            "the executable depends on an expansion".into(),
+        );
+    }
     for diagnostic in &new.diagnostics {
         match diagnostic.kind {
             DiagnosticKind::CompoundCommand | DiagnosticKind::HereDocument => gate.flag(
                 Decision::Confirm,
                 "uses shell syntax notypo can't analyze".into(),
+            ),
+            DiagnosticKind::HistorySubstitution | DiagnosticKind::QuotedNewline => gate.flag(
+                Decision::Refuse,
+                "tcsh would not run this text as written".into(),
             ),
             _ => gate.flag(Decision::Refuse, "the correction is malformed".into()),
         }
@@ -223,6 +262,12 @@ pub fn assess(original: &Script, candidate: &str, effects: &[DeclaredEffect]) ->
 
     if new.commands.len() > original.commands.len() {
         gate.flag(Decision::Confirm, "adds another command".into());
+    }
+    if new.compound_shapes() != original.compound_shapes() {
+        gate.flag(
+            Decision::Confirm,
+            "changes the loops, conditionals, groups, or functions around the commands".into(),
+        );
     }
     let old_ops: HashSet<_> = original
         .commands
@@ -238,6 +283,11 @@ pub fn assess(original: &Script, candidate: &str, effects: &[DeclaredEffect]) ->
     for sub in substitutions(&new) {
         if !old_subs.contains(sub) {
             gate.flag(Decision::Confirm, format!("adds the substitution {sub}"));
+        } else {
+            gate.flag(
+                Decision::Confirm,
+                format!("runs a command substitution with unknown effects: {sub}"),
+            );
         }
     }
     let old_writes = output_redirections(original);
@@ -361,10 +411,18 @@ pub fn assess(original: &Script, candidate: &str, effects: &[DeclaredEffect]) ->
 /// when `replay_for_diagnosis` asks for it). The same policy as for a
 /// corrected command applies, and any output redirection would write again.
 pub fn assess_replay(command: &str) -> SafetyAssessment {
-    let script = parser::parse(command);
+    assess_replay_with_dialect(command, parser::Dialect::Posix)
+}
+
+pub fn assess_replay_with_dialect(command: &str, dialect: parser::Dialect) -> SafetyAssessment {
+    let script = parser::parse_with_dialect(command, dialect);
     let mut gate = assess(&script, command, &[]);
     for (op, target) in output_redirections(&script) {
         gate.flag(Decision::Confirm, format!("writes to {target} ({op})"));
+    }
+    if !script.compounds.is_empty() {
+        // A loop or condition may run its commands many times, or never stop.
+        gate.flag(Decision::Confirm, "reruns a compound command".into());
     }
     if script.commands.is_empty() {
         gate.flag(Decision::Refuse, "nothing to run".into());
@@ -415,6 +473,15 @@ mod tests {
             ),
             ("ls --colro=auto > out.txt", "ls --color=auto > out.txt"),
             ("sudo apt-get updte", "sudo apt-get updtae"),
+            ("{ ehco x; } > out", "{ echo x; } > out"),
+            (
+                "for f in a b; do ctt \"$f\"; done",
+                "for f in a b; do cat \"$f\"; done",
+            ),
+            (
+                "if gti diff; then echo y; fi",
+                "if git diff; then echo y; fi",
+            ),
         ] {
             let gate = check(original, candidate);
             assert_eq!(
@@ -447,6 +514,14 @@ mod tests {
             ("cp a.txt /tmp/b", "cp a.txt /tmp/c"),
             ("tofu aply -auto-approve", "tofu apply -auto-approve"),
             ("ls", "for x in a; do ls; done"),
+            (
+                "for f in $(ls); do ctt $f; done",
+                "for f in $(ls); do cat $f; done",
+            ),
+            ("{ ehco x; } > out", "{ echo x; } > other"),
+            ("if a; then b; fi", "if a; then b; else c; fi"),
+            ("while gti pull; do :; done", "until git pull; do :; done"),
+            ("f() { ls; }", "f() { ls; } > log"),
         ] {
             let gate = check(original, candidate);
             assert_eq!(
@@ -464,6 +539,11 @@ mod tests {
         assert_eq!(check("ls", "ls 'oops").decision, Decision::Refuse);
         assert_eq!(check("ls", "ls &&").decision, Decision::Refuse);
         assert_eq!(check("ls", "  ").decision, Decision::Refuse);
+        assert_eq!(
+            check("if ls; then git sttus; fi", "git status").decision,
+            Decision::Confirm,
+            "a legacy replacement cannot erase unknown syntax and then auto-execute"
+        );
         let gate = assess(
             &parser::parse("cd foo"),
             "mkdir -p foo && cd foo",
@@ -503,10 +583,14 @@ mod tests {
         );
         assert_eq!(assess_replay("rm -r build").decision, Decision::Confirm);
         assert_eq!(assess_replay("brew instal jq").decision, Decision::Allow);
-        assert_eq!(
-            assess_replay("if x; then y; fi").decision,
-            Decision::Confirm
-        );
+        for compound in [
+            "if x; then y; fi",
+            "{ git sttus; }",
+            "while true; do git sttus; done",
+            "! git sttus",
+        ] {
+            assert_eq!(assess_replay(compound).decision, Decision::Confirm);
+        }
     }
 
     #[test]
@@ -518,5 +602,73 @@ mod tests {
         );
         let gate = check("sudo sytemctl status x", "sudo systemctl status x");
         assert_eq!(gate.decision, Decision::Allow, "{:?}", gate.reasons);
+    }
+
+    #[test]
+    fn substitutions_and_expanded_executables_need_approval_in_each_dialect() {
+        for (dialect, source, candidate) in [
+            (
+                parser::Dialect::Posix,
+                "gti $(touch marker)",
+                "git $(touch marker)",
+            ),
+            (
+                parser::Dialect::Posix,
+                "gti `touch marker`",
+                "git `touch marker`",
+            ),
+            (
+                parser::Dialect::Fish,
+                "gti (touch marker)",
+                "git (touch marker)",
+            ),
+            (
+                parser::Dialect::Fish,
+                "gti $(touch marker)",
+                "git $(touch marker)",
+            ),
+            (parser::Dialect::Fish, "$app sttus", "$app status"),
+            (parser::Dialect::Fish, "env $app sttus", "env $app status"),
+            (
+                parser::Dialect::Posix,
+                "sudo $app sttus",
+                "sudo $app status",
+            ),
+            (
+                parser::Dialect::Fish,
+                "gti <(touch marker)",
+                "git <(touch marker)",
+            ),
+            (
+                parser::Dialect::Posix,
+                "gti <$(touch marker)",
+                "git <$(touch marker)",
+            ),
+        ] {
+            let original = parser::parse_with_dialect(source, dialect);
+            let gate = assess(&original, candidate, &[]);
+            assert_eq!(
+                gate.decision,
+                Decision::Confirm,
+                "{candidate}: {:?}",
+                gate.reasons
+            );
+            assert_eq!(
+                assess_replay_with_dialect(candidate, dialect).decision,
+                Decision::Confirm
+            );
+        }
+        for source in [
+            "git '(touch marker)'",
+            "git `touch_marker`",
+            "git \\(touch_marker\\)",
+        ] {
+            let parsed = parser::parse_with_dialect(source, parser::Dialect::Fish);
+            assert_eq!(
+                assess(&parsed, source, &[]).decision,
+                Decision::Allow,
+                "{source}"
+            );
+        }
     }
 }

@@ -39,8 +39,9 @@ pub struct Settings {
     /// Programs whose generic completion protocol may be probed; `*` trusts
     /// every program that declares one. Built-in backends need no entry.
     pub trusted_completers: Vec<String>,
-    /// Programs the engine may run with `--help` to read their options and
-    /// subcommands; `*` trusts all. Running a program is never free of risk.
+    /// Programs the engine may run with `--help`, including documented nested
+    /// subcommands, to read options and values; `*` trusts all. Running a
+    /// program is never free of risk.
     pub trusted_help: Vec<String>,
     /// Seconds a single discovery probe (such as a native completer) may run.
     pub probe_timeout: f64,

@@ -2,15 +2,16 @@
 //!
 //! Scores are ranking signals in `[0, 1]`, not calibrated probabilities. A
 //! token score combines spelling similarity (transpositions count as one
-//! edit), first-letter agreement, explicit diagnostic hints, and how often
-//! the user typed the replacement before; a command's
+//! edit; option names compare without their dashes), first-letter
+//! agreement, explicit diagnostic hints, and how often the user typed the
+//! replacement before; a command's
 //! score is the product of its token scores, so each uncertain repair lowers
 //! it. Callers abstain unless the best candidate is strong enough and clearly
 //! ahead of the runner-up.
 
-// Calibrated on tests/corpus.rs (771 labeled typos of real aws, gcloud,
-// az, git, kubectl, docker, helm, and system command names): with these
-// values 95.7% are decided alone and none wrongly; a smaller margin starts
+// Calibrated on tests/corpus.rs (934 labeled typos of real aws, gcloud,
+// az, git, kubectl, docker, helm, and system command and option names): with
+// these values 96.5% are decided alone and none wrongly; a smaller margin starts
 // choosing wrong commands, a larger one only asks more often.
 
 /// Minimum score for an automatic first choice.
@@ -25,6 +26,33 @@ const HINT_BONUS: f64 = 0.25;
 /// History: a small bonus for any use, growing up to twenty uses.
 const HISTORY_BONUS: (f64, f64) = (0.03, 0.07);
 const CASE_PENALTY: f64 = 0.02;
+
+/// How a token's role shapes the comparison of spellings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Comparison {
+    /// Executables, subcommands, values, and path components.
+    Word,
+    /// Option names compare after their leading dashes, which mark the
+    /// role rather than spell the name: `-x` is not half of `-v`. A
+    /// different dash style (`-region` for `--region`) is one edit.
+    OptionName,
+}
+
+impl Comparison {
+    /// The leading dashes set aside before comparing.
+    fn dashes(self, word: &str) -> usize {
+        match self {
+            Comparison::Word => 0,
+            Comparison::OptionName => word.bytes().take_while(|&c| c == b'-').count(),
+        }
+    }
+
+    /// The lowercased characters compared, and the dashes set aside.
+    fn split(self, word: &str) -> (Vec<char>, usize) {
+        let dashes = self.dashes(word);
+        (word[dashes..].to_lowercase().chars().collect(), dashes)
+    }
+}
 
 /// How a token replacement was scored.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,9 +71,20 @@ pub struct ScoreBreakdown {
 }
 
 pub fn score_token(typed: &str, candidate: &str, hinted: bool, uses: u32) -> ScoreBreakdown {
-    let a: Vec<char> = typed.to_lowercase().chars().collect();
-    let b: Vec<char> = candidate.to_lowercase().chars().collect();
-    let distance = osa_chars(&a, &b, usize::MAX, &mut Rows::default()).unwrap_or(usize::MAX);
+    score_token_as(Comparison::Word, typed, candidate, hinted, uses)
+}
+
+pub fn score_token_as(
+    comparison: Comparison,
+    typed: &str,
+    candidate: &str,
+    hinted: bool,
+    uses: u32,
+) -> ScoreBreakdown {
+    let (a, dashes_a) = comparison.split(typed);
+    let (b, dashes_b) = comparison.split(candidate);
+    let distance = osa_chars(&a, &b, usize::MAX, &mut Rows::default())
+        .map_or(usize::MAX, |d| d + usize::from(dashes_a != dashes_b));
     breakdown(typed, candidate, &a, &b, distance, hinted, uses)
 }
 
@@ -72,7 +111,7 @@ fn breakdown(
     } else {
         0.0
     };
-    let case = if typed != candidate && a == b {
+    let case = if typed != candidate && distance == 0 {
         -CASE_PENALTY
     } else {
         0.0
@@ -147,17 +186,31 @@ pub fn rank_tokens<'v>(
     uses: &dyn Fn(&str) -> u32,
     limit: usize,
 ) -> Vec<(&'v str, ScoreBreakdown)> {
-    let a: Vec<char> = typed.to_lowercase().chars().collect();
+    rank_tokens_as(Comparison::Word, typed, vocabulary, hints, uses, limit)
+}
+
+/// [`rank_tokens`], comparing spellings as `comparison` says.
+pub fn rank_tokens_as<'v>(
+    comparison: Comparison,
+    typed: &str,
+    vocabulary: impl IntoIterator<Item = &'v str>,
+    hints: &[String],
+    uses: &dyn Fn(&str) -> u32,
+    limit: usize,
+) -> Vec<(&'v str, ScoreBreakdown)> {
+    let (a, dashes_a) = comparison.split(typed);
     let mut b: Vec<char> = Vec::new();
     let mut rows = Rows::default();
     let mut scored: Vec<(usize, &str, ScoreBreakdown)> = Vec::new();
     for (n, word) in vocabulary.into_iter().filter(|w| *w != typed).enumerate() {
         let hinted = hints.iter().any(|h| h == word);
         let used = uses(word);
+        let dashes = comparison.dashes(word);
+        let restyled = usize::from(dashes != dashes_a);
         // The largest distance that could still reach the floor with every
         // bonus this word can get.
         b.clear();
-        b.extend(word.chars().flat_map(char::to_lowercase));
+        b.extend(word[dashes..].chars().flat_map(char::to_lowercase));
         let bonus = FIRST_LETTER_BONUS
             + if hinted { HINT_BONUS } else { 0.0 }
             + if used > 0 {
@@ -166,11 +219,15 @@ pub fn rank_tokens<'v>(
                 0.0
             };
         let longest = a.len().max(b.len()).max(1) as f64;
-        let bound = ((1.0 - FLOOR + bonus) * longest).floor() as usize;
+        let Some(bound) =
+            (((1.0 - FLOOR + bonus) * longest).floor() as usize).checked_sub(restyled)
+        else {
+            continue;
+        };
         let Some(distance) = osa_chars(&a, &b, bound, &mut rows) else {
             continue;
         };
-        let score = breakdown(typed, word, &a, &b, distance, hinted, used);
+        let score = breakdown(typed, word, &a, &b, distance + restyled, hinted, used);
         if score.total >= FLOOR {
             scored.push((n, word, score));
         }
@@ -225,6 +282,39 @@ mod tests {
         );
         assert!(plain.total > score_token("acount", "discount", false, 0).total);
         assert!(score_token("Status", "status", false, 0).total < 1.0);
+    }
+
+    #[test]
+    fn option_names_compare_without_their_dashes() {
+        let none = |_: &str| 0;
+        assert!(score_token("-x", "-v", false, 0).total >= FLOOR);
+        assert!(
+            score_token_as(Comparison::OptionName, "-x", "-v", false, 0).total < FLOOR,
+            "one wrong letter is the whole name"
+        );
+        assert!(
+            rank_tokens_as(Comparison::OptionName, "-x", ["-v", "-q"], &[], &none, 3).is_empty()
+        );
+        let restyled = score_token_as(Comparison::OptionName, "-region", "--region", false, 0);
+        assert_eq!(restyled.distance, 1, "a different dash style is one edit");
+        assert_eq!(restyled.case, 0.0);
+        assert!(restyled.total >= ACCEPT);
+        let swapped = score_token_as(Comparison::OptionName, "--regoin", "--region", false, 0);
+        assert!(swapped.similarity < score_token("--regoin", "--region", false, 0).similarity);
+        assert!(swapped.total >= ACCEPT);
+        let ranked = rank_tokens_as(
+            Comparison::OptionName,
+            "--regoin",
+            ["--profile", "-r", "--region", "region"],
+            &[],
+            &none,
+            3,
+        );
+        assert_eq!(ranked[0].0, "--region");
+        assert!(ranked.iter().all(|(word, _)| *word != "-r"));
+        assert!(
+            score_token_as(Comparison::OptionName, "--Region", "--region", false, 0).case < 0.0
+        );
     }
 
     #[test]

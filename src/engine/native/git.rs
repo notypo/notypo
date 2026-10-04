@@ -128,6 +128,7 @@ fn global_options(
             items.push(CompletionItem {
                 value: name.to_owned(),
                 takes_value: Some(takes_value),
+                description: None,
             });
         }
     }
@@ -190,6 +191,7 @@ fn lines(text: &str) -> Vec<CompletionItem> {
             items.push(CompletionItem {
                 value: word.to_owned(),
                 takes_value: None,
+                description: None,
             });
         }
     }
@@ -206,10 +208,12 @@ fn options(tokens: &str) -> Vec<CompletionItem> {
             Some(name) => CompletionItem {
                 value: name.to_owned(),
                 takes_value: Some(true),
+                description: None,
             },
             None => CompletionItem {
                 value: t.to_owned(),
                 takes_value: Some(false),
+                description: None,
             },
         })
         .collect()

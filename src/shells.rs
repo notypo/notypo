@@ -38,6 +38,152 @@ const BUILTIN_COMMANDS: &[&str] = &[
     "unalias", "unset", "until", "wait", "while",
 ];
 
+/// `builtins` in tcsh 6.21.
+const TCSH_BUILTINS: &[&str] = &[
+    ":",
+    "@",
+    "alias",
+    "alloc",
+    "bg",
+    "bindkey",
+    "break",
+    "breaksw",
+    "builtins",
+    "bye",
+    "case",
+    "cd",
+    "chdir",
+    "complete",
+    "continue",
+    "default",
+    "dirs",
+    "echo",
+    "echotc",
+    "else",
+    "end",
+    "endif",
+    "endsw",
+    "eval",
+    "exec",
+    "exit",
+    "fg",
+    "filetest",
+    "foreach",
+    "glob",
+    "goto",
+    "hashstat",
+    "history",
+    "hup",
+    "if",
+    "jobs",
+    "kill",
+    "limit",
+    "login",
+    "logout",
+    "ls-F",
+    "nice",
+    "nohup",
+    "notify",
+    "onintr",
+    "popd",
+    "printenv",
+    "pushd",
+    "rehash",
+    "repeat",
+    "sched",
+    "set",
+    "setenv",
+    "settc",
+    "setty",
+    "shift",
+    "source",
+    "stop",
+    "suspend",
+    "switch",
+    "telltc",
+    "termname",
+    "time",
+    "umask",
+    "unalias",
+    "uncomplete",
+    "unhash",
+    "unlimit",
+    "unset",
+    "unsetenv",
+    "wait",
+    "watchlog",
+    "where",
+    "which",
+    "while",
+];
+
+const FISH_BUILTINS: &[&str] = &[
+    "!",
+    ".",
+    ":",
+    "[",
+    "_",
+    "abbr",
+    "and",
+    "argparse",
+    "begin",
+    "bg",
+    "bind",
+    "block",
+    "break",
+    "breakpoint",
+    "builtin",
+    "case",
+    "cd",
+    "command",
+    "commandline",
+    "complete",
+    "contains",
+    "continue",
+    "count",
+    "disown",
+    "echo",
+    "else",
+    "emit",
+    "end",
+    "eval",
+    "exec",
+    "exit",
+    "false",
+    "fg",
+    "fish_indent",
+    "fish_key_reader",
+    "for",
+    "function",
+    "functions",
+    "history",
+    "if",
+    "jobs",
+    "math",
+    "not",
+    "or",
+    "path",
+    "printf",
+    "pwd",
+    "random",
+    "read",
+    "realpath",
+    "return",
+    "set",
+    "set_color",
+    "source",
+    "status",
+    "string",
+    "switch",
+    "test",
+    "time",
+    "true",
+    "type",
+    "ulimit",
+    "wait",
+    "while",
+];
+
 impl Shell {
     pub fn from_name(name: &str) -> Option<Shell> {
         Some(match name {
@@ -51,10 +197,18 @@ impl Shell {
     }
 
     /// `TF_SHELL`, otherwise the first known shell among our ancestors.
+    /// The generic function names itself `generic`; an ancestor named `sh`
+    /// doesn't, since scripts run through `sh` inside other shells.
     pub fn detect() -> Shell {
         env::var("TF_SHELL")
             .ok()
-            .and_then(|name| Shell::from_name(&name))
+            .and_then(|name| {
+                if name == "generic" {
+                    Some(Shell::Generic)
+                } else {
+                    Shell::from_name(&name)
+                }
+            })
             .or_else(Shell::from_process_tree)
             .unwrap_or(if cfg!(windows) {
                 Shell::Powershell
@@ -115,6 +269,12 @@ impl Shell {
     }
 
     pub fn quote(self, s: &str) -> String {
+        if self == Shell::Fish {
+            return crate::engine::parser::quote_word_with_dialect(
+                s,
+                crate::engine::parser::Dialect::Fish,
+            );
+        }
         if self == Shell::Powershell
             && !s
                 .chars()
@@ -126,6 +286,33 @@ impl Shell {
     }
 
     pub fn split_command(self, command: &str) -> Vec<String> {
+        if self == Shell::Fish {
+            let parsed = crate::engine::parser::parse_with_dialect(
+                command,
+                crate::engine::parser::Dialect::Fish,
+            );
+            let text = |w: &crate::engine::parser::Word| {
+                w.literal()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| w.span.of(command).to_owned())
+            };
+            // Reserved words and block headers stay in source order, as
+            // rules saw them before blocks were parsed.
+            let mut parts: Vec<(usize, String)> = parsed
+                .commands
+                .iter()
+                .flat_map(|c| c.assignments.iter().chain(&c.words))
+                .chain(parsed.compounds.iter().flat_map(|c| &c.words))
+                .map(|w| (w.span.start, text(w)))
+                .chain(parsed.compounds.iter().flat_map(|c| {
+                    c.keywords
+                        .iter()
+                        .map(|k| (k.start, k.of(command).to_owned()))
+                }))
+                .collect();
+            parts.sort_by_key(|(start, _)| *start);
+            return parts.into_iter().map(|(_, part)| part).collect();
+        }
         if self == Shell::Powershell {
             return powershell::split(command);
         }
@@ -165,6 +352,7 @@ impl Shell {
                 "
             {name} () {{
                 local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${{pipestatus[*]}}\";
+                local -x NOTYPO_ZSH_FPATH=\"${{(j.:.)fpath}}\";
                 local -x NOTYPO_SHELL_FUNCTIONS=\"${{(k)functions[(I)[^_]*]}}\";
                 local -x NOTYPO_CURRENT_COMMAND=\"${{history[$HISTCMD]-}}\";
                 export TF_SHELL=zsh;
@@ -188,23 +376,50 @@ impl Shell {
             ),
             Shell::Fish => format!(
                 "function {name} -d \"Correct your previous console command\"\n  \
-                 set -lx NOTYPO_PIPESTATUS $pipestatus\n  \
-                 set -lx NOTYPO_EXIT_STATUS $status\n  \
+                 set -l notypo_status $status $pipestatus\n  \
+                 set -lx NOTYPO_EXIT_STATUS $notypo_status[1]\n  \
+                 set -lx NOTYPO_PIPESTATUS (string join ' ' -- $notypo_status[2..-1])\n  \
+                 set -lx NOTYPO_SHELL_FUNCTIONS (functions --names | string match -v '_*')\n  \
+                 set -lx NOTYPO_FISH_COMPLETE_PATH (string join ':' -- $fish_complete_path)\n  \
+                 set -l notypo_history fish\n  \
+                 if set -q fish_history\n    \
+                 set notypo_history \"$fish_history\"\n  \
+                 end\n  \
+                 if set -q fish_private_mode\n    \
+                 set notypo_history ''\n  \
+                 end\n  \
+                 set -lx NOTYPO_FISH_HISTORY_SESSION \"$notypo_history\"\n  \
                  set -l fucked_up_command $history[1]\n  \
-                 env TF_SHELL=fish TF_ALIAS={name} {exe} $fucked_up_command {PLACEHOLDER} $argv | read -l unfucked_command\n  \
+                 set -lx NOTYPO_CURRENT_COMMAND \"$fucked_up_command\"\n  \
+                 set -lx TF_SHELL fish\n  \
+                 set -lx TF_ALIAS {name}\n  \
+                 set -l unfucked_command ({exe} {PLACEHOLDER} $argv | string collect)\n  \
                  if [ \"$unfucked_command\" != \"\" ]\n    \
                  eval $unfucked_command\n{}  \
                  end\nend",
                 if alter_history {
-                    "    builtin history delete --exact --case-sensitive -- $fucked_up_command\n    builtin history merge\n"
+                    // `history append` was added in fish 4. Older shells
+                    // keep their original history instead of writing the
+                    // file from Rust or deleting without a replacement.
+                    "    if builtin history append -- $unfucked_command 2>/dev/null\n      if test \"$unfucked_command\" != \"$fucked_up_command\"\n        builtin history delete --exact --case-sensitive -- $fucked_up_command\n      end\n    end\n"
                 } else {
                     ""
                 }
             ),
-            Shell::Tcsh => format!(
-                "alias {name} 'setenv TF_SHELL tcsh && setenv TF_ALIAS {name} && \
-                 set fucked_cmd=`history -h 2 | head -n 1` && eval `{exe} ${{fucked_cmd}}`'"
-            ),
+            // `$status` is read before anything else runs. The previous
+            // event travels in the environment as one word: backquotes in
+            // double quotes aren't globbed, while text inside backquotes
+            // would be lexed again. `\!*` forwards the alias's arguments.
+            Shell::Tcsh => {
+                let exe = exe.replace('\'', "'\\''");
+                format!(
+                    "alias {name} 'setenv NOTYPO_EXIT_STATUS $status; \
+                     setenv TF_SHELL tcsh; setenv TF_ALIAS {name}; \
+                     setenv NOTYPO_CURRENT_COMMAND \"`history -h 2 | head -n 1`\"; \
+                     eval \"`{exe} {PLACEHOLDER} \\!*`\"; \
+                     unsetenv NOTYPO_EXIT_STATUS NOTYPO_CURRENT_COMMAND'"
+                )
+            }
             Shell::Powershell => format!(
                 "function {name} {{\n    $history = (Get-History -Count 1).CommandLine;\n    \
                  if (-not [string]::IsNullOrWhiteSpace($history)) {{\n        \
@@ -215,9 +430,18 @@ impl Shell {
                  if ($fuck.StartsWith(\"echo\")) {{ $fuck = $fuck.Substring(5); }}\n            \
                  else {{ iex \"$fuck\"; }}\n        }}\n    }}\n    [Console]::ResetColor() \n}}\n"
             ),
-            Shell::Generic => {
-                format!("alias {name}='eval \"$(TF_ALIAS={name} {exe} \"$(fc -ln -1)\")\"'")
-            }
+            // A POSIX function: `$?` is read before anything else runs, the
+            // recent history lets notypo skip this call's own line (ksh's
+            // `fc -ln -1` includes it), and arguments follow the placeholder
+            // instead of being appended to `eval`.
+            Shell::Generic => format!(
+                "{name} () {{\n    \
+                 notypo_status=$?\n    \
+                 notypo_cmd=$(NOTYPO_EXIT_STATUS=$notypo_status TF_SHELL=generic TF_ALIAS={name} \
+                 TF_HISTORY=\"$(fc -ln -10 2>/dev/null)\" {exe} {PLACEHOLDER} \"$@\") && \
+                 eval \"$notypo_cmd\"\n    \
+                 unset notypo_status notypo_cmd\n}}"
+            ),
         }
     }
 
@@ -268,13 +492,12 @@ impl Shell {
         )
     }
 
-    /// Names of shell functions the shell function passed along (bash and
-    /// zsh; fish functions are among [`Shell::get_aliases`]), without the
+    /// Names of shell functions the shell function passed along, without the
     /// `_`-prefixed completion helpers. Memoized for the process.
     pub fn get_functions(self) -> &'static std::collections::HashSet<String> {
         static FUNCTIONS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
         FUNCTIONS.get_or_init(|| match self {
-            Shell::Bash | Shell::Zsh => env::var("NOTYPO_SHELL_FUNCTIONS")
+            Shell::Bash | Shell::Zsh | Shell::Fish => env::var("NOTYPO_SHELL_FUNCTIONS")
                 .unwrap_or_default()
                 .split_whitespace()
                 .filter(|name| !DEFAULT_ALIASES.contains(name))
@@ -284,14 +507,15 @@ impl Shell {
         })
     }
 
-    /// Shell aliases (and fish functions), memoized for the process.
+    /// Shell aliases, memoized for the process. Fish functions are supplied
+    /// by the active parent shell; discovery must not start an interactive
+    /// fish that executes the user's configuration.
     pub fn get_aliases(self) -> &'static HashMap<String, String> {
         static ALIASES: OnceLock<HashMap<String, String>> = OnceLock::new();
         ALIASES.get_or_init(|| match self {
             Shell::Bash | Shell::Zsh => {
                 parse_aliases(self, &env::var("TF_SHELL_ALIASES").unwrap_or_default())
             }
-            Shell::Fish => fish::aliases(),
             Shell::Tcsh => utils::run_stdout("tcsh", &["-ic", "alias"])
                 .map(|out| {
                     out.split('\n')
@@ -300,7 +524,7 @@ impl Shell {
                         .collect()
                 })
                 .unwrap_or_default(),
-            Shell::Generic | Shell::Powershell => HashMap::new(),
+            Shell::Generic | Shell::Powershell | Shell::Fish => HashMap::new(),
         })
     }
 
@@ -311,10 +535,6 @@ impl Shell {
         let Some(expansion) = aliases.get(binary) else {
             return script.to_owned();
         };
-        if self == Shell::Fish && expansion == binary {
-            // A fish function: run it through fish itself.
-            return format!("fish -ic \"{}\"", script.replace('"', "\\\""));
-        }
         script.replacen(binary, expansion, 1)
     }
 
@@ -326,21 +546,24 @@ impl Shell {
             Shell::Bash => histfile("~/.bash_history"),
             Shell::Zsh => histfile("~/.zsh_history"),
             Shell::Tcsh => histfile("~/.history"),
-            Shell::Fish => Some(utils::expand_user("~/.config/fish/fish_history")),
+            Shell::Fish => {
+                let session = env::var("NOTYPO_FISH_HISTORY_SESSION")
+                    .or_else(|_| env::var("fish_history"))
+                    .unwrap_or_else(|_| "fish".into());
+                if session.is_empty() || session.contains(['/', '\\']) {
+                    return None;
+                }
+                let session = if session == "default" {
+                    "fish"
+                } else {
+                    &session
+                };
+                let data = env::var_os("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| utils::expand_user("~/.local/share"));
+                Some(data.join("fish").join(format!("{session}_history")))
+            }
             Shell::Generic | Shell::Powershell => None,
-        }
-    }
-
-    fn history_line(self, command: &str) -> String {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        match self {
-            Shell::Bash => format!("{command}\n"),
-            Shell::Zsh => format!(": {now}:0;{command}\n"),
-            Shell::Fish => format!("- cmd: {command}\n   when: {now}\n"),
-            Shell::Tcsh => format!("#+{now}\n{command}\n"),
-            Shell::Generic | Shell::Powershell => String::new(),
         }
     }
 
@@ -358,9 +581,32 @@ impl Shell {
                 }
                 _ => line.to_owned(),
             },
-            Shell::Fish => line
-                .split_once("- cmd: ")
-                .map_or_else(String::new, |(_, cmd)| cmd.to_owned()),
+            Shell::Fish => {
+                let Some(raw) = line.strip_prefix("- cmd: ") else {
+                    return String::new();
+                };
+                let mut chars = raw.trim_end_matches(['\r', '\n']).chars().peekable();
+                let mut command = String::new();
+                while let Some(ch) = chars.next() {
+                    if ch == '\\' {
+                        match chars.peek() {
+                            Some('n') => {
+                                chars.next();
+                                command.push('\n');
+                                continue;
+                            }
+                            Some('\\') => {
+                                chars.next();
+                                command.push('\\');
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+                    command.push(ch);
+                }
+                command
+            }
             _ => line.to_owned(),
         }
     }
@@ -420,27 +666,16 @@ impl Shell {
         lines
     }
 
-    /// Adds the fixed command to history where the alias can't (only fish).
-    pub fn put_to_history(self, command: &str) {
-        if self != Shell::Fish {
-            return;
-        }
-        let Some(file) = self.history_file_name().filter(|f| f.is_file()) else {
-            return;
-        };
-        let result = fs::OpenOptions::new()
-            .append(true)
-            .open(file)
-            .and_then(|mut f| {
-                std::io::Write::write_all(&mut f, self.history_line(command).as_bytes())
-            });
-        if let Err(e) = result {
-            logs::warn(&format!("Can't update history: {e}"));
-        }
-    }
+    /// Kept for library compatibility. Generated aliases update history in
+    /// the parent session after execution, respecting its private mode.
+    pub fn put_to_history(self, _command: &str) {}
 
     pub fn get_builtin_commands(self) -> &'static [&'static str] {
-        BUILTIN_COMMANDS
+        match self {
+            Shell::Fish => FISH_BUILTINS,
+            Shell::Tcsh => TCSH_BUILTINS,
+            _ => BUILTIN_COMMANDS,
+        }
     }
 
     fn version(self) -> Option<String> {
@@ -528,56 +763,6 @@ pub fn parse_aliases(shell: Shell, raw: &str) -> HashMap<String, String> {
             Some((name.to_owned(), value.to_owned()))
         })
         .collect()
-}
-
-mod fish {
-    use super::*;
-
-    fn overridden_aliases() -> Vec<String> {
-        let raw = env::var("THEFUCK_OVERRIDDEN_ALIASES")
-            .or_else(|_| env::var("TF_OVERRIDDEN_ALIASES"))
-            .unwrap_or_default();
-        let mut names: Vec<String> = ["cd", "grep", "ls", "man", "open"].map(String::from).into();
-        names.extend(raw.split(',').map(|a| a.trim().to_owned()));
-        names.sort();
-        names.dedup();
-        names
-    }
-
-    /// Fish functions and aliases (cached on disk: running fish is slow).
-    pub fn aliases() -> HashMap<String, String> {
-        let overridden = overridden_aliases();
-        let config = PathBuf::from("~/.config/fish/config.fish");
-        let functions = utils::cached(
-            "fish-functions",
-            &[config.clone(), PathBuf::from("~/.config/fish/functions")],
-            || {
-                utils::run_stdout("fish", &["-ic", "functions"])
-                    .map(|s| s.trim().split('\n').map(str::to_owned).collect())
-                    .unwrap_or_default()
-            },
-        );
-        let raw_aliases = utils::cached("fish-aliases", &[config], || {
-            utils::run_stdout("fish", &["-ic", "alias"])
-                .map(|s| s.trim().split('\n').map(str::to_owned).collect())
-                .unwrap_or_default()
-        });
-        let mut aliases: HashMap<String, String> = functions
-            .into_iter()
-            .filter(|f| !f.is_empty() && !overridden.contains(f))
-            .map(|f| (f.clone(), f))
-            .collect();
-        for line in raw_aliases.iter().filter(|l| !l.is_empty()) {
-            let line = line.replacen("alias ", "", 1);
-            let Some((name, value)) = line.split_once(' ').or_else(|| line.split_once('=')) else {
-                continue;
-            };
-            if !overridden.iter().any(|o| o == name) {
-                aliases.insert(name.to_owned(), value.to_owned());
-            }
-        }
-        aliases
-    }
 }
 
 /// Process name / parent lookup for shell detection (psutil in Python).
@@ -718,6 +903,18 @@ mod tests {
     }
 
     #[test]
+    fn fish_parts_keep_block_words_in_source_order() {
+        assert_eq!(
+            Shell::Fish.split_command("for f in a 'b c'; git sttus $f; end"),
+            ["for", "f", "in", "a", "b c", "git", "sttus", "$f", "end"]
+        );
+        assert_eq!(
+            Shell::Fish.split_command("not git sttus"),
+            ["not", "git", "sttus"]
+        );
+    }
+
+    #[test]
     fn parses_bash_and_zsh_aliases() {
         let bash = parse_aliases(
             Shell::Bash,
@@ -752,6 +949,11 @@ mod tests {
         );
         assert_eq!(Shell::Fish.script_from_history("- cmd: ls -la"), "ls -la");
         assert_eq!(Shell::Fish.script_from_history("   when: 1"), "");
+        assert_eq!(
+            Shell::Fish.script_from_history(r"- cmd: printf 'a\\b'\necho line"),
+            "printf 'a\\b'\necho line"
+        );
+        assert_eq!(Shell::Fish.script_from_history("  - cmd: a path"), "");
         assert_eq!(Shell::Bash.script_from_history("ls"), "ls");
     }
 
@@ -785,7 +987,7 @@ mod tests {
                 Shell::Zsh,
                 "local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${pipestatus[*]}\"",
             ),
-            (Shell::Fish, "set -lx NOTYPO_PIPESTATUS $pipestatus"),
+            (Shell::Fish, "set -l notypo_status $status $pipestatus"),
         ] {
             let alias = shell.app_alias("fuck", "notypo", true);
             let body = alias.split_once('\n').unwrap().1.trim_start();

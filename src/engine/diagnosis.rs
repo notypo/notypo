@@ -47,6 +47,10 @@ pub struct OutputDiagnosis {
     /// Words from "did you mean" style hints.
     pub suggestions: Vec<String>,
     pub operational: Option<OperationalFailure>,
+    /// The output, when it reports a missing file in any wording (tools
+    /// phrase it differently: `can't stat`, `cannot find or open`, a
+    /// Python traceback, bsdtar's `name: m: No such file or directory`).
+    pub missing_file_report: Option<String>,
 }
 
 impl OutputDiagnosis {
@@ -63,7 +67,34 @@ impl OutputDiagnosis {
         self.problems
             .iter()
             .any(|p| p.kind == kind && bare(&p.token) == bare(token))
+            || kind == ProblemKind::MissingPath
+                && self
+                    .missing_file_report
+                    .as_deref()
+                    .is_some_and(|report| names_path(report, token))
     }
+}
+
+/// Whether `report` names `path` as a whole: on its own, quoted, or as the
+/// end of an absolute path (`/home/me/mian.py` names `mian.py`). Short
+/// words are left out; they appear in banners by chance.
+fn names_path(report: &str, path: &str) -> bool {
+    if path.chars().count() < 3 || path.starts_with('-') {
+        return false;
+    }
+    let opens = |c: char| c.is_whitespace() || "'\"`‘“(/:=".contains(c);
+    let closes = |rest: &str| {
+        let mut chars = rest.chars();
+        match chars.next() {
+            None => true,
+            // A sentence's full stop, not an extension: `file.bz2.`
+            Some('.') => chars.next().is_none_or(char::is_whitespace),
+            Some(c) => c.is_whitespace() || "'\"`’”),:;".contains(c),
+        }
+    };
+    report.match_indices(path).any(|(at, _)| {
+        report[..at].chars().next_back().is_none_or(opens) && closes(&report[at + path.len()..])
+    })
 }
 
 pub fn diagnose_output(output: &str) -> OutputDiagnosis {
@@ -159,6 +190,13 @@ pub fn diagnose_output(output: &str) -> OutputDiagnosis {
     }
     diagnosis.suggestions = suggestions(output);
     diagnosis.operational = operational(output);
+    if regex!(
+        r"(?i)no such file|cannot find|can't find|cannot open|can't open|could not open|failed to open|cannot stat|can't stat|cannot access|does not exist|errno[ =]2\b|enoent"
+    )
+    .is_match(output)
+    {
+        diagnosis.missing_file_report = Some(output.to_owned());
+    }
     diagnosis
 }
 
@@ -175,7 +213,7 @@ fn suggestions(output: &str) -> Vec<String> {
         }
     };
     let header = regex!(
-        r"(?i)(did you mean|most similar (?:command|choice)|maybe you meant|similar (?:sub)?commands? (?:exists?|are|is)|possible alternatives?)"
+        r"(?i)(did you mean|most similar (?:command|choice)|maybe you meant|similar (?:sub)?(?:commands?|arguments?|options?|names?|values?) (?:exists?|are|is)|possible alternatives?)"
     );
     let mut in_list = false;
     for line in output.lines() {

@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use notypo::logs::USER_COMMAND_MARK;
+use notypo::shells::Shell;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -34,6 +35,7 @@ impl Workspace {
             .current_dir(&self.0)
             .env("XDG_CONFIG_HOME", &self.0)
             .env("XDG_CACHE_HOME", &self.0)
+            .env("XDG_DATA_HOME", &self.0)
             .env("HISTFILE", self.0.join("history"))
             .env("TF_SHELL", "bash")
             .env("TF_ALIAS", "fuck")
@@ -47,6 +49,11 @@ impl Workspace {
             .env("NOTYPO_NO_CACHE", "1")
             .env_remove("TF_HISTORY")
             .env_remove("NOTYPO_CURRENT_COMMAND")
+            .env_remove("NOTYPO_SHELL_FUNCTIONS")
+            .env_remove("NOTYPO_FISH_COMPLETE_PATH")
+            .env_remove("NOTYPO_ZSH_FPATH")
+            .env_remove("NOTYPO_FISH_HISTORY_SESSION")
+            .env_remove("fish_history")
             .env_remove("TF_SHELL_ALIASES")
             .env_remove("SHELL_LOGGER_SOCKET")
             .env_remove("THEFUCK_OUTPUT_LOG")
@@ -318,6 +325,22 @@ fn system_path(bin: &std::path::Path) -> String {
     format!("{}:/usr/bin:/bin", bin.display())
 }
 
+/// Alias fixtures seed in-memory history through the fish 4 `append` API.
+/// Completion/quoting fixtures run on older installed fish versions too.
+fn fish_with_history_append() -> Option<PathBuf> {
+    let path = notypo::utils::which("fish")?;
+    let output = Command::new(&path).arg("--version").output().ok()?;
+    let version = String::from_utf8(output.stdout).ok()?;
+    let major: u32 = version
+        .split_whitespace()
+        .last()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()?;
+    (major >= 4).then_some(path)
+}
+
 #[test]
 fn native_engine_never_replays_the_failed_command() {
     let workspace = Workspace::new();
@@ -439,12 +462,81 @@ fn json_reports_the_diagnosis_for_automation() {
     assert!(!bin.join("ran").exists());
 }
 
+#[test]
+fn nested_help_is_print_only_and_uncertain_corrections_require_confirmation() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let tool = bin.join("helpcli");
+    fs::write(&tool, r#"#!/bin/sh
+root=$(dirname "$0")
+printf '[%s]' "$@" >> "$root/queries"
+printf '\n' >> "$root/queries"
+case "$*" in
+  '--help') printf 'Commands:\n  nodes    Manage nodes\n';;
+  'nodes --help') printf 'Commands:\n  list     List nodes\n';;
+  'nodes list --help') printf 'Options:\n  --format <FORMAT>  [possible values: json, yaml]\n  --target <TARGET>  Target\n';;
+  *) touch "$root/ran"; exit 1;;
+esac
+"#).unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let source = "helpcli nodes list --format=jsno --target 'private target'";
+    let command = || {
+        let mut command = workspace.command("");
+        command
+            .env("PATH", system_path(&bin))
+            .env("NOTYPO_TRUSTED_HELP", "helpcli")
+            .env("NOTYPO_DISABLED_SOURCES", "native:man:history:legacy");
+        command
+    };
+    let output = finish(
+        command()
+            .args(["--json", "--force-command", source])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"]["kind"], "ambiguous");
+    assert_eq!(
+        report["candidates"][0]["command"],
+        source.replace("jsno", "json")
+    );
+    assert_eq!(report["candidates"][0]["edits"][0]["role"], "OptionValue");
+    assert_eq!(report["probes"], 3);
+    let output = finish(
+        command()
+            .args(["-y", "--force-command", source])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(!output.status.success(), "help remains partial evidence");
+    assert!(
+        output.stdout.is_empty(),
+        "the alias must receive no command"
+    );
+    assert!(!bin.join("ran").exists());
+    assert_eq!(
+        fs::read_to_string(bin.join("queries")).unwrap(),
+        "[--help]\n[nodes][--help]\n[nodes][list][--help]\n[--help]\n[nodes][--help]\n[nodes][list][--help]\n"
+    );
+    assert!(!workspace.0.join("history").exists());
+}
+
 /// The alias passes the shell's function names: a function is a valid
 /// command, and a misspelled one is corrected to it.
 #[test]
 fn shell_aliases_pass_function_names() {
-    for shell in ["bash", "zsh"] {
-        let Some(path) = notypo::utils::which(shell) else {
+    for shell in ["bash", "zsh", "fish"] {
+        let Some(path) = (if shell == "fish" {
+            fish_with_history_append()
+        } else {
+            notypo::utils::which(shell)
+        }) else {
             continue;
         };
         let workspace = Workspace::new();
@@ -457,20 +549,25 @@ fn shell_aliases_pass_function_names() {
                 .unwrap(),
         );
         let alias = String::from_utf8(output.stdout).unwrap();
-        let (flags, seed): (&[&str], _) = if shell == "bash" {
-            (
+        let (flags, seed, function): (&[&str], _, _) = match shell {
+            "bash" => (
                 &["--norc", "--noprofile", "-i", "-c"],
                 "set -o history\nhistory -s 'deploy_site now'",
-            )
-        } else {
-            (
+                "deploy_app() { echo \"deployed $1\"; }",
+            ),
+            "zsh" => (
                 &["-f", "-i", "-c"],
                 "HISTSIZE=50\nfc -p\nprint -s -- 'deploy_site now'",
-            )
+                "deploy_app() { echo \"deployed $1\"; }",
+            ),
+            "fish" => (
+                &["--no-config", "--private", "-c"],
+                "builtin history append -- 'deploy_site now'",
+                "function deploy_app; printf 'deployed %s\\n' $argv[1]; end",
+            ),
+            _ => unreachable!(),
         };
-        let script = format!(
-            "{alias}\ndeploy_app() {{ echo \"deployed $1\"; }}\n{seed}\ndeploy_site now\nfuck -y\n"
-        );
+        let script = format!("{alias}\n{function}\n{seed}\ndeploy_site now\nfuck -y\n");
         let output = finish(
             workspace
                 .program(&path, "")
@@ -495,8 +592,12 @@ fn shell_aliases_pass_function_names() {
 /// which makes the missing-executable diagnosis strong enough for `-y`.
 #[test]
 fn shell_aliases_pass_the_exit_status_to_the_native_engine() {
-    for shell in ["bash", "zsh"] {
-        let Some(path) = notypo::utils::which(shell) else {
+    for shell in ["bash", "zsh", "fish"] {
+        let Some(path) = (if shell == "fish" {
+            fish_with_history_append()
+        } else {
+            notypo::utils::which(shell)
+        }) else {
             continue;
         };
         let workspace = Workspace::new();
@@ -518,16 +619,20 @@ fn shell_aliases_pass_the_exit_status_to_the_native_engine() {
                 .unwrap(),
         );
         let alias = String::from_utf8(output.stdout).unwrap();
-        let (flags, seed): (&[&str], _) = if shell == "bash" {
-            (
+        let (flags, seed): (&[&str], _) = match shell {
+            "bash" => (
                 &["--norc", "--noprofile", "-i", "-c"],
                 "set -o history\nhistory -s 'gti status'",
-            )
-        } else {
-            (
+            ),
+            "zsh" => (
                 &["-f", "-i", "-c"],
                 "HISTSIZE=50\nfc -p\nprint -s -- 'gti status'",
-            )
+            ),
+            "fish" => (
+                &["--no-config", "--private", "-c"],
+                "builtin history append -- 'gti status'",
+            ),
+            _ => unreachable!(),
         };
         let script = format!("{alias}\n{seed}\ngti status\nfuck -y\n");
         let output = finish(
@@ -547,5 +652,680 @@ fn shell_aliases_pass_the_exit_status_to_the_native_engine() {
             "{shell}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+/// A typo inside a loop is repaired in place through each shell's alias;
+/// the loop around it is unchanged, and the corrected loop runs once.
+#[test]
+fn shell_aliases_repair_commands_inside_loops() {
+    for shell in ["bash", "zsh", "fish"] {
+        let Some(path) = (if shell == "fish" {
+            fish_with_history_append()
+        } else {
+            notypo::utils::which(shell)
+        }) else {
+            continue;
+        };
+        let workspace = Workspace::new();
+        let bin = workspace.0.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let git = bin.join("git");
+        fs::write(
+            &git,
+            "#!/bin/sh\n[ \"$1\" = status ] && printf 'status for %s\\n' \"$2\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = finish(
+            workspace
+                .command("")
+                .env("TF_SHELL", shell)
+                .arg("--alias")
+                .spawn()
+                .unwrap(),
+        );
+        let alias = String::from_utf8(output.stdout).unwrap();
+        let (flags, typed, seed): (&[&str], _, _) = match shell {
+            "bash" => (
+                &["--norc", "--noprofile", "-i", "-c"],
+                "for repo in a 'b c'; do gti status \"$repo\"; done",
+                "set -o history\nhistory -s",
+            ),
+            "zsh" => (
+                &["-f", "-i", "-c"],
+                "for repo in a 'b c'; do gti status \"$repo\"; done",
+                "HISTSIZE=50\nfc -p\nprint -s --",
+            ),
+            "fish" => (
+                &["--no-config", "--private", "-c"],
+                "for repo in a 'b c'; gti status $repo; end",
+                "builtin history append --",
+            ),
+            _ => unreachable!(),
+        };
+        let quoted = Shell::Bash.quote(typed);
+        let script = format!("{alias}\n{seed} {quoted}\n{typed}\nfuck -y\n");
+        let output = finish(
+            workspace
+                .program(&path, "")
+                .env("TF_SHELL", shell)
+                .env("PATH", &bin)
+                .env("HISTFILE", workspace.0.join("history"))
+                .args(flags)
+                .arg(&script)
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "status for a\nstatus for b c\n",
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// tcsh's alias hands over the previous event intact (quotes, globs, and
+/// escaped `!` included) with its status, and runs the approved correction
+/// once; a line tcsh would history-substitute again is never rerun.
+#[test]
+fn tcsh_alias_repairs_the_previous_event_without_reinterpreting_it() {
+    let Some(tcsh) = notypo::utils::which("tcsh") else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\n[ \"$1\" = status ] && shift && printf 'status [%s]\\n' \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(workspace.0.join("one.txt"), "").unwrap();
+    let output = finish(
+        workspace
+            .command("")
+            .env("TF_SHELL", "tcsh")
+            .arg("--alias")
+            .spawn()
+            .unwrap(),
+    );
+    let alias = String::from_utf8(output.stdout).unwrap();
+    let script = format!(
+        "set prompt=''\nset history=100\n{alias}\n\
+         gti status 'a b' '*.txt' 'it'\\''s' 'x\\!y'\nfuck -y\n\
+         echo \"left: [$?NOTYPO_EXIT_STATUS$?NOTYPO_CURRENT_COMMAND]\"\n\
+         gti status 'p\\!q'\nfuck -y\nexit\n"
+    );
+    let mut child = workspace
+        .program(&tcsh, "")
+        .env("TF_SHELL", "tcsh")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args(["-f", "-i"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let output = finish(child);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The history keeps `x!y` without its backslash, so that line is
+    // refused rather than rerun with a new history substitution.
+    assert!(!stdout.contains("status ["), "{stdout}\n{stderr}");
+    assert_eq!(stderr.matches("No fucks given").count(), 2, "{stderr}");
+    assert!(stdout.contains("left: [00]"), "{stdout}");
+
+    let script = format!(
+        "set prompt=''\nset history=100\n{alias}\n\
+         gti status 'a b' '*.txt' 'it'\\''s' >& log\nfuck -y\nexit\n"
+    );
+    let mut child = workspace
+        .program(&tcsh, "")
+        .env("TF_SHELL", "tcsh")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .args(["-f", "-i"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let output = finish(child);
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("log")).unwrap(),
+        "status [a b]\nstatus [*.txt]\nstatus [it's]\n",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The generic POSIX function (for ksh and other shells notypo doesn't
+/// know) passes the status and recent history, skips its own line, and
+/// forwards `-y` to notypo rather than to the corrected command.
+#[test]
+fn generic_function_repairs_the_previous_command_in_ksh() {
+    let Some(ksh) = notypo::utils::which("ksh") else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\n[ \"$1\" = status ] && shift && printf 'status [%s]\\n' \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    let function = Shell::Generic.app_alias("fuck", env!("CARGO_BIN_EXE_notypo"), false);
+    let script = format!(
+        "{function}\ngti status 'a b'\nfuck -y\necho \"left=[${{notypo_status-unset}}]\"\n"
+    );
+    let mut child = workspace
+        .program(&ksh, "")
+        .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+        .env("ENV", "/dev/null")
+        .arg("-i")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let output = finish(child);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("status [a b]\n") && stdout.matches("status [").count() == 1,
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("left=[unset]"), "{stdout}");
+}
+
+#[test]
+fn fish_alias_preserves_pipeline_metadata_and_current_history_event() {
+    let Some(fish) = fish_with_history_append() else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let spy = workspace.0.join("spy");
+    fs::write(
+        &spy,
+        "#!/bin/sh\nprintf '%s\\n' \"$NOTYPO_EXIT_STATUS\" \"$NOTYPO_PIPESTATUS\" \"$NOTYPO_CURRENT_COMMAND\" \"$NOTYPO_SHELL_FUNCTIONS\" \"$NOTYPO_FISH_COMPLETE_PATH\" \"$TF_SHELL:$TF_ALIAS\" > metadata\n",
+    ).unwrap();
+    fs::set_permissions(&spy, fs::Permissions::from_mode(0o755)).unwrap();
+    let alias = Shell::Fish.app_alias("fix", spy.to_str().unwrap(), true);
+    let script = format!(
+        "{alias}\nfunction deploy_app; end\nset -g fish_complete_path /custom/completions /vendor/completions\nbuiltin history append -- 'false | true'\nfalse | true\nfix -y\n"
+    );
+    let output = finish(
+        workspace
+            .program(fish, "")
+            .args(["--no-config", "--private", "-c", &script])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(output.stdout.is_empty());
+    let metadata = fs::read_to_string(workspace.0.join("metadata")).unwrap();
+    let lines: Vec<_> = metadata.lines().collect();
+    assert_eq!(&lines[..3], ["0", "1 0", "false | true"]);
+    assert!(lines[3].split_whitespace().any(|word| word == "deploy_app"));
+    assert!(lines[4].starts_with("/custom/completions:"));
+    assert_eq!(lines[5], "fish:fix");
+    assert!(!workspace.0.join("fish/fish_history").exists());
+}
+
+#[test]
+fn fish_alias_executes_the_complete_multiline_selection_once() {
+    let Some(fish) = fish_with_history_append() else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let git = bin.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\n[ \"$1\" = status ] || exit 1\nprintf 'correction executed\\n'\nprintf 'once\\n' >> executions\n",
+    ).unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    let alias = Shell::Fish.app_alias("fix", env!("CARGO_BIN_EXE_notypo"), true);
+    let original = "gti status\nand printf 'second line\\n'";
+    let script = format!(
+        "{alias}\nbuiltin history append -- {}\n{original}\nfix -y\n",
+        Shell::Fish.quote(original)
+    );
+    let output = finish(
+        workspace
+            .program(fish, "")
+            .env("PATH", &bin)
+            .args(["--no-config", "--private", "-c", &script])
+            .spawn()
+            .unwrap(),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "correction executed\nsecond line\n",
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.0.join("executions")).unwrap(),
+        "once\n"
+    );
+    assert!(!workspace.0.join("fish/fish_history").exists());
+}
+
+#[test]
+fn fish_alias_executes_cd_in_the_parent_shell() {
+    let Some(fish) = fish_with_history_append() else {
+        return;
+    };
+    let workspace = Workspace::new();
+    fs::create_dir_all(workspace.0.join("project/src")).unwrap();
+    let alias = Shell::Fish.app_alias("fix", env!("CARGO_BIN_EXE_notypo"), true);
+    let script = format!(
+        "{alias}\nbuiltin history append -- 'cd project/scr'\ncd project/scr\nfix -y\nprintf '%s' $PWD\n"
+    );
+    let output = finish(
+        workspace
+            .program(fish, "")
+            .env("TF_SHELL", "fish")
+            .args(["--no-config", "--private", "-c", &script])
+            .spawn()
+            .unwrap(),
+    );
+    let expected = fs::canonicalize(workspace.0.join("project/src")).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected.to_string_lossy(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!workspace.0.join("fish/fish_history").exists());
+}
+
+#[test]
+fn fish_native_completion_repairs_nested_words_and_values_without_running_operations() {
+    let Some(fish) = notypo::utils::which("fish") else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let tool = bin.join("fishcli");
+    fs::write(&tool, "#!/bin/sh\nprintf ran > operation-marker\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let completion_dir = workspace.0.join("fish/completions");
+    fs::create_dir_all(&completion_dir).unwrap();
+    fs::write(completion_dir.join("fishcli.fish"), r#"complete -c fishcli -f
+complete -c fishcli -n 'not __fish_seen_subcommand_from nodes' -a nodes
+complete -c fishcli -n '__fish_seen_subcommand_from nodes; and not __fish_seen_subcommand_from list' -a list
+complete -c fishcli -n '__fish_seen_subcommand_from list' -l format -x -a "'alpha beta' json yaml"
+"#).unwrap();
+    // Neither command discovery nor function discovery may start an
+    // interactive fish that sources the user's configuration.
+    fs::write(
+        workspace.0.join("fish/config.fish"),
+        "printf loaded > config-marker\n",
+    )
+    .unwrap();
+    let command = || {
+        let mut command = workspace.command("");
+        command
+            .env("TF_SHELL", "fish")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    bin.display(),
+                    fish.parent().unwrap().display()
+                ),
+            )
+            .env("NOTYPO_TRUSTED_COMPLETERS", "fishcli")
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy");
+        command
+    };
+    let source = "fishcli nodes lsit --format='alpha beat' 'private arg' 2>| cat";
+    let output = finish(
+        command()
+            .args(["--json", "--force-command", source])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"]["kind"], "ambiguous", "{report}");
+    assert_eq!(
+        report["candidates"][0]["command"],
+        "fishcli nodes list --format='alpha beta' 'private arg' 2>| cat",
+        "{report}"
+    );
+    assert_eq!(
+        report["candidates"][0]["edits"].as_array().unwrap().len(),
+        2
+    );
+    assert!(report["notes"].as_array().unwrap().iter().any(|note| {
+        note.as_str()
+            .is_some_and(|note| note.contains("fish protocol"))
+    }));
+    let denied = finish(
+        command()
+            .args(["-y", "--force-command", source])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    for marker in ["operation-marker", "config-marker", "fish/fish_history"] {
+        assert!(!workspace.0.join(marker).exists(), "unexpected {marker}");
+    }
+}
+
+#[test]
+fn zsh_alias_passes_completion_paths_without_losing_pipeline_status() {
+    let Some(zsh) = notypo::utils::which("zsh") else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let backend = workspace.0.join("backend");
+    fs::write(&backend, "#!/bin/sh\nprintf '%s\\n' \"$NOTYPO_EXIT_STATUS\" \"$NOTYPO_PIPESTATUS\" \"$NOTYPO_ZSH_FPATH\" > metadata\n").unwrap();
+    fs::set_permissions(&backend, fs::Permissions::from_mode(0o755)).unwrap();
+    let alias = Shell::Zsh.app_alias("fix", backend.to_str().unwrap(), false);
+    let path = workspace.0.join("completion directory");
+    let script = format!(
+        "{alias}\nfpath=( {} $fpath )\nfalse | true\nfix\n",
+        notypo::shlex::quote(&path.to_string_lossy())
+    );
+    let output = finish(
+        workspace
+            .program(zsh, "")
+            .args(["-f", "-i", "-c", &script])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata = fs::read_to_string(workspace.0.join("metadata")).unwrap();
+    let mut lines = metadata.lines();
+    assert_eq!(lines.next(), Some("0"));
+    assert_eq!(lines.next(), Some("1 0"));
+    assert!(
+        lines
+            .next()
+            .unwrap()
+            .starts_with(&format!("{}:", path.display()))
+    );
+}
+
+#[test]
+fn zsh_native_completion_repairs_nested_words_options_and_values_without_running_operations() {
+    let Some(zsh) = notypo::utils::which("zsh") else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    let completions = workspace.0.join("completions");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir(&completions).unwrap();
+    let tool = bin.join("zshcli");
+    fs::write(&tool, "#!/bin/sh\nprintf ran > operation-marker\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    // A shared handler registers an alias that differs from its filename.
+    fs::write(completions.join("_shared_cli"), r#"#compdef sharedcli zshcli
+case ${(Q)words[2]} in
+  '') compadd -- nodes;;
+  nodes)
+    case ${(Q)words[3]} in
+      '') compadd -- list;;
+      list) _arguments '1:group:(nodes)' '2:command:(list)' '--format[Format]:format:(json yaml)' '*:argument:';;
+    esac;;
+esac
+"#).unwrap();
+    for config in [".zshenv", ".zshrc"] {
+        fs::write(workspace.0.join(config), "print ran > config-marker\n").unwrap();
+    }
+    let command = || {
+        let mut command = workspace.command("");
+        command
+            .env("TF_SHELL", "zsh")
+            .env("ZDOTDIR", &workspace.0)
+            .env("NOTYPO_ZSH_FPATH", &completions)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    bin.display(),
+                    zsh.parent().unwrap().display()
+                ),
+            )
+            .env("NOTYPO_TRUSTED_COMPLETERS", "zshcli")
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy");
+        command
+    };
+    for (source, expected) in [
+        (
+            "zshcli nodes lsit --foramt=yaml 'private arg' 2> /dev/null | cat",
+            "zshcli nodes list --format=yaml 'private arg' 2> /dev/null | cat",
+        ),
+        (
+            "zshcli nodes list --format jsno",
+            "zshcli nodes list --format json",
+        ),
+    ] {
+        let output = finish(
+            command()
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["outcome"]["kind"], "ambiguous", "{report}");
+        assert_eq!(report["candidates"][0]["command"], expected, "{report}");
+        assert!(
+            report["notes"].as_array().unwrap().iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.contains("zsh protocol"))),
+            "{report}"
+        );
+        let denied = finish(
+            command()
+                .args(["-y", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(!denied.status.success());
+        assert!(denied.stdout.is_empty());
+    }
+    let untrusted = finish(
+        command()
+            .env("NOTYPO_TRUSTED_COMPLETERS", "")
+            .args(["--json", "--force-command", "zshcli nodes lsit"])
+            .spawn()
+            .unwrap(),
+    );
+    // A handler's protocol is independent of the shell editing the command.
+    let fallback = finish(
+        command()
+            .env("TF_SHELL", "bash")
+            .args(["--json", "--force-command", "zshcli nodes lsit"])
+            .spawn()
+            .unwrap(),
+    );
+    let fallback: serde_json::Value = serde_json::from_slice(&fallback.stdout).unwrap();
+    assert_eq!(
+        fallback["candidates"][0]["command"], "zshcli nodes list",
+        "{fallback}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(&untrusted.stdout).unwrap();
+    assert!(
+        report["notes"].as_array().unwrap().iter().any(|note| note
+            .as_str()
+            .is_some_and(|note| note.contains("trusted_completers"))),
+        "{report}"
+    );
+    for marker in ["operation-marker", "config-marker", ".zcompdump", "history"] {
+        assert!(!workspace.0.join(marker).exists(), "unexpected {marker}");
+    }
+}
+
+#[test]
+fn fish_substitutions_are_neither_replayed_nor_automatically_accepted() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let git = bin.join("git");
+    fs::write(&git, "#!/bin/sh\nprintf 'status\\n'\n").unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+    for source in [
+        "gti (printf rerun > marker)",
+        "gti $(printf rerun > marker)",
+        "gti <(printf rerun > marker)",
+    ] {
+        let command = || {
+            let mut command = workspace.command("");
+            command
+                .env("TF_SHELL", "fish")
+                .env("PATH", system_path(&bin))
+                .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "true");
+            command
+        };
+        let output = finish(
+            command()
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(output.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["candidates"][0]["safety"]["decision"], "confirm",
+            "{report}"
+        );
+        let output = finish(
+            command()
+                .args(["-y", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!workspace.0.join("marker").exists());
+    }
+}
+
+#[test]
+fn fish_history_uses_the_selected_data_session_and_decodes_multiline_commands() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let tool = bin.join("fishcli");
+    fs::write(&tool, "#!/bin/sh\nprintf ran > marker\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let data = workspace.0.join("fish");
+    fs::create_dir(&data).unwrap();
+    let contents = "- cmd: printf 'a\\\\b'\\nfishcli publish\n  when: 1\n  paths:\n    - cmd: fishcli demolish\n";
+    fs::write(data.join("work_history"), contents).unwrap();
+    fs::write(data.join("fish_history"), contents).unwrap();
+    let command = || {
+        let mut command = workspace.command("");
+        command
+            .env("TF_SHELL", "fish")
+            .env("PATH", system_path(&bin))
+            .env("NOTYPO_DISABLED_SOURCES", "native:man:help:legacy")
+            .args(["--json", "--force-command", "fishcli publsih"]);
+        command
+    };
+    for session in ["work", "default"] {
+        let output = finish(command().env("fish_history", session).spawn().unwrap());
+        assert!(output.status.success());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["candidates"][0]["command"], "fishcli publish",
+            "{session}: {report}"
+        );
+    }
+    let output = finish(
+        command()
+            .env("fish_history", "missing")
+            .env("NOTYPO_FISH_HISTORY_SESSION", "work")
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["candidates"][0]["command"], "fishcli publish",
+        "parent metadata takes precedence"
+    );
+    let output = finish(
+        command()
+            .env("NOTYPO_FISH_HISTORY_SESSION", "")
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["candidates"].as_array().unwrap().is_empty(),
+        "private history is unavailable: {report}"
+    );
+    assert_eq!(
+        fs::read_to_string(data.join("work_history")).unwrap(),
+        contents
+    );
+    assert_eq!(
+        fs::read_to_string(data.join("fish_history")).unwrap(),
+        contents
+    );
+    assert!(!workspace.0.join("marker").exists());
+}
+
+#[test]
+fn unsupported_dialects_cannot_bypass_the_gate_with_a_legacy_rule() {
+    let workspace = Workspace::new();
+    for shell in ["powershell"] {
+        for replay in ["false", "true"] {
+            let output = finish(
+                workspace
+                    .command("cd_parent")
+                    .env("TF_SHELL", shell)
+                    .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", replay)
+                    .args(["-y", "--force-command", "cd.."])
+                    .spawn()
+                    .unwrap(),
+            );
+            assert!(!output.status.success(), "{shell}: replay={replay}");
+            assert!(output.stdout.is_empty());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("unsupported syntax"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

@@ -22,11 +22,15 @@ use std::{env, fs};
 
 const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_ENTRIES: usize = 2000;
+// Start a fresh namespace after restricting persistence to command paths,
+// so old entries carrying argument values cannot be loaded and saved again.
+const CACHE_FORMAT_VERSION: u8 = 2;
 
 /// A stable digest of everything that can change an app's answers.
 pub fn fingerprint(files: &[PathBuf], extra: &[&str]) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     env!("CARGO_PKG_VERSION").hash(&mut hasher);
+    CACHE_FORMAT_VERSION.hash(&mut hasher);
     for file in files {
         file.hash(&mut hasher);
         if let Ok(meta) = fs::metadata(file) {
@@ -98,7 +102,7 @@ impl CompletionCache {
             .map(|(key, (saved, items))| {
                 let items: Vec<Value> = items
                     .iter()
-                    .map(|i| json!([i.value, i.takes_value]))
+                    .map(|i| json!([i.value, i.takes_value, i.description]))
                     .collect();
                 (key.clone(), json!([saved, items]))
             })
@@ -134,6 +138,10 @@ fn load(file: &Path) -> HashMap<String, (u64, Vec<CompletionItem>)> {
                     Some(CompletionItem {
                         value: item.get(0)?.as_str()?.to_owned(),
                         takes_value: item.get(1)?.as_bool(),
+                        description: item
+                            .get(2)
+                            .and_then(Value::as_str)
+                            .and_then(super::native::clean_description),
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -150,6 +158,7 @@ mod tests {
         CompletionItem {
             value: value.into(),
             takes_value: Some(false),
+            description: None,
         }
     }
 
@@ -157,12 +166,16 @@ mod tests {
     fn round_trips_expires_and_survives_corruption() {
         let tag = format!("test-{}", std::process::id());
         let mut cache = CompletionCache::open(&tag, "round").unwrap();
-        cache.put("ec2|".into(), vec![item("describe-instances")]);
+        let described = CompletionItem {
+            description: Some("Describes instances".into()),
+            ..item("describe-instances")
+        };
+        cache.put("ec2|".into(), vec![described.clone()]);
         cache.entries.insert("old".into(), (0, vec![item("gone")]));
         cache.dirty = true;
         cache.save();
         let cache = CompletionCache::open(&tag, "round").unwrap();
-        assert_eq!(cache.get("ec2|").unwrap(), [item("describe-instances")]);
+        assert_eq!(cache.get("ec2|").unwrap(), [described]);
         assert!(cache.get("old").is_none(), "expired entries are ignored");
         fs::write(&cache.file, "{not json").unwrap();
         let reopened = CompletionCache::open(&tag, "round").unwrap();

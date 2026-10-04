@@ -20,8 +20,11 @@ use std::rc::Rc;
 use std::{env, fs};
 
 mod bash;
+mod fish;
 mod git;
 mod go;
+mod identity;
+mod zsh;
 
 /// One valid word for a position, as reported by the app.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +32,9 @@ pub struct CompletionItem {
     pub value: String,
     /// For options: whether a value follows, when the protocol says so.
     pub takes_value: Option<bool>,
+    /// The app's own one-line description, when its protocol gives one.
+    /// Untrusted text: control characters are removed and length capped.
+    pub description: Option<String>,
 }
 
 impl CompletionItem {
@@ -75,6 +81,27 @@ pub struct Capabilities {
     /// Option lists include every option. git's helper omits options parsed
     /// outside its option table (`git log --graph`).
     pub complete_options: bool,
+    /// The handler enumerates every subcommand, rather than a partial shell list.
+    pub complete_subcommands: bool,
+    /// Words come with the app's own descriptions.
+    pub descriptions: bool,
+    /// How the query line is quoted for the completer; `None` when words are
+    /// passed as separate arguments (cobra, git), so no dialect applies.
+    pub query_dialect: Option<super::parser::Dialect>,
+    pub trust: Trust,
+}
+
+/// Why notypo may run an app's completer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Trust {
+    /// A built-in bridge identified the app from its installation
+    /// (aws, gcloud, az, git).
+    #[default]
+    Bridge,
+    /// The app's module is on the audited list.
+    Audited,
+    /// `trusted_completers` names the app or its identity.
+    UserTrusted,
 }
 
 pub trait NativeCompletionBackend: std::fmt::Debug {
@@ -107,6 +134,16 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
     ) -> Result<Vec<CompletionItem>, CompletionError> {
         self.complete(words, "", budget)
     }
+
+    /// The app's fixed values for that option, with resource lookups off,
+    /// to tell enum values from resource names when lookups are on.
+    fn complete_offline_values(
+        &self,
+        words: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        self.complete_values(words, budget)
+    }
 }
 
 /// The protocol family of a discovered backend.
@@ -129,6 +166,10 @@ pub enum Flavor {
     Posener,
     /// A function registered by the app's bash completion script (opt-in).
     BashFunction,
+    /// An installed fish completion script, using `complete --do-complete`.
+    FishScript,
+    /// An installed zsh autoload function, queried inside a ZLE widget.
+    ZshFunction,
 }
 
 /// Go apps whose completion was audited: the probe only lists words, and
@@ -161,10 +202,13 @@ pub struct Backend {
     pub completer: PathBuf,
     /// The app's identity when the installation states it (a Go module).
     pub identity: Option<String>,
+    pub trust: Trust,
     /// Value queries may use the network and the user's credentials.
     pub network: bool,
     /// A file the protocol needs besides the completer (a completion script).
     pub helper: Option<PathBuf>,
+    /// The actual app when another executable (a shell/helper) performs completion.
+    pub application: Option<PathBuf>,
     memo: ProbeMemo,
 }
 
@@ -185,12 +229,24 @@ impl Backend {
             identity: None,
             network: false,
             helper: None,
+            application: None,
+            trust: match flavor {
+                Flavor::AwsCompleter | Flavor::Gcloud | Flavor::Azure | Flavor::Git => {
+                    Trust::Bridge
+                }
+                _ => Trust::UserTrusted,
+            },
             memo: ProbeMemo::default(),
         }
     }
 
     pub fn with_helper(mut self, helper: PathBuf) -> Backend {
         self.helper = Some(helper);
+        self
+    }
+
+    pub fn with_application(mut self, application: PathBuf) -> Backend {
+        self.application = Some(application);
         self
     }
 
@@ -205,6 +261,10 @@ impl Backend {
         let real = fs::canonicalize(&self.completer).ok();
         let mut files = vec![self.completer.clone()];
         files.extend(real.clone());
+        if let Some(app) = &self.application {
+            files.push(app.clone());
+            files.extend(fs::canonicalize(app).ok());
+        }
         if let Some(helper) = &self.helper {
             // Completion functions may read local files: cache per directory.
             files.push(helper.clone());
@@ -263,21 +323,111 @@ pub enum Discovery {
 /// Built-in bridges identify the app from its installation; other apps that
 /// declare argcomplete support are probed only when `trusted` lists them.
 pub fn discover(name: &str, path: &Path, trusted: &[String]) -> Discovery {
-    match discover_protocol(name, path, trusted) {
-        Discovery::None => bash_function(name, trusted),
+    discover_for_shell(name, path, trusted, crate::shells::Shell::Bash)
+}
+
+pub fn discover_for_shell(
+    name: &str,
+    path: &Path,
+    trusted: &[String],
+    shell: crate::shells::Shell,
+) -> Discovery {
+    // Only an executable notypo may inspect is identified.
+    let identity = probe::is_trusted_location(path)
+        .then(|| identity::identify(path))
+        .flatten();
+    let identity = identity.as_deref();
+    let found = match discover_protocol(name, path, trusted, identity) {
+        Discovery::None => {
+            let handlers: [HandlerDiscovery; 3] = match shell {
+                crate::shells::Shell::Zsh => [zsh_function, bash_function, fish_script],
+                crate::shells::Shell::Fish => [fish_script, bash_function, zsh_function],
+                _ => [bash_function, fish_script, zsh_function],
+            };
+            handlers
+                .into_iter()
+                .map(|discover| discover(name, trusted, identity))
+                .find(|found| !matches!(found, Discovery::None))
+                .unwrap_or(Discovery::None)
+        }
         found => found,
+    };
+    match found {
+        Discovery::Found(mut backend) => {
+            if backend.identity.is_none() {
+                backend.identity = identity.map(str::to_owned);
+            }
+            Discovery::Found(backend.with_application(path.to_owned()))
+        }
+        other => other,
+    }
+}
+
+/// Looks for an installed shell completion handler: name, trust, identity.
+type HandlerDiscovery = fn(&str, &[String], Option<&str>) -> Discovery;
+
+/// `name`, followed by the identity that distinguishes it from other apps
+/// sharing the name, for messages.
+fn described(name: &str, identity: Option<&str>) -> String {
+    match identity {
+        Some(identity) => format!("{name} ({identity})"),
+        None => name.to_owned(),
+    }
+}
+
+fn zsh_function(name: &str, trusted: &[String], identity: Option<&str>) -> Discovery {
+    let name = app_name(name);
+    let Some(script) = zsh::script_for(name) else {
+        return Discovery::None;
+    };
+    if !identity::is_trusted(trusted, name, identity) {
+        return Discovery::NotTrusted(format!(
+            "{} has a zsh completion function ({}); add it to trusted_completers to use it",
+            described(name, identity),
+            script.display()
+        ));
+    }
+    if !cfg!(unix) {
+        return Discovery::Unavailable("ZLE completion requires a Unix terminal".into());
+    }
+    match crate::utils::which("zsh").filter(|p| probe::is_trusted_location(p)) {
+        Some(zsh) => {
+            Discovery::Found(Backend::new(Flavor::ZshFunction, name, zsh).with_helper(script))
+        }
+        None => Discovery::Unavailable("zsh is not installed".into()),
+    }
+}
+
+fn fish_script(name: &str, trusted: &[String], identity: Option<&str>) -> Discovery {
+    let name = app_name(name);
+    let Some(script) = fish::script_for(name) else {
+        return Discovery::None;
+    };
+    if !identity::is_trusted(trusted, name, identity) {
+        return Discovery::NotTrusted(format!(
+            "{} has a fish completion script ({}); add it to trusted_completers to use it",
+            described(name, identity),
+            script.display()
+        ));
+    }
+    match crate::utils::which("fish").filter(|f| probe::is_trusted_location(f)) {
+        Some(fish) => {
+            Discovery::Found(Backend::new(Flavor::FishScript, name, fish).with_helper(script))
+        }
+        None => Discovery::Unavailable("fish is not installed".into()),
     }
 }
 
 /// A trusted program's bash completion function, when it has nothing else.
-fn bash_function(name: &str, trusted: &[String]) -> Discovery {
+fn bash_function(name: &str, trusted: &[String], identity: Option<&str>) -> Discovery {
     let name = app_name(name);
     let Some(script) = bash::script_for(name) else {
         return Discovery::None;
     };
-    if !trusted.iter().any(|t| t == "*" || t == name) {
+    if !identity::is_trusted(trusted, name, identity) {
         return Discovery::NotTrusted(format!(
-            "{name} has a bash completion script ({}); add it to trusted_completers to use it",
+            "{} has a bash completion script ({}); add it to trusted_completers to use it",
+            described(name, identity),
             script.display()
         ));
     }
@@ -289,7 +439,12 @@ fn bash_function(name: &str, trusted: &[String]) -> Discovery {
     }
 }
 
-fn discover_protocol(name: &str, path: &Path, trusted: &[String]) -> Discovery {
+fn discover_protocol(
+    name: &str,
+    path: &Path,
+    trusted: &[String],
+    identity: Option<&str>,
+) -> Discovery {
     if !probe::is_trusted_location(path) {
         return Discovery::NotTrusted(format!(
             "{} was not resolved to an absolute path",
@@ -308,11 +463,12 @@ fn discover_protocol(name: &str, path: &Path, trusted: &[String]) -> Discovery {
         "gcloud" if is_gcloud(path) => argcomplete(Flavor::Gcloud, name, path),
         "az" if head(path, 4096).contains("azure.cli") => argcomplete(Flavor::Azure, name, path),
         _ if head(path, 1024).contains("PYTHON_ARGCOMPLETE_OK") => {
-            if trusted.iter().any(|t| t == "*" || t == name) {
+            if identity::is_trusted(trusted, name, identity) {
                 argcomplete(Flavor::Argcomplete, name, path)
             } else {
                 Discovery::NotTrusted(format!(
-                    "{name} declares argcomplete support; add it to trusted_completers to use it"
+                    "{} declares argcomplete support; add it to trusted_completers to use it",
+                    described(name, identity)
                 ))
             }
         }
@@ -330,6 +486,9 @@ fn go_app(name: &str, path: &Path, trusted: &[String]) -> Discovery {
     match go_flavor(&module, name, trusted) {
         Ok(flavor) => {
             let mut backend = Backend::new(flavor, name, path.to_owned());
+            if AUDITED_GO_APPS.iter().any(|(app, _)| *app == module.path) {
+                backend.trust = Trust::Audited;
+            }
             backend.identity = Some(module.path);
             Discovery::Found(backend)
         }
@@ -362,7 +521,7 @@ fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Fl
     } else {
         return Err(GoRefusal::NoProtocol);
     };
-    if audited.is_none() && !trusted.iter().any(|t| t == "*" || t == name) {
+    if audited.is_none() && !identity::is_trusted(trusted, name, Some(&module.path)) {
         return Err(GoRefusal::NotTrusted(format!(
             "{name} ({}) supports {} completion; add it to trusted_completers to use it",
             module.path,
@@ -508,7 +667,12 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
             set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
             set("GH_PROMPT_DISABLED", "1"),
         ]),
-        Flavor::Argcomplete | Flavor::Git | Flavor::Posener | Flavor::BashFunction => {}
+        Flavor::Argcomplete
+        | Flavor::Git
+        | Flavor::Posener
+        | Flavor::BashFunction
+        | Flavor::FishScript
+        | Flavor::ZshFunction => {}
     }
     env
 }
@@ -548,7 +712,13 @@ fn run_stdout(
             output.status
         )));
     }
-    Ok(String::from_utf8_lossy(&output.data).into_owned())
+    if output.truncated {
+        return Err(CompletionError::Failed(
+            "completion output exceeded the probe limit".into(),
+        ));
+    }
+    String::from_utf8(output.data)
+        .map_err(|_| CompletionError::Failed("completion output is not valid UTF-8".into()))
 }
 
 fn probe_error(error: ProbeError) -> CompletionError {
@@ -595,11 +765,16 @@ impl NativeCompletionBackend for Backend {
             Flavor::Cobra => "cobra",
             Flavor::Posener => "posener",
             Flavor::BashFunction => "bash",
+            Flavor::FishScript => "fish",
+            Flavor::ZshFunction => "zsh",
         }
     }
 
     fn location(&self) -> String {
-        self.completer.display().to_string()
+        self.helper.as_ref().map_or_else(
+            || self.completer.display().to_string(),
+            |script| format!("{} (via {})", script.display(), self.completer.display()),
+        )
     }
 
     fn cache_identity(&self) -> Option<String> {
@@ -610,7 +785,10 @@ impl NativeCompletionBackend for Backend {
         Capabilities {
             subcommands: true,
             options: true,
-            option_arity: matches!(self.flavor, Flavor::Gcloud | Flavor::Git),
+            option_arity: matches!(
+                self.flavor,
+                Flavor::Gcloud | Flavor::Git | Flavor::FishScript
+            ),
             values: self.flavor != Flavor::Git,
             resources: self.network && self.flavor != Flavor::Git,
             // gcloud's static tree only matches `--`; argparse apps list
@@ -626,9 +804,25 @@ impl NativeCompletionBackend for Backend {
                     | Flavor::Cobra
                     | Flavor::Posener
                     | Flavor::BashFunction
+                    | Flavor::FishScript
+                    | Flavor::ZshFunction
             ),
             // git's helper and hand-written completion scripts omit options.
-            complete_options: !matches!(self.flavor, Flavor::Git | Flavor::BashFunction),
+            complete_options: !matches!(
+                self.flavor,
+                Flavor::Git | Flavor::BashFunction | Flavor::FishScript | Flavor::ZshFunction
+            ),
+            complete_subcommands: !matches!(
+                self.flavor,
+                Flavor::BashFunction | Flavor::FishScript | Flavor::ZshFunction
+            ),
+            descriptions: matches!(self.flavor, Flavor::Cobra | Flavor::FishScript),
+            query_dialect: match self.flavor {
+                Flavor::Cobra | Flavor::Git => None,
+                Flavor::FishScript => Some(super::parser::Dialect::Fish),
+                _ => Some(super::parser::Dialect::Posix),
+            },
+            trust: self.trust,
         }
     }
 
@@ -660,6 +854,14 @@ impl NativeCompletionBackend for Backend {
             offline_env(self.flavor)
         };
         self.query(words, "", budget, env)
+    }
+
+    fn complete_offline_values(
+        &self,
+        words: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        self.query(words, "", budget, offline_env(self.flavor))
     }
 }
 
@@ -694,6 +896,36 @@ impl Backend {
                 budget,
             );
         }
+        if self.flavor == Flavor::FishScript {
+            let script = self
+                .helper
+                .as_deref()
+                .ok_or_else(|| CompletionError::Unsupported("no completion script".into()))?;
+            return fish::complete(
+                &self.completer,
+                script,
+                &self.name,
+                words,
+                prefix,
+                env,
+                budget,
+            );
+        }
+        if self.flavor == Flavor::ZshFunction {
+            let script = self
+                .helper
+                .as_deref()
+                .ok_or_else(|| CompletionError::Unsupported("no completion function".into()))?;
+            return zsh::complete(
+                &self.completer,
+                script,
+                &self.name,
+                words,
+                prefix,
+                env,
+                budget,
+            );
+        }
         let line = completion_line(&self.name, words, prefix);
         // aws_completer and gcloud's lookup slice the line as Python text;
         // argcomplete expects the byte offset bash supplies.
@@ -703,6 +935,9 @@ impl Backend {
             | Flavor::Git
             | Flavor::Cobra
             | Flavor::BashFunction => line.chars().count(),
+            Flavor::FishScript | Flavor::ZshFunction => {
+                unreachable!("shell queries use their own driver")
+            }
             Flavor::Azure | Flavor::Argcomplete | Flavor::Posener => line.len(),
         };
         env.push(("COMP_LINE".into(), Some(line.into())));
@@ -741,7 +976,13 @@ impl Backend {
                 _ => CompletionError::Failed(format!("completer exited with {:?}", output.status)),
             });
         }
-        let text = String::from_utf8_lossy(&output.data);
+        if output.truncated {
+            return Err(CompletionError::Failed(
+                "completion output exceeded the probe limit".into(),
+            ));
+        }
+        let text = String::from_utf8(output.data)
+            .map_err(|_| CompletionError::Failed("completion output is not valid UTF-8".into()))?;
         let separator = if matches!(self.flavor, Flavor::AwsCompleter | Flavor::Posener) {
             '\n'
         } else {
@@ -784,10 +1025,29 @@ impl Backend {
             ));
         }
         Ok(normalize(
-            lines.into_iter().map(|l| l.split('\t').next().unwrap_or(l)),
+            lines.into_iter(),
             Flavor::Cobra,
             budget.max_candidates,
         ))
+    }
+}
+
+/// An app's description made safe to print: control and bidirectional
+/// formatting characters removed, one line, at most 120 characters.
+pub(crate) fn clean_description(text: &str) -> Option<String> {
+    let invisible = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+    };
+    let cleaned: String = text
+        .chars()
+        .map(|c| if invisible(c) { ' ' } else { c })
+        .collect();
+    let line = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    match line.chars().count() {
+        0 => None,
+        n if n > 120 => Some(line.chars().take(119).chain(['…']).collect()),
+        _ => Some(line),
     }
 }
 
@@ -799,8 +1059,18 @@ fn normalize<'a>(
 ) -> Vec<CompletionItem> {
     let mut items: Vec<CompletionItem> = Vec::new();
     for entry in raw {
+        // cobra answers `word<TAB>description`.
+        let (entry, description) = match entry.split_once('\t') {
+            Some((word, description)) if flavor == Flavor::Cobra => {
+                (word, clean_description(description))
+            }
+            _ => (entry, None),
+        };
         let entry = entry.trim();
-        if entry.is_empty() || entry.contains(char::is_whitespace) {
+        if entry.is_empty()
+            || entry.contains(char::is_whitespace)
+            || entry.contains(char::is_control)
+        {
             continue;
         }
         // `--flag=` marks an option that takes a value; gcloud's static
@@ -809,10 +1079,12 @@ fn normalize<'a>(
             Some(name) if name.starts_with('-') => CompletionItem {
                 value: name.to_owned(),
                 takes_value: Some(true),
+                description,
             },
             _ => CompletionItem {
                 value: entry.to_owned(),
                 takes_value: (flavor == Flavor::Gcloud && entry.starts_with("--")).then_some(false),
+                description,
             },
         };
         if !items.iter().any(|i| i.value == item.value) {
@@ -966,15 +1238,18 @@ esac
             [
                 CompletionItem {
                     value: "--format".into(),
-                    takes_value: Some(true)
+                    takes_value: Some(true),
+                    description: None,
                 },
                 CompletionItem {
                     value: "--uri".into(),
-                    takes_value: Some(false)
+                    takes_value: Some(false),
+                    description: None,
                 },
                 CompletionItem {
                     value: "--zones".into(),
-                    takes_value: Some(true)
+                    takes_value: Some(true),
+                    description: None,
                 },
             ]
         );
@@ -988,10 +1263,22 @@ esac
     fn discovery_requires_identity_and_trust() {
         let dir = Dir::new("discovery");
         let fake_gcloud = dir.script("bin/gcloud", "#!/bin/sh\n");
-        assert_eq!(discover("gcloud", &fake_gcloud, &[]), Discovery::None);
+        // Installed shell handlers may exist independently of these fakes.
+        // The audited app protocol still requires the app's own identity.
+        assert_eq!(
+            discover_protocol("gcloud", &fake_gcloud, &[], None),
+            Discovery::None
+        );
         let other_aws = dir.script("other/aws", "#!/bin/sh\n");
         dir.script("other/aws_completer", "#!/bin/sh\n# unrelated\n");
-        assert_eq!(discover("aws", &other_aws, &[]), Discovery::None);
+        assert_eq!(
+            discover_protocol("aws", &other_aws, &[], None),
+            Discovery::None
+        );
+        assert!(!matches!(
+            discover("aws", &other_aws, &[]),
+            Discovery::Found(_)
+        ));
         let az = dir.script("bin/az", "#!/bin/sh\npython -m azure.cli \"$@\"\n");
         assert!(
             matches!(discover("az", &az, &[]), Discovery::Found(b) if b.flavor == Flavor::Azure)
@@ -1010,6 +1297,166 @@ esac
         ));
         assert!(matches!(
             discover("aws", Path::new("bin/aws"), &[]),
+            Discovery::NotTrusted(_)
+        ));
+    }
+
+    /// How a fixture app is packaged.
+    enum Install {
+        Go(&'static str),
+        /// A Python console script declaring argcomplete, by entry module.
+        Python(&'static str),
+        Npm(&'static str),
+    }
+
+    impl Install {
+        fn create(&self, dir: &Dir, name: &str, tag: &str) -> (PathBuf, String) {
+            match self {
+                Install::Go(module) => {
+                    let path = dir.0.join(tag).join(name);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, go::fake_binary(module, &["github.com/spf13/cobra"]))
+                        .unwrap();
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                    (path, module.to_string())
+                }
+                Install::Python(module) => (
+                    dir.script(
+                        &format!("{tag}/{name}"),
+                        &format!(
+                            "#!/usr/bin/env python3\n# PYTHON_ARGCOMPLETE_OK\nimport sys\nfrom {module}.cli import main\nsys.exit(main())\n"
+                        ),
+                    ),
+                    format!("python:{module}"),
+                ),
+                Install::Npm(package) => {
+                    let root = dir.0.join(tag).join("lib/node_modules").join(package);
+                    let target = dir.script(
+                        &format!("{tag}/lib/node_modules/{package}/bin/cli.js"),
+                        "#!/usr/bin/env node\n",
+                    );
+                    fs::write(
+                        root.join("package.json"),
+                        format!(r#"{{"name": "{package}", "bin": {{"{name}": "bin/cli.js"}}}}"#),
+                    )
+                    .unwrap();
+                    let link = dir.0.join(tag).join("bin").join(name);
+                    fs::create_dir_all(link.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(&target, &link).unwrap();
+                    (link, format!("npm:{package}"))
+                }
+            }
+        }
+
+        fn has_protocol(&self) -> bool {
+            !matches!(self, Install::Npm(_))
+        }
+    }
+
+    /// Unrelated apps sharing a basename are told apart by their package
+    /// metadata, never by the name: trust given to one app's identity
+    /// doesn't reach the other, follows the app when it's renamed, and an
+    /// audit (Hetzner's hcloud) belongs to the audited module only. The
+    /// fixture identities stand in for the real packages; each real client's
+    /// identity is recorded when it is verified (section 5A of the plan).
+    #[test]
+    fn basename_collisions_are_resolved_by_app_identity() {
+        let dir = Dir::new("collisions");
+        let pairs = [
+            (
+                "hcloud",
+                Install::Go("github.com/hetznercloud/cli/cmd/hcloud"),
+                Install::Go("example.com/huawei/koocli/cmd/hcloud"),
+            ),
+            (
+                "cf",
+                Install::Go("example.com/cloudfoundry/cli/cmd/cf"),
+                Install::Npm("example-cloudflare-cf"),
+            ),
+            (
+                "metal",
+                Install::Go("example.com/equinix/metal-cli/cmd/metal"),
+                Install::Go("example.com/metal-stack-cloud/cli/cmd/metal"),
+            ),
+            (
+                "atlas",
+                Install::Go("example.com/mongodb/atlas-cli/cmd/atlas"),
+                Install::Go("ariga.io/atlas/cmd/atlas"),
+            ),
+            (
+                "exo",
+                Install::Go("example.com/exoscale/cli"),
+                Install::Python("exo"),
+            ),
+            (
+                "stackit",
+                Install::Go("example.com/stackitcloud/stackit-cli"),
+                Install::Python("stackit_tools"),
+            ),
+            (
+                "s",
+                Install::Npm("@serverless-devs/s"),
+                Install::Python("s_tool"),
+            ),
+        ];
+        for (name, first, second) in &pairs {
+            let (a, id_a) = first.create(&dir, name, &format!("{name}-a"));
+            let (b, id_b) = second.create(&dir, name, &format!("{name}-b"));
+            assert_eq!(
+                identity::identify(&a).as_deref(),
+                Some(id_a.as_str()),
+                "{name}"
+            );
+            assert_eq!(
+                identity::identify(&b).as_deref(),
+                Some(id_b.as_str()),
+                "{name}"
+            );
+            assert_ne!(id_a, id_b);
+
+            // Trust pinned to one identity: the other app is not probed.
+            let pinned = [id_b.clone()];
+            match discover(name, &b, &pinned) {
+                Discovery::Found(backend) if second.has_protocol() => {
+                    assert_eq!(backend.identity.as_deref(), Some(id_b.as_str()));
+                }
+                Discovery::None if !second.has_protocol() => {}
+                other => panic!("{name} b: {other:?}"),
+            }
+            let audited = *name == "hcloud";
+            match discover(name, &a, &pinned) {
+                Discovery::Found(backend) if audited => {
+                    assert_eq!(backend.identity.as_deref(), Some(id_a.as_str()));
+                }
+                Discovery::NotTrusted(why) if first.has_protocol() && !audited => {
+                    assert!(why.contains(&id_a), "{why}");
+                }
+                Discovery::None if !first.has_protocol() => {}
+                other => panic!("{name} a: {other:?}"),
+            }
+
+            // Trust follows the app under another name.
+            if first.has_protocol() && !audited {
+                let renamed = dir.0.join(format!("{name}-a/renamed-{name}"));
+                fs::copy(&a, &renamed).unwrap();
+                assert!(matches!(
+                    discover(
+                        &format!("renamed-{name}"),
+                        &renamed,
+                        std::slice::from_ref(&id_a)
+                    ),
+                    Discovery::Found(_)
+                ));
+                assert!(matches!(
+                    discover(&format!("renamed-{name}"), &renamed, &[name.to_string()]),
+                    Discovery::NotTrusted(_)
+                ));
+            }
+        }
+        // The audit names Hetzner's module; Huawei's hcloud needs trust.
+        let (huawei, _) = pairs[0].2.create(&dir, "hcloud", "hcloud-c");
+        assert!(matches!(
+            discover("hcloud", &huawei, &[]),
             Discovery::NotTrusted(_)
         ));
     }
@@ -1065,11 +1512,28 @@ esac
     }
 
     #[test]
+    fn descriptions_are_printable_single_lines() {
+        assert_eq!(
+            clean_description("  Display\tone\n or many  ").as_deref(),
+            Some("Display one or many")
+        );
+        assert_eq!(
+            clean_description("\x1b]0;pwned\x07Create").as_deref(),
+            Some("]0;pwned Create")
+        );
+        assert_eq!(clean_description("a\u{202e}b").as_deref(), Some("a b"));
+        assert_eq!(clean_description(" \t "), None);
+        let long = clean_description(&"x".repeat(500)).unwrap();
+        assert_eq!(long.chars().count(), 120);
+        assert!(long.ends_with('…'));
+    }
+
+    #[test]
     fn cobra_and_posener_protocols() {
         let dir = Dir::new("go-protocols");
         let cobra = dir.script(
             "bin/app",
-            "#!/bin/sh\n[ \"$KUBECONFIG\" = /dev/null ] || exit 7\n[ \"$1\" = __complete ] || { touch \"$(dirname \"$0\")/ran\"; exit 1; }\nshift\ncase \"$*\" in\n  \"\") printf 'get\\tDisplay\\ncreate\\tCreate\\n:4\\n';;\n  \"get -\") printf -- '--namespace\\tns\\n-n\\tns\\n--watch\\twatch\\n:4\\n';;\n  \"get pods \") printf ':1\\n';;\n  *) printf 'garbage\\n';;\nesac\n",
+            "#!/bin/sh\n[ \"$KUBECONFIG\" = /dev/null ] || exit 7\n[ \"$1\" = __complete ] || { touch \"$(dirname \"$0\")/ran\"; exit 1; }\nshift\ncase \"$*\" in\n  \"\") printf 'get\\tDisplay one or many\\ncreate\\tCreate \\033]0;title\\007it\\n:4\\n';;\n  \"get -\") printf -- '--namespace\\tns\\n-n\\tns\\n--watch\\twatch\\n:4\\n';;\n  \"get pods \") printf ':1\\n';;\n  *) printf 'garbage\\n';;\nesac\n",
         );
         let backend = Backend::new(Flavor::Cobra, "app", cobra);
         let mut budget = budget();
@@ -1080,6 +1544,20 @@ esac
             .map(|i| i.value)
             .collect();
         assert_eq!(words, ["get", "create"]);
+        let descriptions: Vec<Option<String>> = backend
+            .complete(&[], "", &mut budget)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.description)
+            .collect();
+        assert_eq!(
+            descriptions,
+            [
+                Some("Display one or many".into()),
+                Some("Create ]0;title it".into())
+            ],
+            "the app's descriptions are kept, without terminal controls"
+        );
         let options = backend.complete(&["get"], "-", &mut budget).unwrap();
         assert_eq!(options.len(), 3);
         assert!(matches!(
@@ -1115,5 +1593,65 @@ esac
             "aws s3 'a b' --"
         );
         assert_eq!(completion_line("az", &[], ""), "az ");
+    }
+
+    #[test]
+    fn bounded_protocol_outputs_reject_truncation_and_control_characters() {
+        let dir = Dir::new("malformed-completion");
+        for flavor in [Flavor::AwsCompleter, Flavor::Argcomplete, Flavor::Cobra] {
+            let command = match flavor {
+                Flavor::Argcomplete => "printf 'build\\vpublish\\vdeploy' >&8",
+                Flavor::Cobra => "printf 'build\\npublish\\ndeploy\\n:4\\n'",
+                _ => "printf 'build\\npublish\\ndeploy\\n'",
+            };
+            let app = dir.script("app", &format!("#!/bin/sh\n{command}\n"));
+            let backend = Backend::new(flavor, "app", app);
+            let mut budget = budget();
+            budget.max_output = 8;
+            let result = backend.complete(&[], "", &mut budget);
+            assert!(
+                matches!(result, Err(CompletionError::Failed(ref why)) if why.contains("probe limit")),
+                "{flavor:?}: {result:?}"
+            );
+        }
+        let items = normalize(
+            [
+                "build",
+                "bad\0word",
+                "bad\x1b[31m",
+                "two words",
+                "build",
+                "publish;echo_marker",
+            ]
+            .into_iter(),
+            Flavor::Argcomplete,
+            8,
+        );
+        assert_eq!(
+            items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>(),
+            ["build", "publish;echo_marker"]
+        );
+    }
+
+    #[test]
+    fn malformed_protocol_output_is_not_lossily_reinterpreted() {
+        let dir = Dir::new("completion-encoding");
+        for flavor in [Flavor::AwsCompleter, Flavor::Argcomplete, Flavor::Cobra] {
+            let redirect = if flavor == Flavor::Argcomplete {
+                ">&8"
+            } else {
+                ""
+            };
+            let app = dir.script(
+                "app",
+                &format!("#!/bin/sh\nprintf 'build\\n\\377broken\\n:4\\n' {redirect}\n"),
+            );
+            let backend = Backend::new(flavor, "app", app);
+            let result = backend.complete(&[], "", &mut budget());
+            assert!(
+                matches!(result, Err(CompletionError::Failed(why)) if why.contains("UTF-8")),
+                "{flavor:?}"
+            );
+        }
     }
 }
