@@ -84,6 +84,10 @@ def main():
     }
     cases = [{"name": "help_startup", "args": ["--help"], "env": env, "expected": None}]
     for fixture in fixtures:
+        # notypo holds corrections that add sudo for a person's approval,
+        # which `-y` without a terminal can't give: not comparable.
+        if fixture["name"] == "sudo":
+            continue
         log = work / (fixture["name"] + ".log")
         data = (MARK + "$ " + fixture["script"] + "\r\n"
                 + fixture["output"].replace("\n", "\r\n")
@@ -93,12 +97,12 @@ def main():
                         THEFUCK_INSTANT_MODE="true", THEFUCK_OUTPUT_LOG=str(log))
         cases.append({"name": fixture["name"] + "_captured", "args": ["-y"],
                       "env": captured, "expected": fixture["expected"]})
-        # Permission-denied output is simulated only; other reruns are harmless
-        # failures and the suggested correction is printed, never evaluated.
-        if fixture["name"] != "sudo":
-            cases.append({"name": fixture["name"] + "_rerun", "args": ["-y"],
-                          "env": dict(env, TF_HISTORY=fixture["script"] + "\nfuck"),
-                          "expected": fixture["expected"]})
+        # Reruns are harmless failures and the suggested correction is
+        # printed, never evaluated. notypo reruns only when asked to.
+        cases.append({"name": fixture["name"] + "_rerun", "args": ["-y"],
+                      "env": dict(env, TF_HISTORY=fixture["script"] + "\nfuck",
+                                  NOTYPO_REPLAY_FOR_DIAGNOSIS="true"),
+                      "expected": fixture["expected"]})
     fuzzy = next(case for case in cases if case["name"] == "no_command_rerun")
     cases.append(dict(fuzzy, name="no_command_rerun_no_path_cache",
                       env=dict(fuzzy["env"], NOTYPO_NO_CACHE="1")))

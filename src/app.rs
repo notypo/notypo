@@ -4,7 +4,7 @@ use crate::args::{self, Args};
 use crate::corrector::Corrector;
 use crate::engine::safety::{self, Decision, DeclaredEffect};
 use crate::engine::{self, CapturedOutput, FailureContext, Outcome, OutputOrigin, Report};
-use crate::settings::{EngineMode, Settings};
+use crate::settings::Settings;
 #[cfg(unix)]
 use crate::shell_logger;
 use crate::shells::{DEFAULT_ALIASES, Shell};
@@ -200,30 +200,14 @@ pub fn fix_command(args: &Args) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let expanded = ctx.shell.from_shell(&script);
-    let code = if ctx.settings.engine == EngineMode::Native || args.explain || args.json {
-        fix_with_engine(args, &ctx, &script, &expanded, status_applies)
-    } else {
-        let output = output_readers::get_output(&script, &expanded, &ctx.settings);
-        let command = Command::new(expanded, output.as_deref(), &ctx);
-        select_and_run(&mut Corrector::new(&command), &command, &ctx)
-    };
+    let code = fix_with_engine(args, &ctx, &script, &expanded, status_applies);
     logs::debug(format_args!("Total took: {:?}", started.elapsed()));
     code
 }
 
-fn select_and_run(suggestions: &mut dyn Suggestions, command: &Command, ctx: &Context) -> ExitCode {
-    match ui::select_command(suggestions, ctx.settings.require_confirmation, &ctx.alias) {
-        Some(selected) => {
-            run_corrected(command, &selected);
-            ExitCode::SUCCESS
-        }
-        None => ExitCode::FAILURE,
-    }
-}
-
-/// The structured engine: captured output only (the command is rerun just
-/// when `replay_for_diagnosis` allows it and the safety gate agrees), then
-/// engine candidates, then legacy rule suggestions through the same gate.
+/// Captured output only (the command is rerun just when
+/// `replay_for_diagnosis` allows it and the safety gate agrees), then the
+/// engine's candidates and the legacy rules' suggestions, all gated.
 fn fix_with_engine(
     args: &Args,
     ctx: &Context,
@@ -332,10 +316,17 @@ fn revalidate(ctx: &Context, report: &Report, selected: &Choice) -> Result<(), S
     Ok(())
 }
 
-/// Engine candidates first, then legacy rule suggestions (computed only when
-/// needed), each with the reason it is offered and what needs approval.
+/// Engine candidates and legacy rule suggestions, each with the reason it
+/// is offered and what needs approval. A decisive engine suggestion comes
+/// first; otherwise a matching rule does (rules encode specific fixes the
+/// engine can't always see without output), followed by the engine's.
+/// Rules are evaluated only when needed.
 struct EngineSuggestions<'c, 'a> {
     native: Vec<Choice>,
+    /// The engine's first candidate was chosen on its own evidence.
+    decisive: bool,
+    /// A rule's suggestion was offered first.
+    led_by_legacy: bool,
     legacy: Option<Corrector<'c, 'a>>,
     /// The legacy suggestion already taken from the corrector.
     legacy_first: Option<CorrectedCommand>,
@@ -379,6 +370,8 @@ impl<'c, 'a> EngineSuggestions<'c, 'a> {
             .then(|| Corrector::new(command));
         EngineSuggestions {
             native,
+            decisive: matches!(report.outcome, Outcome::Suggestion(_)),
+            led_by_legacy: false,
             legacy,
             legacy_first: None,
             legacy_done: false,
@@ -437,11 +430,9 @@ impl<'c, 'a> EngineSuggestions<'c, 'a> {
     }
 }
 
-impl Suggestions for EngineSuggestions<'_, '_> {
-    fn first(&mut self) -> Option<Choice> {
-        if let Some(first) = self.native.first() {
-            return Some(first.clone());
-        }
+impl EngineSuggestions<'_, '_> {
+    /// The first legacy suggestion the safety gate doesn't refuse.
+    fn legacy_first(&mut self) -> Option<Choice> {
         let first = self.legacy.as_mut()?.first()?;
         self.legacy_first = Some(first.clone());
         if let Some(choice) = self.gate(first) {
@@ -457,9 +448,25 @@ impl Suggestions for EngineSuggestions<'_, '_> {
         self.pending = acceptable.collect();
         Some(choice)
     }
+}
+
+impl Suggestions for EngineSuggestions<'_, '_> {
+    fn first(&mut self) -> Option<Choice> {
+        if self.decisive
+            && let Some(first) = self.native.first()
+        {
+            return Some(first.clone());
+        }
+        if let Some(choice) = self.legacy_first() {
+            self.led_by_legacy = true;
+            return Some(choice);
+        }
+        self.native.first().cloned()
+    }
 
     fn rest(&mut self, first: &Choice) -> Vec<Choice> {
-        let mut all: Vec<Choice> = self.native.iter().skip(1).cloned().collect();
+        let skip = usize::from(!self.led_by_legacy);
+        let mut all: Vec<Choice> = self.native.iter().skip(skip).cloned().collect();
         all.append(&mut self.pending);
         let legacy: Vec<Choice> = self
             .legacy_rest()

@@ -1,6 +1,6 @@
 # notypo
 
-notypo is a crossplatform Rust port of thefuck. It suggests fixes for failed shell commands and can run the selected correction.
+notypo fixes failed shell commands. It began as a Rust port of thefuck; it now asks the installed app what is valid and repairs only the wrong words, with thefuck's rules as a fallback.
 Mac/Linux/Windows/FreeBSD supported. x64 and ARM
 
 ## Shell setup
@@ -30,27 +30,24 @@ Running `./target/release/notypo` directly without arguments prints usage: the b
 ./target/release/notypo -y 'git sttus'
 ```
 
-This prints `git status`; the standalone binary does not execute the printed correction.
+This prints `git status`; the standalone binary does not execute the printed correction. An explicit command carries no exit status, so corrections the evidence doesn't settle are refused under `-y` instead of guessed.
 
-## Structured engine (experimental)
-
-By default notypo uses thefuck's rule engine. An opt-in engine instead asks the installed app what is valid and repairs only the wrong words:
+## How it corrects
 
 ```sh
-export NOTYPO_ENGINE=native        # or engine = 'native' in settings.py
 notypo --explain 'aws ec2 describ-instances --regoin eu-west-1'
 ```
 
-`--explain` prints the diagnosis, candidates, evidence, and safety decision without running anything. With the shell alias, `typo` offers `aws ec2 describe-instances --region eu-west-1`.
+`--explain` prints the diagnosis, candidates, evidence, and safety decision without running anything; `--json` prints the same report as JSON on stdout. With the shell alias, `typo` offers `aws ec2 describe-instances --region eu-west-1`.
 
 Where the corrections come from:
 
 - **The app itself.** notypo asks the installed app's own completer what is valid at each level and only proposes words it lists, so new commands and installed extensions work without a notypo update. Built-in bridges cover `aws` (`aws_completer`), `gcloud` and `az` (argcomplete), and `git` (`--list-cmds` and `--git-completion-helper`, run in an empty repository). Go apps are recognized from the module information in their binaries: kubectl, helm, gh, Hetzner's hcloud, kind, and docker speak cobra; terraform, tofu, and packer speak posener/complete. Other argcomplete, cobra, or posener apps, and apps that only ship a bash completion script (such as brew or deno), are probed only when listed in `trusted_completers`.
 - **Option values** such as regions or output formats are checked against the app's offline value lists. Resource names (instances, buckets) are looked up only with `network_completion`, using your credentials, read-only.
 - **Without a completer**, the first level and options are checked against the man page (formatted by the system `man`; the program never runs), `--help` output for programs in `trusted_help`, and your shell history. These lists can be incomplete, so a close match is offered for confirmation rather than run.
-- **Programs and paths:** misspelled programs are matched against `$PATH`, aliases, and builtins. A program whose own completer accepts the rest of the line ranks first. Missing paths, including `cd` targets, are repaired from the filesystem. Commands run through `npx`, `uvx`, `pipx run`, `bundle exec`, and similar are repaired as the installed program they run; nothing is downloaded.
+- **Programs and paths:** misspelled programs are matched against `$PATH`, aliases, and builtins, and a missing space is inserted (`cd..` → `cd ..`, `gitstatus` → `git status`). A program whose own completer accepts the rest of the line ranks first. Missing paths, including `cd` targets, are repaired from the filesystem. Commands run through `npx`, `uvx`, `pipx run`, `bundle exec`, and similar are repaired as the installed program they run; nothing is downloaded.
 - **Error output**, when the shell logger or instant mode captured it, confirms the diagnosis, and "did you mean" hints raise matching candidates. Printed hints are untrusted text: they only ever become a quoted word.
-- If the engine finds nothing, legacy rules still run on any captured output, through the same safety gate.
+- **thefuck's rules** still run, through the same safety gate: a matching rule leads when the engine isn't sure, and is offered as an alternative otherwise. Most rules need the failed command's output, which notypo has only when the shell logger or instant mode captured it, or when `replay_for_diagnosis` allows a rerun.
 
 How it stays safe:
 
@@ -60,13 +57,10 @@ How it stays safe:
 - Every candidate passes a safety gate. These all need explicit approval, even with `-y`: added `sudo`, deletions, force or auto-approve flags, destructive git or cloud operations, package changes, changed write targets, and new redirections, operators, or substitutions. Close or weakly supported candidates also need a choice. Without a terminal to ask on, nothing runs. The gate is a heuristic, not a proof that a command is harmless.
 - The shell functions pass the failed command's exit status (and pipeline statuses) to notypo, which strengthens the diagnosis.
 
-`--json` prints the same report as `--explain`, as JSON on stdout, for automation.
-
-Engine settings (`settings.py` name, then environment variable):
+Settings (`settings.py` name, then environment variable), besides thefuck's:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `engine` / `NOTYPO_ENGINE` | `legacy` | `native` enables the structured engine |
 | `disabled_sources` / `NOTYPO_DISABLED_SOURCES` | `[]` | any of `native`, `executables`, `stderr`, `history`, `filesystem`, `man`, `help`, `legacy` |
 | `trusted_completers` / `NOTYPO_TRUSTED_COMPLETERS` | `[]` | extra argcomplete/cobra/posener apps and bash completion scripts to use; `*` for all |
 | `trusted_help` / `NOTYPO_TRUSTED_HELP` | `[]` | programs that may be run with `--help`; `*` for all |
@@ -74,15 +68,19 @@ Engine settings (`settings.py` name, then environment variable):
 | `probe_timeout` / `NOTYPO_PROBE_TIMEOUT` | `3` | seconds per probe (three times that in total) |
 | `replay_for_diagnosis` / `NOTYPO_REPLAY_FOR_DIAGNOSIS` | `False` | rerun low-risk commands to read their output |
 
-Accuracy and speed: on a corpus of 715 typos in real aws, gcloud, az, git, kubectl, docker, helm, and system command names (`tests/corpus.rs`), the first suggestion is right 98.7% of the time and one of the first three 100%. The engine decides alone in 95.9% of cases with no wrong decisions, and asks otherwise. The engine itself takes about a millisecond. End to end, time is the app's completer: 20–70 ms for git and Go CLIs, 200–450 ms warm for the Python cloud CLIs (`benchmarks/structured-results.md`).
+Accuracy: on a corpus of 771 typos in real aws, gcloud, az, git, kubectl, docker, helm, and system command names (`tests/corpus.rs`), the first suggestion is right 98.8% of the time and one of the first three 100%. notypo decides alone in 95.7% of cases with no wrong decisions, and asks otherwise. To check the CLIs installed on your machine: `cargo test --test installed_clis -- --ignored --nocapture`.
 
-Compared with the rule engine, the structured engine never reruns the failed command, so rules that need output only work when the shell logger or instant mode captured it. `-y` no longer runs risky or uncertain corrections. Rule suggestions with side effects (`dirty_untar`, `dirty_unzip`, `ssh_known_hosts`) always ask first. To check the installed CLIs on your machine: `cargo test --test installed_clis -- --ignored --nocapture`.
+Differences from thefuck:
+
+- The failed command is never rerun to read its output, so output-based rules (for example `git push` without an upstream) need the shell logger, instant mode, or `replay_for_diagnosis = True`.
+- `-y` never runs risky or uncertain corrections: added `sudo`, package changes, close alternatives, and corrections without failure evidence all ask first, and are refused without a terminal.
+- Rule suggestions with side effects (`dirty_untar`, `dirty_unzip`, `ssh_known_hosts`) always ask first.
 
 Not yet supported: fish, PowerShell, and tcsh command lines; zsh, fish, and PowerShell completion functions as a source; other completion protocols (click, oclif, yargs).
 
 ## Performance
 
-notypo **14–39× faster** than the original Python `thefuck` and uses **10x** less memory
+Against the original Python thefuck 3.32 on the same commands, notypo is **6–33× faster** end to end and uses about **6× less memory** (6.8 MiB against 40.5 MiB; `benchmarks/results.md`). Asking an app's own completer adds the app's startup: git and Go CLIs answer in 20–70 ms; the Python cloud CLIs take 200–450 ms warm (`benchmarks/structured-results.md`). The engine itself takes about a millisecond.
 
 ## License
 

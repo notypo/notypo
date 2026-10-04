@@ -187,6 +187,20 @@ fn cases(trees: &HashMap<String, Tree>, executables: &[&str]) -> Vec<Case> {
             }
         }
     }
+    // A missing space after the program: `gitstatus`, `kubectlget`.
+    let mut apps: Vec<&String> = trees.keys().collect();
+    apps.sort();
+    for app in apps {
+        let top = &trees[app.as_str()].levels[""];
+        for word in top.iter().step_by((top.len() / 8).max(1)).take(8) {
+            cases.push(Case {
+                tier: "missing space",
+                command: format!("{app}{word}"),
+                expected: format!("{app} {word}"),
+                status: 127,
+            });
+        }
+    }
     let path: HashSet<&str> = executables.iter().copied().collect();
     for name in executables.iter().step_by(6) {
         if name.chars().count() < 3 {
@@ -306,6 +320,20 @@ fn labeled_corpus_accuracy_and_threshold_calibration() {
                 Outcome::Ambiguous(_) => t.asked += 1,
                 _ => t.abstained += 1,
             }
+        }
+        if std::env::var_os("CORPUS_DEBUG").is_some()
+            && case.tier == "program"
+            && matches!(report.outcome, Outcome::Ambiguous(_))
+        {
+            eprintln!(
+                "asked: {} -> {:?}",
+                case.command,
+                candidates
+                    .iter()
+                    .take(3)
+                    .map(|c| format!("{} {:.3}", c.script, c.score))
+                    .collect::<Vec<_>>()
+            );
         }
         let scores: Vec<f64> = candidates.iter().map(|c| c.score).collect();
         let held = matches!(report.outcome, Outcome::Ambiguous(_)) && ranking::is_decisive(&scores);

@@ -8,9 +8,9 @@
 //! it. Callers abstain unless the best candidate is strong enough and clearly
 //! ahead of the runner-up.
 
-// Calibrated on tests/corpus.rs (715 labeled typos of real aws, gcloud,
+// Calibrated on tests/corpus.rs (771 labeled typos of real aws, gcloud,
 // az, git, kubectl, docker, helm, and system command names): with these
-// values 95.9% are decided alone and none wrongly; a smaller margin starts
+// values 95.7% are decided alone and none wrongly; a smaller margin starts
 // choosing wrong commands, a larger one only asks more often.
 
 /// Minimum score for an automatic first choice.

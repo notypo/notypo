@@ -33,10 +33,7 @@ pub struct Settings {
     /// Used by the `fix_file` rule (`@default_settings` in Python).
     pub fixlinecmd: String,
     pub fixcolcmd: Option<String>,
-    /// The rule-based compatibility engine, or the structured pipeline in
-    /// [`crate::engine`] (opt-in while it is being measured).
-    pub engine: EngineMode,
-    /// Candidate sources the structured engine must not use (see
+    /// Candidate sources the correction engine must not use (see
     /// [`crate::engine::Source::setting_name`]).
     pub disabled_sources: Vec<String>,
     /// Programs whose generic completion protocol may be probed; `*` trusts
@@ -54,23 +51,6 @@ pub struct Settings {
     /// clusters) with the user's credentials. Read-only, but it reaches the
     /// network, so it is off by default.
     pub network_completion: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum EngineMode {
-    #[default]
-    Legacy,
-    Native,
-}
-
-impl EngineMode {
-    pub fn from_name(name: &str) -> Option<EngineMode> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "legacy" | "rules" => Some(EngineMode::Legacy),
-            "native" | "structured" => Some(EngineMode::Native),
-            _ => None,
-        }
-    }
 }
 
 impl Default for Settings {
@@ -100,7 +80,6 @@ impl Default for Settings {
             excluded_search_path_prefixes: Vec::new(),
             fixlinecmd: "{editor} {file} +{line}".into(),
             fixcolcmd: None,
-            engine: EngineMode::Legacy,
             disabled_sources: Vec::new(),
             trusted_completers: Vec::new(),
             trusted_help: Vec::new(),
@@ -139,7 +118,6 @@ const DEFAULTS_DOC: &str = "# rules = [<const: All rules enabled>]
 # num_close_matches = 3
 # env = {'LC_ALL': 'C', 'LANG': 'C', 'GIT_TRACE': '1'}
 # excluded_search_path_prefixes = []
-# engine = 'legacy'
 # disabled_sources = []
 # trusted_completers = []
 # trusted_help = []
@@ -259,10 +237,6 @@ impl Settings {
         }
         if let Some(v) = var("THEFUCK_EXCLUDED_SEARCH_PATH_PREFIXES") {
             next.excluded_search_path_prefixes = list(&v);
-        }
-        if let Some(v) = var("NOTYPO_ENGINE") {
-            next.engine =
-                EngineMode::from_name(&v).ok_or_else(|| format!("unknown engine: '{v}'"))?;
         }
         if let Some(v) = var("NOTYPO_DISABLED_SOURCES") {
             next.disabled_sources = list(&v).into_iter().filter(|s| !s.is_empty()).collect();
@@ -385,10 +359,6 @@ impl Settings {
             }
             "fixlinecmd" => match v.as_str() {
                 Some(s) => self.fixlinecmd = s.to_owned(),
-                None => return false,
-            },
-            "engine" => match v.as_str().and_then(EngineMode::from_name) {
-                Some(mode) => self.engine = mode,
                 None => return false,
             },
             "disabled_sources" | "trusted_completers" | "trusted_help" => {
@@ -824,11 +794,9 @@ no_colors = True
     #[test]
     fn structured_engine_settings() {
         let mut s = Settings::default();
-        assert_eq!(s.engine, EngineMode::Legacy);
         s.apply_file(
-            "engine = 'native'\ndisabled_sources = ['stderr']\ntrusted_completers = ['mytool']\ntrusted_help = ['cargo']\nprobe_timeout = 1.5\nreplay_for_diagnosis = True\n",
+            "disabled_sources = ['stderr']\ntrusted_completers = ['mytool']\ntrusted_help = ['cargo']\nprobe_timeout = 1.5\nreplay_for_diagnosis = True\n",
         );
-        assert_eq!(s.engine, EngineMode::Native);
         assert!(!s.is_source_enabled("stderr"));
         assert!(s.is_source_enabled("native"));
         assert_eq!(s.trusted_completers, ["mytool"]);
@@ -837,19 +805,17 @@ no_colors = True
         assert!(s.replay_for_diagnosis);
 
         let env: HashMap<&str, &str> = [
-            ("NOTYPO_ENGINE", "legacy"),
             ("NOTYPO_DISABLED_SOURCES", "native:legacy"),
             ("NOTYPO_PROBE_TIMEOUT", "0.25"),
             ("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false"),
         ]
         .into();
         s.apply_env(|k| env.get(k).map(|v| v.to_string())).unwrap();
-        assert_eq!(s.engine, EngineMode::Legacy);
         assert_eq!(s.disabled_sources, ["native", "legacy"]);
         assert_eq!(s.probe_timeout, 0.25);
         assert!(!s.replay_for_diagnosis);
         assert!(
-            s.apply_env(|k| (k == "NOTYPO_ENGINE").then(|| "fast".into()))
+            s.apply_env(|k| (k == "NOTYPO_PROBE_TIMEOUT").then(|| "soon".into()))
                 .is_err()
         );
     }

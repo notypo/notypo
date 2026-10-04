@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Structured engine latency, probes, and memory, end to end.
+"""Correction latency, probes, and memory against installed CLIs.
 
-Runs `notypo --json` (which never executes the correction) against the
-installed CLIs: each case cold (an empty cache directory) and warm (after
-one run filled it), reporting median and p95 wall time, completer probes,
-and peak RSS. Cases whose app is missing are skipped. The rule engine is
-compared only on commands that are safe to rerun, because it reruns the
-failed command to read its output.
+Runs `notypo --json` (which never executes the correction): each case cold
+(an empty cache directory) and warm (after one run filled it), reporting
+median and p95 wall time, completer probes, and peak RSS. Cases whose app
+is missing are skipped. For the comparison with Python thefuck, see
+compare.py.
 
     cargo build --release
     cargo bench --bench engine            # in-process stages
@@ -27,23 +26,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 BINARY = ROOT / "target" / "release" / "notypo"
 
-# (label, app that must be installed, command, safe to rerun)
+# (label, app that must be installed, command)
 CASES = [
-    ("aws operation and option", "aws", "aws ec2 describ-instances --regoin eu-west-1", False),
-    ("gcloud two groups", "gcloud", "gcloud compte instnaces list", False),
-    ("az group", "az", "az storage acount list", False),
-    ("git subcommand", "git", "git sttus", True),
-    ("kubectl (cobra)", "kubectl", "kubectl gt pods", False),
-    ("terraform (posener)", "terraform", "terraform plna", False),
-    ("ls option (man page)", "ls", "ls --colro=auto", True),
-    ("program name", "git", "gti status", True),
+    ("aws operation and option", "aws", "aws ec2 describ-instances --regoin eu-west-1"),
+    ("gcloud two groups", "gcloud", "gcloud compte instnaces list"),
+    ("az group", "az", "az storage acount list"),
+    ("git subcommand", "git", "git sttus"),
+    ("kubectl (cobra)", "kubectl", "kubectl gt pods"),
+    ("terraform (posener)", "terraform", "terraform plna"),
+    ("ls option (man page)", "ls", "ls --colro=auto"),
+    ("program name", "git", "gti status"),
 ]
 
 
-def run(command, env, engine):
+def run(command, env):
     """One process: wall seconds, peak RSS in KiB, and the parsed report."""
-    args = [str(BINARY)]
-    args += ["--json", "--force-command", command] if engine == "native" else ["-y", "--force-command", command]
+    args = [str(BINARY), "--json", "--force-command", command]
     started = time.perf_counter()
     proc = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -51,7 +49,7 @@ def run(command, env, engine):
     _, status, usage = os.wait4(proc.pid, 0)
     elapsed = time.perf_counter() - started
     rss = usage.ru_maxrss // 1024 if sys.platform == "darwin" else usage.ru_maxrss
-    report = json.loads(out) if engine == "native" and out else None
+    report = json.loads(out) if out else None
     return elapsed, rss, report
 
 
@@ -61,13 +59,12 @@ def summarize(times):
     return statistics.median(times) * 1000, p95 * 1000
 
 
-def environment(cache, engine):
+def environment(cache):
     env = dict(os.environ)
     env.update({
         "XDG_CACHE_HOME": str(cache),
         "TF_SHELL": "bash",
         "THEFUCK_NO_COLORS": "true",
-        "NOTYPO_ENGINE": engine,
         "HISTFILE": str(cache / "history"),
     })
     for key in ("TF_HISTORY", "SHELL_LOGGER_SOCKET", "NOTYPO_NO_CACHE"):
@@ -86,33 +83,29 @@ def main():
     rows = []
     with tempfile.TemporaryDirectory(prefix="notypo-bench-") as scratch:
         scratch = Path(scratch)
-        for label, app, command, rerun_safe in CASES:
+        for label, app, command in CASES:
             if shutil.which(app) is None:
                 print(f"skip {label}: {app} is not installed")
                 continue
-            cold, warm, rss, legacy = [], [], [], []
+            cold, warm, rss = [], [], []
             probes_cold = probes_warm = None
             suggestion = None
             for n in range(options.samples):
                 cache = scratch / f"cold-{label}-{n}"
                 cache.mkdir()
-                elapsed, peak, report = run(command, environment(cache, "native"), "native")
+                elapsed, peak, report = run(command, environment(cache))
                 cold.append(elapsed)
                 rss.append(peak)
                 probes_cold = report["probes"]
                 suggestion = (report["candidates"] or [{}])[0].get("command")
             cache = scratch / f"warm-{label}"
             cache.mkdir()
-            run(command, environment(cache, "native"), "native")
+            run(command, environment(cache))
             for _ in range(options.samples):
-                elapsed, peak, report = run(command, environment(cache, "native"), "native")
+                elapsed, peak, report = run(command, environment(cache))
                 warm.append(elapsed)
                 rss.append(peak)
                 probes_warm = report["probes"]
-            if rerun_safe:
-                for _ in range(options.samples):
-                    elapsed, _, _ = run(command, environment(cache, "legacy"), "legacy")
-                    legacy.append(elapsed)
             row = {
                 "case": label,
                 "command": command,
@@ -121,30 +114,27 @@ def main():
                 "warm": summarize(warm),
                 "probes": (probes_cold, probes_warm),
                 "rss_kib": max(rss),
-                "legacy": summarize(legacy) if legacy else None,
             }
             rows.append(row)
             print(json.dumps(row))
 
     lines = [
-        "# Structured engine benchmark",
+        "# Correction benchmark against installed CLIs",
         "",
         f"{options.samples} processes per mode; times in ms (median / p95). Cold runs",
         "start with an empty cache directory; warm runs reuse one. Probes are",
         "completer subprocesses (cold / warm). Peak RSS is the largest process in",
-        "the tree, which for cloud CLIs is the app's own completer. The rule",
-        "engine column reruns the command and is measured only where that is",
-        "harmless. In-process stage timings: `cargo bench --bench engine`.",
+        "the tree, which for cloud CLIs is the app's own completer. In-process",
+        "stage timings: `cargo bench --bench engine`.",
         "",
-        "| Case | Correction | Cold | Warm | Probes | Peak RSS | Rule engine |",
-        "|---|---|---|---|---|---|---|",
+        "| Case | Correction | Cold | Warm | Probes | Peak RSS |",
+        "|---|---|---|---|---|---|",
     ]
     for r in rows:
-        legacy = "{:.0f} / {:.0f}".format(*r["legacy"]) if r["legacy"] else "n/a"
         lines.append(
-            "| {} | `{}` → `{}` | {:.0f} / {:.0f} | {:.0f} / {:.0f} | {} / {} | {:.1f} MiB | {} |".format(
+            "| {} | `{}` → `{}` | {:.0f} / {:.0f} | {:.0f} / {:.0f} | {} / {} | {:.1f} MiB |".format(
                 r["case"], r["command"], r["suggestion"], *r["cold"], *r["warm"],
-                *r["probes"], r["rss_kib"] / 1024, legacy,
+                *r["probes"], r["rss_kib"] / 1024,
             )
         )
     Path(options.output).write_text("\n".join(lines) + "\n")

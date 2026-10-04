@@ -70,6 +70,8 @@ pub enum TokenRole {
     /// An option's value, such as a region or an output format.
     OptionValue,
     Path,
+    /// A missing space: `cd..` is `cd ..`, `gitstatus` is `git status`.
+    Split,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,6 +280,10 @@ const OUTPUT_NAMES_IT: f64 = 0.85;
 const PATH_MISSING: f64 = 0.6;
 /// Ranking bonus for a corrected program that accepts the rest of the line.
 const CONTEXT_FITS: f64 = 0.1;
+/// A missing space ranks just below an equally close spelling fix.
+const SPLIT_DISCOUNT: f64 = 0.97;
+/// ...and further below when nothing confirms the word it splits off.
+const UNCONFIRMED_SPLIT: f64 = 0.9;
 const COMMAND_FAILED: f64 = 0.5;
 /// Weaker suspicions can't be repaired without the user confirming.
 const STRONG_SUSPICION: f64 = 0.75;
@@ -893,6 +899,8 @@ impl<'a> Run<'a> {
             self.note(format!("no installed executable is close to `{name}`"));
         }
         let word = &script.commands[index].words[p];
+        let splits =
+            self.split_candidates(index, p, word.span, name, &vocabulary, &evidence, suspicion);
         ranked
             .into_iter()
             .map(|(to, score)| {
@@ -914,7 +922,86 @@ impl<'a> Run<'a> {
                 });
                 state
             })
+            .chain(splits)
             .collect()
+    }
+
+    /// `name` as a known program followed by the rest of the word: `cd..`
+    /// is `cd ..`, `gitstatus` is `git status`. The longest programs that
+    /// fit are tried, and the program's completer judges the rest.
+    #[allow(clippy::too_many_arguments)]
+    fn split_candidates(
+        &mut self,
+        index: usize,
+        p: usize,
+        span: Span,
+        name: &str,
+        vocabulary: &providers::Vocabulary,
+        evidence: &[(f64, Evidence)],
+        suspicion: f64,
+    ) -> Vec<State> {
+        let mut heads: Vec<usize> = name
+            .char_indices()
+            .map(|(i, _)| i)
+            .filter(|&i| i >= 2 && vocabulary.contains(&name[..i]))
+            .collect();
+        heads.reverse();
+        let mut states = Vec::new();
+        for i in heads.into_iter().take(2) {
+            let (head, tail) = name.split_at(i);
+            // `cd..`, `cd/tmp`, `cd~`, `ls-la`: punctuation after a program.
+            let wordy = !tail.starts_with(['.', '/', '~', '-']);
+            // `lsx` is likelier `ls` with a stray key than `ls x`.
+            if wordy && tail.chars().count() < 2 {
+                continue;
+            }
+            let joined = format!("{head} {tail}");
+            let uses = self.history.as_ref().map_or(0, |h| h.program_uses(head));
+            let score = ranking::score_token(name, &joined, false, uses);
+            let mut state = State::new(head, self.ctx.which(head));
+            state.weak = suspicion < STRONG_SUSPICION;
+            // An equally close spelling fix is the likelier mistake.
+            state.score = score.total * SPLIT_DISCOUNT;
+            state
+                .evidence
+                .extend(evidence.iter().map(|(_, e)| e.clone()));
+            state.evidence.push(Evidence {
+                source: Source::Executables,
+                detail: format!("`{head}` is installed and `{name}` starts with it"),
+            });
+            if !tail.starts_with('-') {
+                match self.check(&state, TokenRole::Subcommand, tail) {
+                    Check::Valid {
+                        confirmed: true, ..
+                    } => {
+                        state.score = (state.score + CONTEXT_FITS).min(1.0);
+                        state.confirmed = true;
+                        state.command_path.push(tail.to_owned());
+                        state.evidence.push(Evidence {
+                            source: Source::NativeCompletion,
+                            detail: format!("{head} completion lists `{tail}`"),
+                        });
+                    }
+                    Check::Invalid(v) if v.authoritative => state.score *= UNRESOLVED_PENALTY,
+                    // Nothing vouches for a word after the program.
+                    _ if wordy => state.score *= UNCONFIRMED_SPLIT,
+                    _ => {}
+                }
+            }
+            state.context.push(tail.to_owned());
+            state.edits.push(TokenEdit {
+                command: index,
+                word: p,
+                span,
+                role: TokenRole::Split,
+                from: name.to_owned(),
+                to: joined,
+                via: vocabulary.via.clone(),
+                score,
+            });
+            states.push(state);
+        }
+        states
     }
 
     /// Asks the app's completer about one word of the walk, or, for apps
@@ -1495,7 +1582,14 @@ impl<'a> Run<'a> {
             .iter()
             .map(|e| parser::Edit {
                 span: e.span,
-                replacement: parser::quote_word(&e.to),
+                replacement: if e.role == TokenRole::Split {
+                    e.to.split(' ')
+                        .map(parser::quote_word)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    parser::quote_word(&e.to)
+                },
             })
             .collect();
         let source = parser::apply_edits(&script.source, &edits)?;
@@ -1539,7 +1633,7 @@ fn equally_supported(a: &Candidate, b: &Candidate) -> bool {
     a.confirmed == b.confirmed
         && a.edits.len() == b.edits.len()
         && a.edits.iter().zip(&b.edits).all(|(x, y)| {
-            (x.command, x.word) == (y.command, y.word)
+            (x.command, x.word, x.role) == (y.command, y.word, y.role)
                 && x.score.distance == y.score.distance
                 && x.score.first_letter == y.score.first_letter
                 && x.score.hint == y.score.hint
@@ -1571,7 +1665,6 @@ fn check_structure(old: &Script, source: &str, edits: &[TokenEdit]) -> Result<()
     };
     for (n, (a, b)) in old.commands.iter().zip(&new.commands).enumerate() {
         if a.connector != b.connector
-            || a.words.len() != b.words.len()
             || a.assignments.len() != b.assignments.len()
             || a.redirections.len() != b.redirections.len()
         {
@@ -1591,8 +1684,13 @@ fn check_structure(old: &Script, source: &str, edits: &[TokenEdit]) -> Result<()
                 return Err("a redirection changed".into());
             }
         }
-        for (i, (x, y)) in a.words.iter().zip(&b.words).enumerate() {
-            let expected = match edits.iter().find(|e| e.command == n && e.word == i) {
+        let mut expected: Vec<String> = Vec::new();
+        for (i, x) in a.words.iter().enumerate() {
+            let word = match edits.iter().find(|e| e.command == n && e.word == i) {
+                Some(edit) if edit.role == TokenRole::Split => {
+                    expected.extend(edit.to.split(' ').map(str::to_owned));
+                    continue;
+                }
                 Some(edit) if edit.role == TokenRole::OptionName => {
                     let old_text = literal(old, x);
                     format!(
@@ -1615,9 +1713,11 @@ fn check_structure(old: &Script, source: &str, edits: &[TokenEdit]) -> Result<()
                 Some(edit) => edit.to.clone(),
                 None => literal(old, x),
             };
-            if literal(&new, y) != expected {
-                return Err(format!("word {i} would read `{}`", literal(&new, y)));
-            }
+            expected.push(word);
+        }
+        let actual: Vec<String> = b.words.iter().map(|w| literal(&new, w)).collect();
+        if actual != expected {
+            return Err(format!("the words would read `{}`", actual.join(" ")));
         }
     }
     Ok(())
@@ -2080,6 +2180,30 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
             matches!(correct(&f, &ctx).outcome, Outcome::Ambiguous(_)),
             "without context agreement, equally close names are a tie"
         );
+    }
+
+    #[test]
+    fn missing_spaces_after_programs_are_inserted() {
+        let fake = fake_aws();
+        let ctx = context(&fake)
+            .with_which("cd..", None)
+            .with_which("gitstatus", None)
+            .with_which("awsec2", None);
+        for (typo, fixed) in [
+            ("cd..", "cd .."),
+            ("gitstatus --short", "git status --short"),
+            ("awsec2 describ-instances", "aws ec2 describe-instances"),
+        ] {
+            let mut f = failure(typo);
+            f.exit_status = Some(127);
+            let report = correct(&f, &ctx);
+            assert!(
+                matches!(report.outcome, Outcome::Suggestion(_)),
+                "{typo}: {:?}",
+                report.outcome
+            );
+            assert_eq!(scripts(&report.outcome)[0], fixed);
+        }
     }
 
     #[test]

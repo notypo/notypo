@@ -82,15 +82,23 @@ fn finish(mut child: Child) -> Output {
 #[test]
 fn corrects_commands_through_the_cli() {
     let workspace = Workspace::new();
+    // As the shell function runs it: the history and the exit status.
     let output = finish(
         workspace
             .command("cd_parent")
-            .args(["-y", "--force-command", "cd.."])
+            .env("TF_HISTORY", "cd..\nfuck -y")
+            .env("NOTYPO_EXIT_STATUS", "127")
+            .arg("-y")
             .spawn()
             .unwrap(),
     );
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(String::from_utf8(output.stdout).unwrap(), "cd ..");
+    // mkdir_p needs the error output: only an allowed replay provides it.
     let output = finish(
         workspace
             .command("mkdir_p")
@@ -98,7 +106,20 @@ fn corrects_commands_through_the_cli() {
             .spawn()
             .unwrap(),
     );
-    assert!(output.status.success());
+    assert!(!output.status.success(), "without output there is no fix");
+    let output = finish(
+        workspace
+            .command("mkdir_p")
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "true")
+            .args(["-y", "--force-command", "mkdir nested/dir"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         "mkdir -p nested/dir"
@@ -131,15 +152,13 @@ fn instant_mode_uses_captured_output_without_rerunning() {
             .spawn()
             .unwrap(),
     );
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "sudo sh -c \"printf rerun > marker\""
-    );
+    // The sudo rule matches the captured output, but adding sudo needs a
+    // person's approval, and `-y` without a terminal can't give it.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("sudo sh -c"), "{stderr}");
+    assert!(stderr.contains("elevated privileges"), "{stderr}");
     assert!(!workspace.0.join("marker").exists());
 }
 
@@ -218,7 +237,7 @@ fn zsh_alias_corrects_command_from_current_multiline_history_event() {
     let git = bin.join("git");
     fs::write(
         &git,
-        "#!/bin/sh\ncase $1 in\n  sttus) printf \"git: 'sttus' is not a git command. See 'git --help'.\\n\\nThe most similar command is\\n\\tstatus\\n\"; exit 1;;\n  status) printf 'correction executed\\n';;\n  *) exit 1;;\nesac\n",
+        "#!/bin/sh\ncase $1 in\n  sttus) printf \"git: 'sttus' is not a git command. See 'git --help'.\\n\\nThe most similar command is\\n\\tstatus\\n\"; exit 1;;\n  status) printf 'correction executed\\n';;\n  --list-cmds=*) printf 'status\\n';;\n  -h) printf 'usage: git [--version]\\n'; exit 129;;\n  *) exit 1;;\nesac\n",
     )
     .unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
@@ -306,7 +325,6 @@ fn native_engine_never_replays_the_failed_command() {
         let output = finish(
             workspace
                 .command("")
-                .env("NOTYPO_ENGINE", "native")
                 .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", replay)
                 .args(["-y", "--force-command", "printf rerun > marker"])
                 .spawn()
@@ -328,7 +346,6 @@ fn native_engine_repairs_through_the_apps_completer() {
     let output = finish(
         workspace
             .command("")
-            .env("NOTYPO_ENGINE", "native")
             .env("PATH", system_path(&bin))
             .env(
                 "TF_HISTORY",
@@ -358,7 +375,6 @@ fn native_engine_needs_a_person_for_risky_corrections() {
     let output = finish(
         workspace
             .command("")
-            .env("NOTYPO_ENGINE", "native")
             .env("PATH", system_path(&bin))
             .args(["-y", "--force-command", "aws ec2 terminat-instances"])
             .spawn()
@@ -466,7 +482,6 @@ fn shell_aliases_pass_the_exit_status_to_the_native_engine() {
             workspace
                 .program(&path, "")
                 .env("TF_SHELL", shell)
-                .env("NOTYPO_ENGINE", "native")
                 .env("PATH", &bin)
                 .env("HISTFILE", workspace.0.join("history"))
                 .args(flags)
