@@ -67,6 +67,8 @@ pub enum TokenRole {
     Executable,
     Subcommand,
     OptionName,
+    /// An option's value, such as a region or an output format.
+    OptionValue,
     Path,
 }
 
@@ -340,6 +342,16 @@ enum Level {
     Arguments,
 }
 
+/// How a word missing from a vocabulary was handled.
+enum Branching {
+    /// A partial list doesn't hold anything close: no reason to doubt it.
+    NotSuspicious,
+    /// The word is wrong, but nothing listed is close.
+    Unresolved,
+    /// Interpretations with a close replacement, and whether it takes a value.
+    Branches(Vec<(State, Option<bool>)>),
+}
+
 /// What the app said about one word of the walk.
 enum Check {
     Valid {
@@ -380,8 +392,12 @@ impl<'a> Run<'a> {
             ctx,
             budget: Budget::for_timeout(settings.probe_timeout),
             notes,
-            native: enabled(Source::NativeCompletion)
-                .then(|| providers::NativeCompletion::new(&settings.trusted_completers)),
+            native: enabled(Source::NativeCompletion).then(|| {
+                providers::NativeCompletion::new(
+                    &settings.trusted_completers,
+                    settings.network_completion,
+                )
+            }),
             executables: enabled(Source::Executables).then_some(providers::Executables { ctx }),
             hints: enabled(Source::Stderr).then(|| providers::ErrorHints {
                 suggestions: diagnosis.suggestions.clone(),
@@ -945,6 +961,7 @@ impl<'a> Run<'a> {
         let src = &script.source;
         let words = &script.commands[index].words;
         let mut done = Vec::new();
+        // (interpretation, next word, level, the previous option takes a value)
         let mut frontier = vec![(start, p + 1, Level::Commands, false)];
         while let Some((mut state, mut i, mut level, mut pending_value)) = frontier.pop() {
             while i < words.len() {
@@ -954,20 +971,41 @@ impl<'a> Run<'a> {
                     break;
                 }
                 let word = &words[i];
-                if pending_value {
-                    state.context.push(word.literal().unwrap_or("x").to_owned());
-                    pending_value = false;
-                    i += 1;
-                    continue;
-                }
                 let Some(text) = word.literal() else {
                     // An expansion: its meaning is unknown, so words after it
                     // can no longer be checked as subcommands.
-                    level = Level::Arguments;
+                    if !pending_value {
+                        level = Level::Arguments;
+                    }
+                    pending_value = false;
                     state.context.push("x".into());
                     i += 1;
                     continue;
                 };
+                if pending_value {
+                    pending_value = false;
+                    if let Some(vocabulary) = self.check_value(&state, &[], text)
+                        && let Branching::Branches(mut branches) = self.branch(
+                            &state,
+                            (index, i),
+                            TokenRole::OptionValue,
+                            (text, ""),
+                            word.span,
+                            &vocabulary,
+                        )
+                    {
+                        let (first, _) = branches.remove(0);
+                        for (other, _) in branches.into_iter().rev() {
+                            frontier.push((other, i + 1, level, false));
+                        }
+                        state = first;
+                        i += 1;
+                        continue;
+                    }
+                    state.context.push(text.to_owned());
+                    i += 1;
+                    continue;
+                }
                 if text == "--" {
                     break;
                 }
@@ -987,6 +1025,34 @@ impl<'a> Run<'a> {
                 };
                 let vocabulary = match self.check(&state, role, typed) {
                     Check::Valid { takes_value } => {
+                        // `--output=jsn`: check the attached value too.
+                        if let Some(value) =
+                            text.strip_prefix(typed).and_then(|t| t.strip_prefix('='))
+                            && takes_value != Some(false)
+                            && let Some(span) = attached_value_span(word, src, typed)
+                            && let Some(vocabulary) = self.check_value(&state, &[typed], value)
+                            && let Branching::Branches(mut branches) = self.branch(
+                                &state,
+                                (index, i),
+                                TokenRole::OptionValue,
+                                (value, ""),
+                                span,
+                                &vocabulary,
+                            )
+                        {
+                            let joined = |mut s: State| {
+                                let value = s.context.pop().unwrap_or_default();
+                                s.context.push(format!("{typed}={value}"));
+                                s
+                            };
+                            let (first, _) = branches.remove(0);
+                            for (other, _) in branches.into_iter().rev() {
+                                frontier.push((joined(other), i + 1, level, false));
+                            }
+                            state = joined(first);
+                            i += 1;
+                            continue;
+                        }
                         pending_value =
                             is_option && !text.contains('=') && takes_value != Some(false);
                         if !is_option {
@@ -1021,124 +1087,180 @@ impl<'a> Run<'a> {
                     }
                     Check::Invalid(vocabulary) => vocabulary,
                 };
-
-                // `typed` is not listed here: branch on the closest valid words.
-                let history = self.history.as_ref();
-                let uses = |word: &str| {
-                    history.map_or(0, |h| h.uses(&state.program, &state.command_path, word))
-                };
-                let ranked = within_window(ranking::rank_tokens(
-                    typed,
-                    vocabulary.words.iter().map(|v| v.value.as_str()),
-                    &self.diagnosis.suggestions,
-                    &uses,
-                    BEAM,
-                ));
-                if ranked.is_empty() && !vocabulary.authoritative {
-                    // A partial list says nothing about a word far from it.
-                    pending_value = is_option && !text.contains('=');
-                    state.context.push(text.to_owned());
-                    i += 1;
-                    continue;
-                }
-                let kind = if is_option {
-                    ProblemKind::UnknownOption
-                } else {
-                    ProblemKind::UnknownCommand
-                };
-                let mut evidence = vec![(
-                    if vocabulary.authoritative {
-                        APP_REJECTS
-                    } else {
-                        APP_OMITS
-                    },
-                    Evidence {
-                        source: vocabulary.source,
-                        detail: format!(
-                            "`{typed}` is not listed after `{}` by {}{}",
-                            [state.program.as_str()]
-                                .into_iter()
-                                .chain(state.context.iter().map(String::as_str))
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                            vocabulary.via,
-                            if vocabulary.authoritative {
-                                ""
-                            } else {
-                                " (a partial list)"
-                            }
-                        ),
-                    },
-                )];
-                if self.diagnosis.mentions(kind, typed) {
-                    evidence.push((
-                        OUTPUT_NAMES_IT,
-                        Evidence {
-                            source: Source::Stderr,
-                            detail: format!("the error output names `{typed}`"),
-                        },
-                    ));
-                }
-                let suspicion = self.suspect(index, i, role, typed, evidence.clone());
-                if ranked.is_empty() {
-                    self.note(format!(
-                        "{}: `{typed}` is not valid after `{}`, and nothing valid is close",
-                        state.program,
-                        state.context.join(" ")
-                    ));
-                    state.score *= UNRESOLVED_PENALTY;
-                    break;
-                }
                 let span = match role {
                     TokenRole::OptionName => word.option_name_span(src).unwrap_or(word.span),
                     _ => word.span,
                 };
-                let mut branches: Vec<_> = ranked
-                    .into_iter()
-                    .map(|(to, score)| {
-                        let mut next = state.clone();
-                        let item = vocabulary.words.iter().find(|v| v.value == to);
-                        next.context.push(format!("{to}{}", &text[typed.len()..]));
-                        if !is_option {
-                            next.command_path.push(to.to_owned());
+                match self.branch(
+                    &state,
+                    (index, i),
+                    role,
+                    (typed, &text[typed.len()..]),
+                    span,
+                    &vocabulary,
+                ) {
+                    Branching::NotSuspicious => {
+                        // A partial list says nothing about a word far from it.
+                        pending_value = is_option && !text.contains('=');
+                        state.context.push(text.to_owned());
+                        i += 1;
+                    }
+                    Branching::Unresolved => {
+                        state.score *= UNRESOLVED_PENALTY;
+                        break;
+                    }
+                    Branching::Branches(mut branches) => {
+                        let pending = |takes_value: Option<bool>| {
+                            is_option && !text.contains('=') && takes_value != Some(false)
+                        };
+                        let (first, takes_value) = branches.remove(0);
+                        for (other, takes_value) in branches.into_iter().rev() {
+                            frontier.push((other, i + 1, level, pending(takes_value)));
                         }
-                        if score.history > 0.0 {
-                            next.evidence.push(Evidence {
-                                source: Source::History,
-                                detail: format!("you have used `{to}` here before"),
-                            });
-                        }
-                        next.score *= score.total;
-                        next.weak |= suspicion < STRONG_SUSPICION;
-                        next.evidence
-                            .extend(evidence.iter().map(|(_, e)| e.clone()));
-                        next.edits.push(TokenEdit {
-                            command: index,
-                            word: i,
-                            span,
-                            role,
-                            from: typed.to_owned(),
-                            to: to.to_owned(),
-                            via: vocabulary.via.clone(),
-                            score,
-                        });
-                        let pending = is_option
-                            && !text.contains('=')
-                            && item.is_none_or(|i| i.takes_value != Some(false));
-                        (next, pending)
-                    })
-                    .collect();
-                let (first, first_pending) = branches.remove(0);
-                for (other, pending) in branches.into_iter().rev() {
-                    frontier.push((other, i + 1, level, pending));
+                        state = first;
+                        pending_value = pending(takes_value);
+                        i += 1;
+                    }
                 }
-                state = first;
-                pending_value = first_pending;
-                i += 1;
             }
             done.push(state);
         }
         done
+    }
+
+    /// The values the app lists for the option ending the context (plus
+    /// `extra` words), when `typed` is not among them. Values that look like
+    /// paths or URIs are never judged.
+    fn check_value(
+        &mut self,
+        state: &State,
+        extra: &[&str],
+        typed: &str,
+    ) -> Option<providers::Vocabulary> {
+        if typed.is_empty() || typed.contains('/') || !self.has_native(state) {
+            return None;
+        }
+        let mut context = state.context.clone();
+        context.extend(extra.iter().map(|w| w.to_string()));
+        let native = self.native.as_mut()?;
+        let vocabulary = native.values(
+            &state.program,
+            state.path.as_ref(),
+            &context,
+            &mut self.budget,
+        )?;
+        (!vocabulary.contains(typed)).then_some(vocabulary)
+    }
+
+    /// `typed` (followed by `suffix`, such as `=value`) is not listed in
+    /// `vocabulary`: records the suspicion and returns the closest listed
+    /// words as new interpretations, with whether each takes a value.
+    fn branch(
+        &mut self,
+        state: &State,
+        (index, i): (usize, usize),
+        role: TokenRole,
+        (typed, suffix): (&str, &str),
+        span: Span,
+        vocabulary: &providers::Vocabulary,
+    ) -> Branching {
+        let history = self.history.as_ref();
+        let uses =
+            |word: &str| history.map_or(0, |h| h.uses(&state.program, &state.command_path, word));
+        let ranked = within_window(ranking::rank_tokens(
+            typed,
+            vocabulary.words.iter().map(|v| v.value.as_str()),
+            &self.diagnosis.suggestions,
+            &uses,
+            BEAM,
+        ));
+        if ranked.is_empty() && !vocabulary.authoritative {
+            return Branching::NotSuspicious;
+        }
+        let kind = if role == TokenRole::OptionName {
+            ProblemKind::UnknownOption
+        } else {
+            ProblemKind::UnknownCommand
+        };
+        let mut evidence = vec![(
+            if vocabulary.authoritative {
+                APP_REJECTS
+            } else {
+                APP_OMITS
+            },
+            Evidence {
+                source: vocabulary.source,
+                detail: format!(
+                    "`{typed}` is not listed after `{}` by {}{}",
+                    [state.program.as_str()]
+                        .into_iter()
+                        .chain(state.context.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    vocabulary.via,
+                    if vocabulary.authoritative {
+                        ""
+                    } else {
+                        " (a partial list)"
+                    }
+                ),
+            },
+        )];
+        if self.diagnosis.mentions(kind, typed) {
+            evidence.push((
+                OUTPUT_NAMES_IT,
+                Evidence {
+                    source: Source::Stderr,
+                    detail: format!("the error output names `{typed}`"),
+                },
+            ));
+        }
+        let suspicion = self.suspect(index, i, role, typed, evidence.clone());
+        if ranked.is_empty() {
+            self.note(format!(
+                "{}: `{typed}` is not valid after `{}`, and nothing valid is close",
+                state.program,
+                state.context.join(" ")
+            ));
+            return Branching::Unresolved;
+        }
+        let branches = ranked
+            .into_iter()
+            .map(|(to, score)| {
+                let mut next = state.clone();
+                let takes_value = vocabulary
+                    .words
+                    .iter()
+                    .find(|v| v.value == to)
+                    .and_then(|v| v.takes_value);
+                next.context.push(format!("{to}{suffix}"));
+                if role == TokenRole::Subcommand {
+                    next.command_path.push(to.to_owned());
+                }
+                if score.history > 0.0 {
+                    next.evidence.push(Evidence {
+                        source: Source::History,
+                        detail: format!("you have used `{to}` here before"),
+                    });
+                }
+                next.score *= score.total;
+                next.weak |= suspicion < STRONG_SUSPICION;
+                next.evidence
+                    .extend(evidence.iter().map(|(_, e)| e.clone()));
+                next.edits.push(TokenEdit {
+                    command: index,
+                    word: i,
+                    span,
+                    role,
+                    from: typed.to_owned(),
+                    to: to.to_owned(),
+                    via: vocabulary.via.clone(),
+                    score,
+                });
+                (next, takes_value)
+            })
+            .collect();
+        Branching::Branches(branches)
     }
 
     /// Replacements offered by the error output, for apps without a native
@@ -1288,6 +1410,20 @@ impl<'a> Run<'a> {
     }
 }
 
+/// The span of the value in an unquoted `--name=value` word, when the value
+/// is written plainly enough to replace in place.
+fn attached_value_span(word: &parser::Word, src: &str, name: &str) -> Option<Span> {
+    let name_span = word.option_name_span(src)?;
+    let raw = &src[name_span.end..word.span.end];
+    let value = raw.strip_prefix('=')?;
+    (name_span.of(src) == name
+        && !value.is_empty()
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"-_.:,@%+".contains(&c)))
+    .then(|| Span::new(name_span.end + 1, word.span.end))
+}
+
 /// Drops alternatives too far behind the best one to be worth probing.
 fn within_window<T>(mut ranked: Vec<(T, ScoreBreakdown)>) -> Vec<(T, ScoreBreakdown)> {
     if let Some(best) = ranked.first().map(|(_, s)| s.total) {
@@ -1342,6 +1478,17 @@ fn check_structure(old: &Script, source: &str, edits: &[TokenEdit]) -> Result<()
                         &old_text[edit.from.len().min(old_text.len())..]
                     )
                 }
+                // `--output=jsn` → `--output=json`: the value is the suffix.
+                Some(edit)
+                    if edit.role == TokenRole::OptionValue && literal(old, x) != edit.from =>
+                {
+                    let old_text = literal(old, x);
+                    format!(
+                        "{}{}",
+                        &old_text[..old_text.len().saturating_sub(edit.from.len())],
+                        edit.to
+                    )
+                }
                 Some(edit) => edit.to.clone(),
                 None => literal(old, x),
             };
@@ -1383,7 +1530,10 @@ done < "$(dirname "$0")/tree"
 
     const TREE: &str = "|ec2\n|s3\n|sts\n|--region\n|--profile\n\
 ec2|describe-instances\nec2|describe-instance-status\nec2|run-instances\nec2|terminate-instances\n\
-ec2 *-instances*|--instance-ids\nec2 *-instances*|--region\nec2 *-instances*|--dry-run\n";
+ec2 *-instances*|--instance-ids\nec2 *-instances*|--region\nec2 *-instances*|--dry-run\n\
+ec2 *-instances*|--output\n\
+ec2 *-instances* --region|eu-west-1\nec2 *-instances* --region|eu-west-2\nec2 *-instances* --region|us-east-1\n\
+ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances* --output|text\n";
 
     struct Fake {
         dir: Dir,
@@ -1453,7 +1603,7 @@ ec2 *-instances*|--instance-ids\nec2 *-instances*|--region\nec2 *-instances*|--d
             !fake.dir.0.join("bin/ran").exists(),
             "discovery must not run the app's failed operation"
         );
-        assert!(report.probes <= 3, "{} probes", report.probes);
+        assert!(report.probes <= 4, "{} probes", report.probes);
     }
 
     #[test]
@@ -1944,6 +2094,54 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
             report.outcome
         );
         assert_eq!(report.probes, 1);
+    }
+
+    #[test]
+    fn option_values_are_checked_against_the_apps_list() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let report = correct(
+            &failure("aws ec2 describe-instances --region eu-wst-1 --output=jsn"),
+            &ctx,
+        );
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "aws ec2 describe-instances --region eu-west-1 --output=json",
+            "{:?}",
+            report.notes
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Ambiguous(_)),
+            "value lists are partial: without output, ask"
+        );
+        let mut f = failure("aws ec2 describe-instances --output jsn");
+        f.output = CapturedOutput::Combined {
+            text: "aws: [ERROR]: argument --output: Found invalid choice 'jsn'".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&f, &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "aws ec2 describe-instances --output json"
+        );
+        for valid in [
+            "aws ec2 describe-instances --region us-east-1",
+            "aws ec2 describe-instances --region ap-south-9 --dry-run",
+            "aws ec2 describe-instances --instance-ids i-0abc",
+        ] {
+            assert!(
+                matches!(
+                    correct(&failure(valid), &ctx).outcome,
+                    Outcome::NoCorrection(_)
+                ),
+                "{valid}"
+            );
+        }
     }
 
     #[test]

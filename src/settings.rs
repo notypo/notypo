@@ -50,6 +50,10 @@ pub struct Settings {
     /// Lets the structured engine rerun the failed command to read its
     /// output when none was captured, if the safety gate allows the command.
     pub replay_for_diagnosis: bool,
+    /// Lets native completers look up resource names (instances, buckets,
+    /// clusters) with the user's credentials. Read-only, but it reaches the
+    /// network, so it is off by default.
+    pub network_completion: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -102,6 +106,7 @@ impl Default for Settings {
             trusted_help: Vec::new(),
             probe_timeout: 3.0,
             replay_for_diagnosis: false,
+            network_completion: false,
         }
     }
 }
@@ -140,6 +145,7 @@ const DEFAULTS_DOC: &str = "# rules = [<const: All rules enabled>]
 # trusted_help = []
 # probe_timeout = 3
 # replay_for_diagnosis = False
+# network_completion = False
 ";
 
 impl Settings {
@@ -276,6 +282,9 @@ impl Settings {
         if let Some(v) = var("NOTYPO_REPLAY_FOR_DIAGNOSIS") {
             next.replay_for_diagnosis = flag(&v);
         }
+        if let Some(v) = var("NOTYPO_NETWORK_COMPLETION") {
+            next.network_completion = flag(&v);
+        }
         *self = next;
         Ok(())
     }
@@ -395,6 +404,7 @@ impl Settings {
                 None => return false,
             },
             "replay_for_diagnosis" => self.replay_for_diagnosis = v.truthy(),
+            "network_completion" => self.network_completion = v.truthy(),
             "fixcolcmd" => match v {
                 V::None => self.fixcolcmd = None,
                 other => match other.as_str() {

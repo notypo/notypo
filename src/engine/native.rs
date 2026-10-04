@@ -82,12 +82,22 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
     fn capabilities(&self) -> Capabilities;
     /// Words valid after `words` (the arguments following the program name)
     /// that start with `prefix`. `Ok(vec![])` means the app knows of none.
+    /// Always offline.
     fn complete(
         &self,
         words: &[&str],
         prefix: &str,
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError>;
+    /// Values for the option that ends `words`. Offline unless resource
+    /// lookups were allowed (see [`Capabilities::resources`]).
+    fn complete_values(
+        &self,
+        words: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        self.complete(words, "", budget)
+    }
 }
 
 /// The protocol family of a discovered backend.
@@ -140,6 +150,8 @@ pub struct Backend {
     pub completer: PathBuf,
     /// The app's identity when the installation states it (a Go module).
     pub identity: Option<String>,
+    /// Value queries may use the network and the user's credentials.
+    pub network: bool,
     memo: ProbeMemo,
 }
 
@@ -158,6 +170,7 @@ impl Backend {
             name: name.to_owned(),
             completer,
             identity: None,
+            network: false,
             memo: ProbeMemo::default(),
         }
     }
@@ -436,6 +449,17 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
     env
 }
 
+/// The environment for resource lookups the user allowed: their own
+/// credentials and network, but never a prompt or a pager.
+fn network_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
+    let set = |k: &str, v: &str| (OsString::from(k), Some(OsString::from(v)));
+    let mut env = vec![set("AWS_PAGER", ""), set("GIT_TERMINAL_PROMPT", "0")];
+    if flavor == Flavor::Gcloud {
+        env.push(set("CLOUDSDK_CORE_DISABLE_PROMPTS", "1"));
+    }
+    env
+}
+
 /// Runs a completion helper with explicit arguments and returns its stdout.
 fn run_stdout(
     program: &Path,
@@ -514,8 +538,8 @@ impl NativeCompletionBackend for Backend {
             subcommands: true,
             options: true,
             option_arity: matches!(self.flavor, Flavor::Gcloud | Flavor::Git),
-            values: false,
-            resources: false,
+            values: self.flavor != Flavor::Git,
+            resources: self.network && self.flavor != Flavor::Git,
             // gcloud's static tree only matches `--`; argparse apps list
             // every option (short ones too) for `-`; git lists long ones.
             option_prefix: match self.flavor {
@@ -544,8 +568,38 @@ impl NativeCompletionBackend for Backend {
                 .take(budget.max_candidates)
                 .collect());
         }
+        self.query(words, prefix, budget, offline_env(self.flavor))
+    }
+
+    fn complete_values(
+        &self,
+        words: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        let env = if self.network {
+            network_env(self.flavor)
+        } else {
+            offline_env(self.flavor)
+        };
+        self.query(words, "", budget, env)
+    }
+}
+
+impl Backend {
+    fn query(
+        &self,
+        words: &[&str],
+        prefix: &str,
+        budget: &mut Budget,
+        mut env: Vec<(OsString, Option<OsString>)>,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        if self.flavor == Flavor::Git {
+            return Err(CompletionError::Unsupported(
+                "git completion does not list option values".into(),
+            ));
+        }
         if self.flavor == Flavor::Cobra {
-            return self.complete_cobra(words, prefix, budget);
+            return self.complete_cobra(words, prefix, budget, env);
         }
         let line = completion_line(&self.name, words, prefix);
         // aws_completer and gcloud's lookup slice the line as Python text;
@@ -556,7 +610,6 @@ impl NativeCompletionBackend for Backend {
             }
             Flavor::Azure | Flavor::Argcomplete | Flavor::Posener => line.len(),
         };
-        let mut env = offline_env(self.flavor);
         env.push(("COMP_LINE".into(), Some(line.into())));
         env.push(("COMP_POINT".into(), Some(point.to_string().into())));
         let capture = if matches!(self.flavor, Flavor::AwsCompleter | Flavor::Posener) {
@@ -616,17 +669,12 @@ impl Backend {
         words: &[&str],
         prefix: &str,
         budget: &mut Budget,
+        env: Vec<(OsString, Option<OsString>)>,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
         let mut args: Vec<OsString> = vec!["__complete".into()];
         args.extend(words.iter().map(OsString::from));
         args.push(prefix.into());
-        let text = run_stdout(
-            &self.completer,
-            args,
-            offline_env(Flavor::Cobra),
-            budget,
-            true,
-        )?;
+        let text = run_stdout(&self.completer, args, env, budget, true)?;
         let mut lines: Vec<&str> = text.lines().collect();
         let directive = lines
             .iter()

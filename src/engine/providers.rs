@@ -109,6 +109,8 @@ type Memo =
 /// The installed app's own completer, for its subcommands and options.
 pub struct NativeCompletion<'c> {
     pub trusted: &'c [String],
+    /// Value queries may look up resources over the network.
+    pub network: bool,
     backends: HashMap<String, Option<native::Backend>>,
     caches: HashMap<String, Option<CompletionCache>>,
     memo: Memo,
@@ -116,14 +118,65 @@ pub struct NativeCompletion<'c> {
 }
 
 impl<'c> NativeCompletion<'c> {
-    pub fn new(trusted: &'c [String]) -> Self {
+    pub fn new(trusted: &'c [String], network: bool) -> Self {
         NativeCompletion {
             trusted,
+            network,
             backends: HashMap::new(),
             caches: HashMap::new(),
             memo: HashMap::new(),
             notes: Vec::new(),
         }
+    }
+
+    /// Values the app lists for the option ending `context`. Never cached
+    /// on disk: values can be resources that depend on credentials and
+    /// account context.
+    pub fn values(
+        &mut self,
+        program: &str,
+        path: Option<&PathBuf>,
+        context: &[String],
+        budget: &mut Budget,
+    ) -> Option<Vocabulary> {
+        let backend = self.backend(program, path)?.clone();
+        if !backend.capabilities().values {
+            return None;
+        }
+        let key = (program.to_owned(), context.to_vec(), "\0values".to_owned());
+        let result = match self.memo.get(&key) {
+            Some((hit, _)) => hit.clone(),
+            None => {
+                let words: Vec<&str> = context.iter().map(String::as_str).collect();
+                let result = backend.complete_values(&words, budget);
+                self.memo.insert(key, (result.clone(), false));
+                result
+            }
+        };
+        let words: Vec<CompletionItem> = result
+            .ok()?
+            .into_iter()
+            .filter(|i| !i.is_option())
+            .collect();
+        if words.is_empty() || words.iter().any(|w| w.value.contains('/')) {
+            return None;
+        }
+        Some(Vocabulary {
+            words,
+            // Value lists can lag the service (new regions, formats).
+            authoritative: false,
+            via: format!(
+                "{} {}",
+                backend.id(),
+                if backend.network {
+                    "resource lookup"
+                } else {
+                    "completion"
+                }
+            ),
+            source: Source::NativeCompletion,
+            cached: false,
+        })
     }
 
     /// Writes new answers to the disk cache.
@@ -155,11 +208,17 @@ impl<'c> NativeCompletion<'c> {
             let found = match path {
                 None => None,
                 Some(path) => match native::discover(program, path, self.trusted) {
-                    Discovery::Found(backend) => {
+                    Discovery::Found(mut backend) => {
+                        backend.network = self.network;
                         self.note(format!(
-                            "{program}: native completion via {} ({} protocol); option values and resource names are not queried offline",
+                            "{program}: native completion via {} ({} protocol); {}",
                             backend.completer.display(),
-                            backend.id()
+                            backend.id(),
+                            if backend.network {
+                                "resource names may be looked up with your credentials"
+                            } else {
+                                "resource names are not looked up offline"
+                            }
                         ));
                         Some(backend)
                     }
