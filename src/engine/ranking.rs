@@ -2,7 +2,8 @@
 //!
 //! Scores are ranking signals in `[0, 1]`, not calibrated probabilities. A
 //! token score combines spelling similarity (transpositions count as one
-//! edit), first-letter agreement, and explicit diagnostic hints; a command's
+//! edit), first-letter agreement, explicit diagnostic hints, and how often
+//! the user typed the replacement before; a command's
 //! score is the product of its token scores, so each uncertain repair lowers
 //! it. Callers abstain unless the best candidate is strong enough and clearly
 //! ahead of the runner-up.
@@ -16,6 +17,8 @@ pub const FLOOR: f64 = 0.5;
 
 const FIRST_LETTER_BONUS: f64 = 0.05;
 const HINT_BONUS: f64 = 0.25;
+/// History: a small bonus for any use, growing up to twenty uses.
+const HISTORY_BONUS: (f64, f64) = (0.03, 0.07);
 const CASE_PENALTY: f64 = 0.02;
 
 /// How a token replacement was scored.
@@ -28,11 +31,13 @@ pub struct ScoreBreakdown {
     pub first_letter: f64,
     /// The failed command's own output suggested this replacement.
     pub hint: f64,
+    /// The user typed this replacement in the same place before.
+    pub history: f64,
     pub case: f64,
     pub total: f64,
 }
 
-pub fn score_token(typed: &str, candidate: &str, hinted: bool) -> ScoreBreakdown {
+pub fn score_token(typed: &str, candidate: &str, hinted: bool, uses: u32) -> ScoreBreakdown {
     let (a, b) = (typed.to_lowercase(), candidate.to_lowercase());
     let a_core = a.trim_start_matches('-');
     let b_core = b.trim_start_matches('-');
@@ -45,17 +50,23 @@ pub fn score_token(typed: &str, candidate: &str, hinted: bool) -> ScoreBreakdown
         0.0
     };
     let hint = if hinted { HINT_BONUS } else { 0.0 };
+    let history = if uses > 0 {
+        HISTORY_BONUS.0 + HISTORY_BONUS.1 * f64::from(uses.min(20)) / 20.0
+    } else {
+        0.0
+    };
     let case = if typed != candidate && a == b {
         -CASE_PENALTY
     } else {
         0.0
     };
-    let total = ((similarity + first_letter + hint).min(1.0) + case).max(0.0);
+    let total = ((similarity + first_letter + hint + history).min(1.0) + case).max(0.0);
     ScoreBreakdown {
         similarity,
         distance,
         first_letter,
         hint,
+        history,
         case,
         total,
     }
@@ -89,11 +100,13 @@ pub fn osa_distance(a: &str, b: &str) -> usize {
 }
 
 /// The best `limit` replacements for `typed` among `vocabulary`, highest
-/// first, ties broken by vocabulary order (the app's own ordering).
+/// first, ties broken by vocabulary order (the app's own ordering). `uses`
+/// says how often the user typed a word in this place before.
 pub fn rank_tokens<'v>(
     typed: &str,
     vocabulary: impl IntoIterator<Item = &'v str>,
     hints: &[String],
+    uses: &dyn Fn(&str) -> u32,
     limit: usize,
 ) -> Vec<(&'v str, ScoreBreakdown)> {
     let mut scored: Vec<(usize, &str, ScoreBreakdown)> = vocabulary
@@ -102,7 +115,7 @@ pub fn rank_tokens<'v>(
         .enumerate()
         .map(|(n, word)| {
             let hinted = hints.iter().any(|h| h == word);
-            (n, word, score_token(typed, word, hinted))
+            (n, word, score_token(typed, word, hinted, uses(word)))
         })
         .filter(|(_, _, score)| score.total >= FLOOR)
         .collect();
@@ -141,11 +154,16 @@ mod tests {
 
     #[test]
     fn hints_and_first_letters_raise_scores() {
-        let plain = score_token("acount", "account", false);
-        let hinted = score_token("acount", "account", true);
+        let plain = score_token("acount", "account", false, 0);
+        let hinted = score_token("acount", "account", true, 0);
         assert!(hinted.total > plain.total);
-        assert!(plain.total > score_token("acount", "discount", false).total);
-        assert!(score_token("Status", "status", false).total < 1.0);
+        assert!(score_token("acount", "account", false, 3).total > plain.total);
+        assert!(
+            score_token("acount", "account", false, 50).history
+                > score_token("acount", "account", false, 1).history
+        );
+        assert!(plain.total > score_token("acount", "discount", false, 0).total);
+        assert!(score_token("Status", "status", false, 0).total < 1.0);
     }
 
     #[test]
@@ -155,12 +173,15 @@ mod tests {
             "describe-instances",
             "run-instances",
         ];
-        let ranked = rank_tokens("describ-instances", vocabulary, &[], 3);
+        let none = |_: &str| 0;
+        let ranked = rank_tokens("describ-instances", vocabulary, &[], &none, 3);
         assert_eq!(ranked[0].0, "describe-instances");
         assert!(is_decisive(&[ranked[0].1.total, ranked[1].1.total]));
-        let ties = rank_tokens("ab", ["ac", "ad"], &[], 3);
+        let ties = rank_tokens("ab", ["ac", "ad"], &[], &none, 3);
+        let used = rank_tokens("ab", ["ac", "ad"], &[], &|w: &str| u32::from(w == "ad"), 3);
+        assert_eq!(used[0].0, "ad", "history breaks the tie");
         assert_eq!(ties[0].0, "ac");
         assert!(!is_decisive(&[ties[0].1.total, ties[1].1.total]));
-        assert!(rank_tokens("zzzz", vocabulary, &[], 3).is_empty());
+        assert!(rank_tokens("zzzz", vocabulary, &[], &none, 3).is_empty());
     }
 }

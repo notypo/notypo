@@ -42,6 +42,9 @@ pub struct Settings {
     /// Programs whose generic completion protocol may be probed; `*` trusts
     /// every program that declares one. Built-in backends need no entry.
     pub trusted_completers: Vec<String>,
+    /// Programs the engine may run with `--help` to read their options and
+    /// subcommands; `*` trusts all. Running a program is never free of risk.
+    pub trusted_help: Vec<String>,
     /// Seconds a single discovery probe (such as a native completer) may run.
     pub probe_timeout: f64,
     /// Lets the structured engine rerun the failed command to read its
@@ -96,6 +99,7 @@ impl Default for Settings {
             engine: EngineMode::Legacy,
             disabled_sources: Vec::new(),
             trusted_completers: Vec::new(),
+            trusted_help: Vec::new(),
             probe_timeout: 3.0,
             replay_for_diagnosis: false,
         }
@@ -133,6 +137,7 @@ const DEFAULTS_DOC: &str = "# rules = [<const: All rules enabled>]
 # engine = 'legacy'
 # disabled_sources = []
 # trusted_completers = []
+# trusted_help = []
 # probe_timeout = 3
 # replay_for_diagnosis = False
 ";
@@ -259,6 +264,9 @@ impl Settings {
         if let Some(v) = var("NOTYPO_TRUSTED_COMPLETERS") {
             next.trusted_completers = list(&v).into_iter().filter(|s| !s.is_empty()).collect();
         }
+        if let Some(v) = var("NOTYPO_TRUSTED_HELP") {
+            next.trusted_help = list(&v).into_iter().filter(|s| !s.is_empty()).collect();
+        }
         if let Some(v) = var("NOTYPO_PROBE_TIMEOUT") {
             next.probe_timeout = v
                 .trim()
@@ -374,12 +382,12 @@ impl Settings {
                 Some(mode) => self.engine = mode,
                 None => return false,
             },
-            "disabled_sources" | "trusted_completers" => {
+            "disabled_sources" | "trusted_completers" | "trusted_help" => {
                 let Some(list) = strings(v) else { return false };
-                if key == "disabled_sources" {
-                    self.disabled_sources = list;
-                } else {
-                    self.trusted_completers = list;
+                match key {
+                    "disabled_sources" => self.disabled_sources = list,
+                    "trusted_completers" => self.trusted_completers = list,
+                    _ => self.trusted_help = list,
                 }
             }
             "probe_timeout" => match v.as_f64() {
@@ -808,12 +816,13 @@ no_colors = True
         let mut s = Settings::default();
         assert_eq!(s.engine, EngineMode::Legacy);
         s.apply_file(
-            "engine = 'native'\ndisabled_sources = ['stderr']\ntrusted_completers = ['mytool']\nprobe_timeout = 1.5\nreplay_for_diagnosis = True\n",
+            "engine = 'native'\ndisabled_sources = ['stderr']\ntrusted_completers = ['mytool']\ntrusted_help = ['cargo']\nprobe_timeout = 1.5\nreplay_for_diagnosis = True\n",
         );
         assert_eq!(s.engine, EngineMode::Native);
         assert!(!s.is_source_enabled("stderr"));
         assert!(s.is_source_enabled("native"));
         assert_eq!(s.trusted_completers, ["mytool"]);
+        assert_eq!(s.trusted_help, ["cargo"]);
         assert_eq!(s.probe_timeout, 1.5);
         assert!(s.replay_for_diagnosis);
 

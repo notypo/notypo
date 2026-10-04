@@ -34,6 +34,7 @@ impl Workspace {
             .current_dir(&self.0)
             .env("XDG_CONFIG_HOME", &self.0)
             .env("XDG_CACHE_HOME", &self.0)
+            .env("HISTFILE", self.0.join("history"))
             .env("TF_SHELL", "bash")
             .env("TF_ALIAS", "fuck")
             .env("THEFUCK_RULES", rules)

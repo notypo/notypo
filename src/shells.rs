@@ -369,6 +369,39 @@ impl Shell {
             .collect()
     }
 
+    /// The newest `limit` entries, oldest first, reading at most the last
+    /// megabyte of the history file.
+    pub fn recent_history(self, limit: usize) -> Vec<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        const TAIL: u64 = 1024 * 1024;
+        let Some(mut file) = self
+            .history_file_name()
+            .and_then(|f| fs::File::open(f).ok())
+        else {
+            return Vec::new();
+        };
+        let len = file.metadata().map_or(0, |m| m.len());
+        let clipped = len > TAIL && file.seek(SeekFrom::Start(len - TAIL)).is_ok();
+        let mut bytes = Vec::new();
+        if file.take(TAIL).read_to_end(&mut bytes).is_err() {
+            return Vec::new();
+        }
+        let text: String = bytes.utf8_chunks().map(|chunk| chunk.valid()).collect();
+        // The first line of a clipped read is probably partial.
+        let text = if clipped {
+            text.split_once('\n').map_or("", |(_, rest)| rest)
+        } else {
+            &text
+        };
+        let mut lines: Vec<String> = text
+            .split_inclusive('\n')
+            .map(|line| utils::py_strip(&self.script_from_history(line)).to_owned())
+            .filter(|line| !line.is_empty())
+            .collect();
+        lines.drain(..lines.len().saturating_sub(limit));
+        lines
+    }
+
     /// Adds the fixed command to history where the alias can't (only fish).
     pub fn put_to_history(self, command: &str) {
         if self != Shell::Fish {

@@ -73,6 +73,8 @@ impl Budget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capture {
     Stdout,
+    /// stdout and stderr through one pipe (help text goes to either).
+    Combined,
     /// An extra inherited descriptor, such as argcomplete's fd 8. stdout and
     /// stderr are discarded.
     Descriptor(i32),
@@ -143,6 +145,11 @@ pub fn run(probe: &Probe, budget: &mut Budget) -> Result<ProbeOutput, ProbeError
     match probe.capture {
         Capture::Stdout => {
             process.stdout(writer).stderr(Stdio::null());
+        }
+        Capture::Combined => {
+            process
+                .stdout(writer.try_clone().map_err(ProbeError::Spawn)?)
+                .stderr(writer);
         }
         Capture::Descriptor(target) => {
             process.stdout(Stdio::null()).stderr(Stdio::null());

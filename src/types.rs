@@ -19,6 +19,7 @@ pub struct Context {
     pub alias: String,
     executables: OnceLock<Vec<String>>,
     history: OnceLock<Vec<String>>,
+    recent_history: OnceLock<Vec<String>>,
     which_overrides: HashMap<String, Option<PathBuf>>,
 }
 
@@ -33,6 +34,7 @@ impl Context {
             alias,
             executables: OnceLock::new(),
             history: OnceLock::new(),
+            recent_history: OnceLock::new(),
             which_overrides: HashMap::new(),
         }
     }
@@ -93,6 +95,18 @@ impl Context {
     pub fn history(&self) -> &[String] {
         self.history
             .get_or_init(|| self.shell.get_history(self.settings.history_limit))
+    }
+
+    /// A bounded tail of the history for the structured engine: at most
+    /// `history_limit` (default 5000) entries from the file's last megabyte.
+    pub fn recent_history(&self) -> &[String] {
+        if let Some(fixed) = self.history.get() {
+            return fixed;
+        }
+        self.recent_history.get_or_init(|| {
+            self.shell
+                .recent_history(self.settings.history_limit.unwrap_or(5000))
+        })
     }
 }
 

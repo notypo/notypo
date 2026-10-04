@@ -15,6 +15,7 @@
 
 pub mod cache;
 pub mod diagnosis;
+pub mod docs;
 pub mod native;
 pub mod parser;
 pub mod probe;
@@ -39,6 +40,10 @@ pub enum Source {
     NativeCompletion,
     Executables,
     Stderr,
+    History,
+    Filesystem,
+    Help,
+    ManPage,
     LegacyRule,
 }
 
@@ -48,6 +53,10 @@ impl Source {
             Source::NativeCompletion => "native",
             Source::Executables => "executables",
             Source::Stderr => "stderr",
+            Source::History => "history",
+            Source::Filesystem => "filesystem",
+            Source::Help => "help",
+            Source::ManPage => "man",
             Source::LegacyRule => "legacy",
         }
     }
@@ -58,6 +67,7 @@ pub enum TokenRole {
     Executable,
     Subcommand,
     OptionName,
+    Path,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,6 +183,9 @@ impl Outcome {
     pub fn describe(&self) -> String {
         match self {
             Outcome::Suggestion(c) => format!("suggestion: {}", c[0].script),
+            Outcome::Ambiguous(c) if c.len() == 1 => {
+                format!("needs confirmation: {} (weak evidence)", c[0].script)
+            }
             Outcome::Ambiguous(c) => format!("{} close candidates; choose one", c.len()),
             Outcome::Unsafe(c) => format!(
                 "refused: {}",
@@ -242,6 +255,8 @@ const APP_OMITS: f64 = 0.5;
 const NOT_ON_PATH: f64 = 0.6;
 const EXIT_127: f64 = 0.8;
 const OUTPUT_NAMES_IT: f64 = 0.85;
+const PATH_MISSING: f64 = 0.6;
+const COMMAND_FAILED: f64 = 0.5;
 /// Weaker suspicions can't be repaired without the user confirming.
 const STRONG_SUSPICION: f64 = 0.75;
 
@@ -270,6 +285,10 @@ struct Run<'a> {
     native: Option<providers::NativeCompletion<'a>>,
     executables: Option<providers::Executables<'a>>,
     hints: Option<providers::ErrorHints>,
+    history: Option<providers::History>,
+    man: Option<providers::ManPages>,
+    help: Option<providers::HelpText<'a>>,
+    filesystem: bool,
     suspicions: Vec<Suspicion>,
     /// Some words could not be checked (a failed probe, an exhausted budget).
     unchecked: bool,
@@ -282,6 +301,8 @@ struct State {
     path: Option<PathBuf>,
     /// The words after the program, as corrected so far.
     context: Vec<String>,
+    /// The subcommands among them.
+    command_path: Vec<String>,
     edits: Vec<TokenEdit>,
     score: f64,
     evidence: Vec<Evidence>,
@@ -294,6 +315,7 @@ impl State {
             program: program.to_owned(),
             path,
             context: Vec::new(),
+            command_path: Vec::new(),
             edits: Vec::new(),
             score: 1.0,
             evidence: Vec::new(),
@@ -338,6 +360,9 @@ impl<'a> Run<'a> {
             Source::NativeCompletion,
             Source::Executables,
             Source::Stderr,
+            Source::History,
+            Source::Filesystem,
+            Source::ManPage,
         ] {
             if !enabled(source) {
                 notes.push(format!(
@@ -361,6 +386,20 @@ impl<'a> Run<'a> {
             hints: enabled(Source::Stderr).then(|| providers::ErrorHints {
                 suggestions: diagnosis.suggestions.clone(),
             }),
+            history: enabled(Source::History).then(|| {
+                let own = [ctx.alias.as_str(), "fuck", "typo", "notypo", "thefuck"];
+                providers::History::new(ctx.recent_history(), |line| {
+                    line == failure.source
+                        || line
+                            .split_whitespace()
+                            .next()
+                            .is_some_and(|first| own.contains(&first))
+                })
+            }),
+            man: enabled(Source::ManPage).then(|| providers::ManPages::new(ctx.which("man"))),
+            help: (enabled(Source::Help) && !settings.trusted_help.is_empty())
+                .then(|| providers::HelpText::new(&settings.trusted_help)),
+            filesystem: enabled(Source::Filesystem),
             diagnosis,
             suspicions: Vec::new(),
             unchecked: false,
@@ -545,20 +584,156 @@ impl<'a> Run<'a> {
         };
         let starts = match self.resolve(name) {
             Resolution::Executable(path) => vec![State::new(name, Some(path))],
-            Resolution::ShellDefined | Resolution::ExplicitPath => return Vec::new(),
-            Resolution::Missing => self.executable_candidates(script, index, p, name),
+            Resolution::ShellDefined => {
+                return if matches!(name, "cd" | "pushd") {
+                    self.path_candidates(script, index, p, Some(p + 1))
+                } else {
+                    Vec::new()
+                };
+            }
+            Resolution::ExplicitPath => return self.path_candidates(script, index, p, Some(p)),
+            Resolution::Missing => {
+                let starts = self.executable_candidates(script, index, p, name);
+                let mut finished = Vec::new();
+                for start in starts {
+                    finished.extend(self.walk(script, index, p, start));
+                }
+                finished.retain(|s| !s.edits.is_empty());
+                return finished;
+            }
         };
         let mut finished = Vec::new();
         for start in starts {
-            let resolved_typo = !start.edits.is_empty();
-            match self.walk(script, index, p, start.clone()) {
-                Some(states) => finished.extend(states),
-                None if resolved_typo => finished.push(start),
-                None => finished.extend(self.hint_candidates(script, index, p, start)),
+            let native = self.has_native(&start);
+            let original = start.edits.is_empty();
+            finished.extend(self.walk(script, index, p, start.clone()));
+            if !native && original {
+                finished.extend(self.hint_candidates(script, index, p, start));
             }
         }
+        finished.extend(self.path_candidates(script, index, p, None));
         finished.retain(|s| !s.edits.is_empty());
         finished
+    }
+
+    fn has_native(&mut self, state: &State) -> bool {
+        self.native
+            .as_mut()
+            .is_some_and(|n| n.backend(&state.program, state.path.as_ref()).is_some())
+    }
+
+    /// Repairs words naming paths that don't exist: the target of `cd`
+    /// (`only`), an explicit program path (`only`), or, with `only` unset,
+    /// paths the output reports missing and, after a known failure, other
+    /// words containing `/`.
+    fn path_candidates(
+        &mut self,
+        script: &Script,
+        index: usize,
+        p: usize,
+        only: Option<usize>,
+    ) -> Vec<State> {
+        if !self.filesystem {
+            return Vec::new();
+        }
+        let Some(cwd) = self
+            .failure
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+        else {
+            return Vec::new();
+        };
+        let words = &script.commands[index].words;
+        let program = words[p].literal().unwrap_or_default();
+        let cd = matches!(program, "cd" | "pushd") && only == Some(p + 1);
+        if cd && std::env::var_os("CDPATH").is_some_and(|v| !v.is_empty()) {
+            self.note("cd targets are not repaired while CDPATH is set".into());
+            return Vec::new();
+        }
+        let failed = self.failure.exit_status.is_some_and(|s| s != 0)
+            || self.failure.output.diagnostic_text().is_some();
+        let targets: Vec<usize> = match only {
+            Some(i) if cd => words
+                .iter()
+                .enumerate()
+                .skip(i)
+                .find(|(_, w)| w.literal().is_some_and(|t| !t.starts_with('-')))
+                .map(|(i, _)| i)
+                .into_iter()
+                .collect(),
+            Some(i) => vec![i],
+            None => (p + 1..words.len())
+                .filter(|&i| {
+                    words[i].literal().is_some_and(|t| {
+                        !t.starts_with('-')
+                            && !t.contains("://")
+                            && (self.diagnosis.mentions(ProblemKind::MissingPath, t)
+                                || failed && t.contains('/') && !t.contains('='))
+                    })
+                })
+                .collect(),
+        };
+        let mut states = Vec::new();
+        for i in targets {
+            let Some(typed) = words[i].literal() else {
+                continue;
+            };
+            let here = cwd.join(typed);
+            let exists = if cd {
+                here.is_dir()
+            } else {
+                std::fs::symlink_metadata(&here).is_ok()
+            };
+            if exists {
+                continue;
+            }
+            let mut evidence = vec![(
+                PATH_MISSING,
+                Evidence {
+                    source: Source::Filesystem,
+                    detail: format!("`{typed}` does not exist"),
+                },
+            )];
+            if self.diagnosis.mentions(ProblemKind::MissingPath, typed) {
+                evidence.push((
+                    OUTPUT_NAMES_IT,
+                    Evidence {
+                        source: Source::Stderr,
+                        detail: format!("the output says `{typed}` is missing"),
+                    },
+                ));
+            } else if self.failure.exit_status.is_some_and(|s| s != 0) {
+                evidence.push((
+                    COMMAND_FAILED,
+                    Evidence {
+                        source: Source::Filesystem,
+                        detail: "the command failed".into(),
+                    },
+                ));
+            }
+            let suspicion = self.suspect(index, i, TokenRole::Path, typed, evidence.clone());
+            for (to, score) in providers::repair_path(typed, &cwd, cd) {
+                let mut state = State::new(program, None);
+                state.weak = suspicion < STRONG_SUSPICION;
+                state.score = score.total;
+                state
+                    .evidence
+                    .extend(evidence.iter().map(|(_, e)| e.clone()));
+                state.edits.push(TokenEdit {
+                    command: index,
+                    word: i,
+                    span: words[i].span,
+                    role: TokenRole::Path,
+                    from: typed.to_owned(),
+                    to,
+                    via: "filesystem".into(),
+                    score,
+                });
+                states.push(state);
+            }
+        }
+        states
     }
 
     fn executable_candidates(
@@ -602,6 +777,7 @@ impl<'a> Run<'a> {
             program: "",
             path: None,
             context: &[],
+            command_path: &[],
             typed: name,
             fresh: false,
         };
@@ -609,10 +785,13 @@ impl<'a> Run<'a> {
         else {
             return Vec::new();
         };
+        let history = self.history.as_ref();
+        let uses = |word: &str| history.map_or(0, |h| h.program_uses(word));
         let ranked = within_window(ranking::rank_tokens(
             name,
             vocabulary.words.iter().map(|w| w.value.as_str()),
             &self.diagnosis.suggestions,
+            &uses,
             BEAM,
         ));
         if ranked.is_empty() {
@@ -643,8 +822,12 @@ impl<'a> Run<'a> {
             .collect()
     }
 
-    /// Asks the app's completer about one word of the walk.
+    /// Asks the app's completer about one word of the walk, or, for apps
+    /// without one, what documentation and history know.
     fn check(&mut self, state: &State, role: TokenRole, typed: &str) -> Check {
+        if !self.has_native(state) {
+            return self.fallback_check(state, role, typed);
+        }
         let Some(native) = self.native.as_mut() else {
             return Check::Unknown;
         };
@@ -653,6 +836,7 @@ impl<'a> Run<'a> {
             program: &state.program,
             path: state.path.as_ref(),
             context: &state.context,
+            command_path: &state.command_path,
             typed,
             fresh: false,
         };
@@ -686,18 +870,78 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Checks the words after the program against the app's completer, from
-    /// the first level down, branching on close alternatives. `None` when
-    /// the program has no native backend (or native completion is off).
-    fn walk(
-        &mut self,
-        script: &Script,
-        index: usize,
-        p: usize,
-        start: State,
-    ) -> Option<Vec<State>> {
-        let native = self.native.as_mut()?;
-        native.backend(&start.program, start.path.as_ref())?;
+    /// `--help` output, man pages, and history for an app without a native
+    /// completer: only its first level and options, and never authoritative.
+    fn fallback_check(&mut self, state: &State, role: TokenRole, typed: &str) -> Check {
+        if role == TokenRole::Subcommand && !state.command_path.is_empty() {
+            return Check::Arguments;
+        }
+        let slot = providers::Slot {
+            role,
+            program: &state.program,
+            path: state.path.as_ref(),
+            context: &state.context,
+            command_path: &state.command_path,
+            typed,
+            fresh: false,
+        };
+        let answers = [
+            self.help
+                .as_mut()
+                .map(|p| p.vocabulary(&slot, &mut self.budget)),
+            self.man
+                .as_mut()
+                .map(|p| p.vocabulary(&slot, &mut self.budget)),
+            self.history
+                .as_mut()
+                .map(|p| p.vocabulary(&slot, &mut self.budget)),
+        ];
+        let mut merged = providers::Vocabulary {
+            words: Vec::new(),
+            authoritative: false,
+            via: String::new(),
+            source: Source::ManPage,
+            cached: false,
+        };
+        let mut vias = Vec::new();
+        for answer in answers.into_iter().flatten() {
+            let providers::Answer::Words(vocabulary) = answer else {
+                continue;
+            };
+            if vias.is_empty() {
+                merged.source = vocabulary.source;
+            }
+            vias.push(vocabulary.via);
+            for word in vocabulary.words {
+                match merged.words.iter_mut().find(|w| w.value == word.value) {
+                    Some(known) if known.takes_value.is_none() => {
+                        known.takes_value = word.takes_value
+                    }
+                    Some(_) => {}
+                    None => merged.words.push(word),
+                }
+            }
+        }
+        merged.via = vias.join(" and ");
+        if merged.words.is_empty() {
+            return if role == TokenRole::Subcommand {
+                Check::Arguments
+            } else {
+                Check::Unknown
+            };
+        }
+        match merged.words.iter().find(|w| w.value == typed) {
+            Some(word) => Check::Valid {
+                takes_value: word.takes_value,
+            },
+            None => Check::Invalid(merged),
+        }
+    }
+
+    /// Checks the words after the program against the app's completer (or,
+    /// without one, documentation and history), from the first level down,
+    /// branching on close alternatives.
+    fn walk(&mut self, script: &Script, index: usize, p: usize, start: State) -> Vec<State> {
         let src = &script.source;
         let words = &script.commands[index].words;
         let mut done = Vec::new();
@@ -745,6 +989,9 @@ impl<'a> Run<'a> {
                     Check::Valid { takes_value } => {
                         pending_value =
                             is_option && !text.contains('=') && takes_value != Some(false);
+                        if !is_option {
+                            state.command_path.push(text.to_owned());
+                        }
                         state.context.push(text.to_owned());
                         i += 1;
                         continue;
@@ -776,10 +1023,15 @@ impl<'a> Run<'a> {
                 };
 
                 // `typed` is not listed here: branch on the closest valid words.
+                let history = self.history.as_ref();
+                let uses = |word: &str| {
+                    history.map_or(0, |h| h.uses(&state.program, &state.command_path, word))
+                };
                 let ranked = within_window(ranking::rank_tokens(
                     typed,
                     vocabulary.words.iter().map(|v| v.value.as_str()),
                     &self.diagnosis.suggestions,
+                    &uses,
                     BEAM,
                 ));
                 if ranked.is_empty() && !vocabulary.authoritative {
@@ -801,16 +1053,19 @@ impl<'a> Run<'a> {
                         APP_OMITS
                     },
                     Evidence {
-                        source: Source::NativeCompletion,
+                        source: vocabulary.source,
                         detail: format!(
-                            "{} does not list `{typed}` after `{} {}`{}",
+                            "`{typed}` is not listed after `{}` by {}{}",
+                            [state.program.as_str()]
+                                .into_iter()
+                                .chain(state.context.iter().map(String::as_str))
+                                .collect::<Vec<_>>()
+                                .join(" "),
                             vocabulary.via,
-                            state.program,
-                            state.context.join(" "),
                             if vocabulary.authoritative {
                                 ""
                             } else {
-                                " (the list is known to be partial)"
+                                " (a partial list)"
                             }
                         ),
                     },
@@ -844,6 +1099,15 @@ impl<'a> Run<'a> {
                         let mut next = state.clone();
                         let item = vocabulary.words.iter().find(|v| v.value == to);
                         next.context.push(format!("{to}{}", &text[typed.len()..]));
+                        if !is_option {
+                            next.command_path.push(to.to_owned());
+                        }
+                        if score.history > 0.0 {
+                            next.evidence.push(Evidence {
+                                source: Source::History,
+                                detail: format!("you have used `{to}` here before"),
+                            });
+                        }
                         next.score *= score.total;
                         next.weak |= suspicion < STRONG_SUSPICION;
                         next.evidence
@@ -874,7 +1138,7 @@ impl<'a> Run<'a> {
             }
             done.push(state);
         }
-        Some(done)
+        done
     }
 
     /// Replacements offered by the error output, for apps without a native
@@ -940,6 +1204,7 @@ impl<'a> Run<'a> {
                 program: &start.program,
                 path: start.path.as_ref(),
                 context: &[],
+                command_path: &[],
                 typed: &problem.token,
                 fresh: false,
             };
@@ -954,6 +1219,7 @@ impl<'a> Run<'a> {
                 &problem.token,
                 vocabulary.words.iter().map(|w| w.value.as_str()),
                 &self.diagnosis.suggestions,
+                &|_: &str| 0,
                 BEAM,
             );
             for (n, &i) in positions.iter().enumerate() {
@@ -1141,6 +1407,8 @@ ec2 *-instances*|--instance-ids\nec2 *-instances*|--region\nec2 *-instances*|--d
             .with_which("ls", Some("/bin/ls"))
             .with_which("gti", None)
             .with_which("jq", Some("/usr/bin/jq"))
+            .with_which("man", None)
+            .with_history::<&str>(&[])
     }
 
     fn failure(source: &str) -> FailureContext {
@@ -1268,6 +1536,166 @@ ec2 *-instances*|--instance-ids\nec2 *-instances*|--region\nec2 *-instances*|--d
             );
         }
         assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn man_pages_supply_options_for_apps_without_completion() {
+        let fake = fake_aws();
+        let man = fake.dir.script(
+            "bin/man",
+            "#!/bin/sh\n[ \"$1\" = ls ] || exit 1\nprintf 'LS(1)\\n     -\\b-a\\ba      all\\n     -\\b--\\b-c\\bco\\bol\\blo\\bor\\br[=when]   colorize\\n'\n",
+        );
+        let ctx = context(&fake).with_which("man", Some(man.to_str().unwrap()));
+        let mut f = failure("ls --colro=auto -a");
+        f.exit_status = Some(2);
+        let report = correct(&f, &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::Ambiguous(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(scripts(&report.outcome)[0], "ls --color=auto -a");
+        assert!(
+            report.outcome.candidates()[0]
+                .evidence
+                .iter()
+                .any(|e| e.source == Source::ManPage)
+        );
+        f.output = CapturedOutput::Combined {
+            text: "ls: unrecognized option '--colro=auto'".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        assert!(matches!(correct(&f, &ctx).outcome, Outcome::Suggestion(_)));
+        assert!(
+            matches!(
+                correct(&failure("ls --all-of-it"), &ctx).outcome,
+                Outcome::NoCorrection(_)
+            ),
+            "an unlisted option far from every documented one is left alone"
+        );
+    }
+
+    #[test]
+    fn history_ranks_and_supplies_first_level_words() {
+        let fake = fake_aws();
+        let cargo = fake.dir.script("bin/cargo", "#!/bin/sh\n");
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("cargo", Some(cargo.to_str().unwrap()))
+            .with_which("go", Some(cargo.to_str().unwrap()))
+            .with_which("gt", None)
+            .with_which("man", None)
+            .with_executables(&["git", "gzip", "go", "cargo"])
+            .with_history(&[
+                "cargo test",
+                "cargo build --release",
+                "go build",
+                "go test",
+                "go vet",
+                "fuck",
+            ]);
+        let mut f = failure("cargo tset");
+        f.exit_status = Some(101);
+        let report = correct(&f, &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "cargo test",
+            "{:?}",
+            report.notes
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Ambiguous(_)),
+            "history alone is weak"
+        );
+        let report = correct(&failure("cargo build --relase"), &ctx);
+        assert_eq!(scripts(&report.outcome)[0], "cargo build --release");
+        assert!(matches!(
+            correct(&failure("cargo add serde"), &ctx).outcome,
+            Outcome::NoCorrection(_)
+        ));
+        // `gt` is as close to git as to go; history prefers what was used.
+        let mut f = failure("gt vet");
+        f.exit_status = Some(127);
+        let report = correct(&f, &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "go vet",
+            "{:?}",
+            report.outcome
+        );
+    }
+
+    #[test]
+    fn missing_paths_are_repaired_from_the_filesystem() {
+        let fake = fake_aws();
+        let root = fake.dir.0.join("work");
+        fs::create_dir_all(root.join("src/engine")).unwrap();
+        fs::write(root.join("src/engine/parser.rs"), "").unwrap();
+        fs::write(root.join("notes.txt"), "").unwrap();
+        fake.dir.script("work/script.sh", "#!/bin/sh\n");
+        let ctx = context(&fake).with_which("cat", Some("/bin/cat"));
+        let case = |source: &str, status: Option<i32>, output: Option<&str>| {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = status;
+            if let Some(text) = output {
+                f.output = CapturedOutput::Combined {
+                    text: text.into(),
+                    origin: OutputOrigin::ShellLogger,
+                };
+            }
+            correct(&f, &ctx).outcome
+        };
+        let outcome = case("cd sr/engin", Some(1), None);
+        assert!(matches!(outcome, Outcome::Suggestion(_)), "{outcome:?}");
+        assert_eq!(scripts(&outcome)[0], "cd src/engine");
+        let outcome = case(
+            "cat notse.txt",
+            Some(1),
+            Some("cat: notse.txt: No such file or directory"),
+        );
+        assert_eq!(scripts(&outcome)[0], "cat notes.txt");
+        let outcome = case("cat src/engine/parsr.rs", Some(1), None);
+        assert_eq!(scripts(&outcome)[0], "cat src/engine/parser.rs");
+        let outcome = case("./scirpt.sh --x", Some(127), None);
+        assert_eq!(scripts(&outcome)[0], "./script.sh --x");
+        assert!(
+            matches!(
+                case("cat src/engine/parsr.rs", None, None),
+                Outcome::NoCorrection(_)
+            ),
+            "an argument path is only questioned after a known failure"
+        );
+        assert!(matches!(
+            case("cd src", Some(1), None),
+            Outcome::NoCorrection(_)
+        ));
+    }
+
+    #[test]
+    fn trusted_help_output_supplies_subcommands() {
+        let fake = fake_aws();
+        let tool = fake.dir.script(
+            "bin/tool",
+            "#!/bin/sh\n[ \"$1\" = --help ] || { touch \"$(dirname \"$0\")/ran\"; exit 1; }\nprintf 'Usage: tool <command>\\n\\nCommands:\\n  build    Build it\\n  deploy   Ship it\\n\\nOptions:\\n  -v, --verbose  Talk\\n' >&2\n",
+        );
+        let settings = Settings {
+            trusted_help: vec!["tool".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("tool", Some(tool.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let report = correct(&failure("tool biuld --verbos"), &ctx);
+        assert_eq!(scripts(&report.outcome)[0], "tool build --verbose");
+        assert!(!fake.dir.0.join("bin/ran").exists(), "only --help ran");
+        let untrusted = context(&fake).with_which("tool", Some(tool.to_str().unwrap()));
+        assert!(
+            correct(&failure("tool biuld"), &untrusted)
+                .outcome
+                .candidates()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1456,7 +1884,8 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
         for app in ["gcloud", "az"] {
             let (dir, path) = fake_argcomplete(app);
             let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
-                .with_which(app, Some(path.to_str().unwrap()));
+                .with_which(app, Some(path.to_str().unwrap()))
+                .with_history::<&str>(&[]);
             let report = correct(
                 &failure(&format!("{app} storage acount list --resorce-group=rg")),
                 &ctx,
@@ -1553,7 +1982,8 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
             ..Settings::default()
         };
         let ctx = Context::new(settings, Shell::Bash, "fuck".into())
-            .with_which("aws", Some(fake.aws.to_str().unwrap()));
+            .with_which("aws", Some(fake.aws.to_str().unwrap()))
+            .with_history::<&str>(&[]);
         let report = correct(&failure("aws ec2 describ-instances"), &ctx);
         assert!(report.outcome.candidates().is_empty());
         assert!(
