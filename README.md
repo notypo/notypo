@@ -45,7 +45,7 @@ notypo --explain 'aws ec2 describ-instances --regoin eu-west-1'
 
 Where the corrections come from:
 
-- **The app itself.** notypo asks the installed app's own completer what is valid at each level and only proposes words it lists, so new commands and installed extensions work without a notypo update. Built-in bridges cover `aws` (`aws_completer`), `gcloud` and `az` (argcomplete), and `git` (`--list-cmds` and `--git-completion-helper`, run in an empty repository). Go apps are recognized from the module information in their binaries: kubectl, helm, gh, Hetzner's hcloud, kind, and docker speak cobra; terraform, tofu, and packer speak posener/complete. Other argcomplete, cobra, or posener apps are probed only when listed in `trusted_completers`.
+- **The app itself.** notypo asks the installed app's own completer what is valid at each level and only proposes words it lists, so new commands and installed extensions work without a notypo update. Built-in bridges cover `aws` (`aws_completer`), `gcloud` and `az` (argcomplete), and `git` (`--list-cmds` and `--git-completion-helper`, run in an empty repository). Go apps are recognized from the module information in their binaries: kubectl, helm, gh, Hetzner's hcloud, kind, and docker speak cobra; terraform, tofu, and packer speak posener/complete. Other argcomplete, cobra, or posener apps, and apps that only ship a bash completion script (such as brew or deno), are probed only when listed in `trusted_completers`.
 - **Option values** such as regions or output formats are checked against the app's offline value lists. Resource names (instances, buckets) are looked up only with `network_completion`, using your credentials, read-only.
 - **Without a completer**, the first level and options are checked against the man page (formatted by the system `man`; the program never runs), `--help` output for programs in `trusted_help`, and your shell history. These lists can be incomplete, so a close match is offered for confirmation rather than run.
 - **Programs and paths:** misspelled programs are matched against `$PATH`, aliases, and builtins. A program whose own completer accepts the rest of the line ranks first. Missing paths, including `cd` targets, are repaired from the filesystem. Commands run through `npx`, `uvx`, `pipx run`, `bundle exec`, and similar are repaired as the installed program they run; nothing is downloaded.
@@ -68,7 +68,7 @@ Engine settings (`settings.py` name, then environment variable):
 |---|---|---|
 | `engine` / `NOTYPO_ENGINE` | `legacy` | `native` enables the structured engine |
 | `disabled_sources` / `NOTYPO_DISABLED_SOURCES` | `[]` | any of `native`, `executables`, `stderr`, `history`, `filesystem`, `man`, `help`, `legacy` |
-| `trusted_completers` / `NOTYPO_TRUSTED_COMPLETERS` | `[]` | extra argcomplete/cobra/posener apps to probe; `*` for all |
+| `trusted_completers` / `NOTYPO_TRUSTED_COMPLETERS` | `[]` | extra argcomplete/cobra/posener apps and bash completion scripts to use; `*` for all |
 | `trusted_help` / `NOTYPO_TRUSTED_HELP` | `[]` | programs that may be run with `--help`; `*` for all |
 | `network_completion` / `NOTYPO_NETWORK_COMPLETION` | `False` | let completers look up resource names with your credentials |
 | `probe_timeout` / `NOTYPO_PROBE_TIMEOUT` | `3` | seconds per probe (three times that in total) |
@@ -78,7 +78,7 @@ Accuracy and speed: on a corpus of 715 typos in real aws, gcloud, az, git, kubec
 
 Compared with the rule engine, the structured engine never reruns the failed command, so rules that need output only work when the shell logger or instant mode captured it. `-y` no longer runs risky or uncertain corrections. Rule suggestions with side effects (`dirty_untar`, `dirty_unzip`, `ssh_known_hosts`) always ask first. To check the installed CLIs on your machine: `cargo test --test installed_clis -- --ignored --nocapture`.
 
-Not yet supported: fish, PowerShell, and tcsh command lines; shell completion functions (bash/zsh/fish/PowerShell) as a source; other completion protocols (click, oclif, yargs).
+Not yet supported: fish, PowerShell, and tcsh command lines; zsh, fish, and PowerShell completion functions as a source; other completion protocols (click, oclif, yargs).
 
 ## Performance
 

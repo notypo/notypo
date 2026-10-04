@@ -314,6 +314,8 @@ struct Run<'a> {
     suspicions: Vec<Suspicion>,
     /// Some words could not be checked (a failed probe, an exhausted budget).
     unchecked: bool,
+    /// Words some source confirmed or rejected.
+    checked: usize,
 }
 
 /// One interpretation of a command being repaired.
@@ -444,6 +446,7 @@ impl<'a> Run<'a> {
             diagnosis,
             suspicions: Vec::new(),
             unchecked: false,
+            checked: 0,
         }
     }
 
@@ -551,6 +554,8 @@ impl<'a> Run<'a> {
                     "the output points to {}, which a spelling change can't fix",
                     failure.describe()
                 ))
+            } else if self.checked == 0 {
+                Outcome::NoCorrection("no source could check these words".into())
             } else {
                 Outcome::NoCorrection("every checked token is valid".into())
             };
@@ -915,9 +920,18 @@ impl<'a> Run<'a> {
     /// Asks the app's completer about one word of the walk, or, for apps
     /// without one, what documentation and history know.
     fn check(&mut self, state: &State, role: TokenRole, typed: &str) -> Check {
-        if !self.has_native(state) {
-            return self.fallback_check(state, role, typed);
+        let check = if self.has_native(state) {
+            self.native_check(state, role, typed)
+        } else {
+            self.fallback_check(state, role, typed)
+        };
+        if matches!(check, Check::Valid { .. } | Check::Invalid(_)) {
+            self.checked += 1;
         }
+        check
+    }
+
+    fn native_check(&mut self, state: &State, role: TokenRole, typed: &str) -> Check {
         let Some(native) = self.native.as_mut() else {
             return Check::Unknown;
         };
@@ -2226,6 +2240,58 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
                 !dir.0.join("sdk/bin/ran").exists(),
                 "{app} ran an operation"
             );
+        }
+    }
+
+    #[test]
+    fn every_protocol_follows_commands_added_by_an_upgrade() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("upgrades");
+        // Each fake answers from `words` next to it, in its own protocol.
+        let cobra = dir.script(
+            "cobra/app",
+            "#!/bin/sh\n[ \"$1\" = __complete ] || exit 1\ncat \"$(dirname \"$0\")/words\"\necho :4\n",
+        );
+        let posener = dir.script(
+            "posener/app",
+            "#!/bin/sh\n[ -n \"$COMP_LINE\" ] || exit 1\ncat \"$(dirname \"$0\")/words\"\n",
+        );
+        let git = dir.script(
+            "git/app",
+            "#!/bin/sh\ncase \"$*\" in\n  --list-cmds=main*) cat \"$(dirname \"$0\")/words\";;\n  --list-cmds=builtins) ;;\n  -h) printf 'usage: git [--version]\\n'; exit 129;;\n  *) exit 1;;\nesac\n",
+        );
+        for (flavor, path) in [
+            (Flavor::Cobra, cobra),
+            (Flavor::Posener, posener),
+            (Flavor::Git, git),
+        ] {
+            let words = path.parent().unwrap().join("words");
+            fs::write(&words, "build\ndeploy\n").unwrap();
+            let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+                .with_which("app", Some(path.to_str().unwrap()))
+                .with_which("man", None)
+                .with_history::<&str>(&[]);
+            let run = |source: &str| {
+                let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                    std::rc::Rc::new(Backend::new(flavor, "app", path.clone()));
+                correct_with_backends(&failure(source), &ctx, vec![("app".into(), backend)])
+            };
+            assert!(
+                !matches!(run("app releese").outcome, Outcome::Suggestion(_)),
+                "{flavor:?}: nothing close yet"
+            );
+            fs::write(&words, "build\ndeploy\nrelease\n").unwrap();
+            let report = run("app releese");
+            assert_eq!(
+                scripts(&report.outcome),
+                ["app release"],
+                "{flavor:?}: {:?}",
+                report.notes
+            );
+            assert!(matches!(
+                run("app release").outcome,
+                Outcome::NoCorrection(_)
+            ));
         }
     }
 

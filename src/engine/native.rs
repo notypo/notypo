@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::{env, fs};
 
+mod bash;
 mod git;
 mod go;
 
@@ -126,6 +127,8 @@ pub enum Flavor {
     /// Go apps built with posener/complete (HashiCorp tools): `COMP_LINE`
     /// in, one word per line out.
     Posener,
+    /// A function registered by the app's bash completion script (opt-in).
+    BashFunction,
 }
 
 /// Go apps whose completion was audited: the probe only lists words, and
@@ -160,6 +163,8 @@ pub struct Backend {
     pub identity: Option<String>,
     /// Value queries may use the network and the user's credentials.
     pub network: bool,
+    /// A file the protocol needs besides the completer (a completion script).
+    pub helper: Option<PathBuf>,
     memo: ProbeMemo,
 }
 
@@ -179,8 +184,14 @@ impl Backend {
             completer,
             identity: None,
             network: false,
+            helper: None,
             memo: ProbeMemo::default(),
         }
+    }
+
+    pub fn with_helper(mut self, helper: PathBuf) -> Backend {
+        self.helper = Some(helper);
+        self
     }
 
     /// What identifies this installation's answers in the disk cache:
@@ -194,6 +205,15 @@ impl Backend {
         let real = fs::canonicalize(&self.completer).ok();
         let mut files = vec![self.completer.clone()];
         files.extend(real.clone());
+        if let Some(helper) = &self.helper {
+            // Completion functions may read local files: cache per directory.
+            files.push(helper.clone());
+            let cwd = env::current_dir().unwrap_or_default();
+            return Some(super::cache::fingerprint(
+                &files,
+                &[self.id(), &self.name, &cwd.to_string_lossy()],
+            ));
+        }
         match self.flavor {
             Flavor::Gcloud => {
                 if let Some(root) = real
@@ -243,6 +263,33 @@ pub enum Discovery {
 /// Built-in bridges identify the app from its installation; other apps that
 /// declare argcomplete support are probed only when `trusted` lists them.
 pub fn discover(name: &str, path: &Path, trusted: &[String]) -> Discovery {
+    match discover_protocol(name, path, trusted) {
+        Discovery::None => bash_function(name, trusted),
+        found => found,
+    }
+}
+
+/// A trusted program's bash completion function, when it has nothing else.
+fn bash_function(name: &str, trusted: &[String]) -> Discovery {
+    let name = app_name(name);
+    let Some(script) = bash::script_for(name) else {
+        return Discovery::None;
+    };
+    if !trusted.iter().any(|t| t == "*" || t == name) {
+        return Discovery::NotTrusted(format!(
+            "{name} has a bash completion script ({}); add it to trusted_completers to use it",
+            script.display()
+        ));
+    }
+    match crate::utils::which("bash").filter(|b| probe::is_trusted_location(b)) {
+        Some(bash) => {
+            Discovery::Found(Backend::new(Flavor::BashFunction, name, bash).with_helper(script))
+        }
+        None => Discovery::Unavailable("bash is not installed".into()),
+    }
+}
+
+fn discover_protocol(name: &str, path: &Path, trusted: &[String]) -> Discovery {
     if !probe::is_trusted_location(path) {
         return Discovery::NotTrusted(format!(
             "{} was not resolved to an absolute path",
@@ -286,13 +333,22 @@ fn go_app(name: &str, path: &Path, trusted: &[String]) -> Discovery {
             backend.identity = Some(module.path);
             Discovery::Found(backend)
         }
-        Err(discovery) => discovery,
+        Err(GoRefusal::NoProtocol) => Discovery::None,
+        Err(GoRefusal::NotTrusted(why)) => Discovery::NotTrusted(why),
     }
 }
 
 /// The protocol a Go app speaks, if notypo may use it: audited apps by
 /// module path, others only when `trusted` names them.
-fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Flavor, Discovery> {
+/// Why a Go app's completion can't be used.
+#[derive(Debug, PartialEq, Eq)]
+enum GoRefusal {
+    /// It doesn't use a completion library notypo speaks.
+    NoProtocol,
+    NotTrusted(String),
+}
+
+fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Flavor, GoRefusal> {
     let audited = AUDITED_GO_APPS
         .iter()
         .find(|(app, _)| *app == module.path)
@@ -304,10 +360,10 @@ fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Fl
     } else if let Some(flavor) = audited {
         flavor
     } else {
-        return Err(Discovery::None);
+        return Err(GoRefusal::NoProtocol);
     };
     if audited.is_none() && !trusted.iter().any(|t| t == "*" || t == name) {
-        return Err(Discovery::NotTrusted(format!(
+        return Err(GoRefusal::NotTrusted(format!(
             "{name} ({}) supports {} completion; add it to trusted_completers to use it",
             module.path,
             if flavor == Flavor::Cobra {
@@ -452,7 +508,7 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
             set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
             set("GH_PROMPT_DISABLED", "1"),
         ]),
-        Flavor::Argcomplete | Flavor::Git | Flavor::Posener => {}
+        Flavor::Argcomplete | Flavor::Git | Flavor::Posener | Flavor::BashFunction => {}
     }
     env
 }
@@ -538,6 +594,7 @@ impl NativeCompletionBackend for Backend {
             Flavor::Git => "git",
             Flavor::Cobra => "cobra",
             Flavor::Posener => "posener",
+            Flavor::BashFunction => "bash",
         }
     }
 
@@ -564,9 +621,14 @@ impl NativeCompletionBackend for Backend {
             },
             short_options: matches!(
                 self.flavor,
-                Flavor::Azure | Flavor::Argcomplete | Flavor::Cobra | Flavor::Posener
+                Flavor::Azure
+                    | Flavor::Argcomplete
+                    | Flavor::Cobra
+                    | Flavor::Posener
+                    | Flavor::BashFunction
             ),
-            complete_options: self.flavor != Flavor::Git,
+            // git's helper and hand-written completion scripts omit options.
+            complete_options: !matches!(self.flavor, Flavor::Git | Flavor::BashFunction),
         }
     }
 
@@ -617,13 +679,30 @@ impl Backend {
         if self.flavor == Flavor::Cobra {
             return self.complete_cobra(words, prefix, budget, env);
         }
+        if self.flavor == Flavor::BashFunction {
+            let script = self
+                .helper
+                .as_deref()
+                .ok_or_else(|| CompletionError::Unsupported("no completion script".into()))?;
+            return bash::complete(
+                &self.completer,
+                script,
+                &self.name,
+                words,
+                prefix,
+                env,
+                budget,
+            );
+        }
         let line = completion_line(&self.name, words, prefix);
         // aws_completer and gcloud's lookup slice the line as Python text;
         // argcomplete expects the byte offset bash supplies.
         let point = match self.flavor {
-            Flavor::AwsCompleter | Flavor::Gcloud | Flavor::Git | Flavor::Cobra => {
-                line.chars().count()
-            }
+            Flavor::AwsCompleter
+            | Flavor::Gcloud
+            | Flavor::Git
+            | Flavor::Cobra
+            | Flavor::BashFunction => line.chars().count(),
             Flavor::Azure | Flavor::Argcomplete | Flavor::Posener => line.len(),
         };
         env.push(("COMP_LINE".into(), Some(line.into())));
@@ -973,7 +1052,7 @@ esac
         let other = module("example.com/huawei/hcloud", &[cobra]);
         assert!(matches!(
             go_flavor(&other, "hcloud", &[]),
-            Err(Discovery::NotTrusted(_))
+            Err(GoRefusal::NotTrusted(_))
         ));
         assert_eq!(
             go_flavor(&other, "hcloud", &["hcloud".into()]),
@@ -981,7 +1060,7 @@ esac
         );
         assert!(matches!(
             go_flavor(&module("example.com/tool", &[]), "tool", &["*".into()]),
-            Err(Discovery::None)
+            Err(GoRefusal::NoProtocol)
         ));
     }
 

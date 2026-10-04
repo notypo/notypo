@@ -3,7 +3,9 @@ NOTYPO: STRUCTURED COMMAND CORRECTION PLAN
 Status: first and second slices implemented in src/engine/ behind
         engine = 'native' (NOTYPO_ENGINE=native) on branch
         structured-engine; the legacy engine stays the default.
-        Third slice not started.
+        Third slice in progress: bash completion functions and
+        upgrade coverage for every protocol; fish/PowerShell dialects
+        and the default switch are not started.
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.
         [ ] NOT DONE = work required to deliver this plan.
@@ -227,6 +229,8 @@ and ls --colro=auto the option name while preserving its value.
 [ ] NOT DONE: Shell completion adapters: collect bounded results from native
     completion facilities for bash/zsh/fish/PowerShell. Completion functions
     can execute code, so invocation must obey the shared probe trust policy.
+    PARTIAL: bash completion functions (sourced scripts, opt-in via
+    trusted_completers) are bridged; zsh, fish, and PowerShell are not.
 [ ] NOT DONE: Discover the active shell's registered handler or the app's
     documented completion entry point automatically. Preserve full command
     context, target token, cursor position, cwd, dialect, and relevant options;
@@ -605,9 +609,9 @@ SHARED IMPLEMENTATION AND COVERAGE TASKS
     app-generated completion scripts, completion subprocess protocols,
     Python completion protocols, and PowerShell completion/cmdlet metadata.
     Reuse a protocol bridge across apps instead of writing one rule per service.
-    PARTIAL: completion subprocess protocols (aws_completer, git, cobra, posener) and
-    argcomplete are implemented; shell handlers, generated scripts, and
-    PowerShell are pending.
+    PARTIAL: completion subprocess protocols (aws_completer, git, cobra, posener),
+    argcomplete, and bash completion functions are implemented;
+    app-generated scripts beyond bash and PowerShell are pending.
 [x] DONE: Detect package-runner invocations (npx, npm exec, pnpm exec,
     yarn, uvx, pipx run) and obtain the target app's installed identity without
     downloading a package or executing its failed operation during discovery.
@@ -784,8 +788,8 @@ executes it once. Aborting or a denied safety decision executes nothing.
 [ ] NOT DONE: Extend this upgrade/extension corpus to every native protocol
     family and every provider/client entry in section 5A. Keep per-executable
     discovery, completion, correction, and environment coverage records.
-    PARTIAL: aws_completer and argcomplete fakes change between requests; git,
-    cobra, and posener have protocol fixtures but no upgrade cases.
+    PARTIAL: every protocol family (aws_completer, argcomplete, git, cobra,
+    posener) has an upgrade fixture; most 5A clients have no check.
 [ ] NOT DONE: Test mid-command token replacement, empty-prefix enumeration,
     multiple typos, nested groups, global flags, enum/resource values, quoting,
     and shell-specific native completion responses.
