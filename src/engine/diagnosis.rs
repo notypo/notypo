@@ -285,16 +285,97 @@ const WRAPPERS: &[(&str, &[&str])] = &[
     ("nocorrect", &[]),
 ];
 
+/// Package runners: the program they run comes from a package, which may
+/// have to be downloaded. Options listed take a value; `-c`/`--call` run a
+/// shell string instead of a program.
+const RUNNERS: &[(&[&str], Ecosystem, &[&str])] = &[
+    (
+        &["npx"],
+        Ecosystem::Node,
+        &["-p", "--package", "--registry", "--cache"],
+    ),
+    (&["pnpx"], Ecosystem::Node, &[]),
+    (&["bunx"], Ecosystem::Node, &["-p", "--package"]),
+    (
+        &["npm", "exec"],
+        Ecosystem::Node,
+        &["-p", "--package", "--registry", "-w", "--workspace"],
+    ),
+    (&["npm", "x"], Ecosystem::Node, &["-p", "--package"]),
+    (
+        &["pnpm", "exec"],
+        Ecosystem::Node,
+        &["-C", "--dir", "--filter"],
+    ),
+    (&["pnpm", "dlx"], Ecosystem::Node, &["--package"]),
+    (&["yarn", "dlx"], Ecosystem::Node, &["-p", "--package"]),
+    (&["yarn", "exec"], Ecosystem::Node, &[]),
+    (&["bun", "x"], Ecosystem::Node, &["-p", "--package"]),
+    (
+        &["uvx"],
+        Ecosystem::Python,
+        &["--from", "--with", "-p", "--python", "--index-url"],
+    ),
+    (
+        &["pipx", "run"],
+        Ecosystem::Python,
+        &["--spec", "--python", "--index-url"],
+    ),
+    (
+        &["uv", "run"],
+        Ecosystem::Python,
+        &["--with", "-p", "--python", "--project", "--directory"],
+    ),
+    (&["poetry", "run"], Ecosystem::Python, &[]),
+    (&["bundle", "exec"], Ecosystem::Ruby, &["--gemfile"]),
+];
+
+/// Where a package runner finds the program it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ecosystem {
+    Node,
+    Python,
+    Ruby,
+}
+
 /// Index of the word naming the program that actually runs, skipping
 /// wrappers and their options; `None` when nothing is executed (`sudo -l`,
 /// `command -v git`) or a wrapper is the last word.
 pub fn effective_program(words: &[Word]) -> Option<usize> {
+    effective_program_via(words).map(|(i, _)| i)
+}
+
+/// [`effective_program`], and the package runner it is run through.
+pub fn effective_program_via(words: &[Word]) -> Option<(usize, Option<Ecosystem>)> {
     let mut i = 0;
+    let mut runner = None;
     loop {
         let name = words.get(i)?.literal()?;
         let base = name.rsplit('/').next().unwrap_or(name);
+        let next = words.get(i + 1).and_then(Word::literal);
+        if let Some((prefix, ecosystem, with_value)) = RUNNERS.iter().find(|(prefix, _, _)| {
+            prefix[0] == base && (prefix.len() == 1 || Some(prefix[1]) == next)
+        }) {
+            i += prefix.len();
+            runner = Some(*ecosystem);
+            while let Some(arg) = words.get(i).map(Word::literal) {
+                let arg = arg?;
+                if arg == "--" {
+                    i += 1;
+                    break;
+                }
+                if !arg.starts_with('-') || arg.len() < 2 {
+                    break;
+                }
+                if matches!(arg, "-c" | "--call") || arg.starts_with("--call=") {
+                    return None;
+                }
+                i += if with_value.contains(&arg) { 2 } else { 1 };
+            }
+            continue;
+        }
         let Some((wrapper, with_value)) = WRAPPERS.iter().find(|(w, _)| *w == base) else {
-            return Some(i);
+            return Some((i, runner));
         };
         i += 1;
         let mut positional_duration = *wrapper == "timeout";
@@ -361,6 +442,37 @@ mod tests {
         assert_eq!(program("sudo -l"), None);
         assert_eq!(program("command -v git"), None);
         assert_eq!(program("sudo $CMD"), None);
+    }
+
+    #[test]
+    fn package_runners_are_looked_through() {
+        let via = |src: &str| {
+            let script = parse(src);
+            let words = &script.commands[0].words;
+            effective_program_via(words).map(|(i, e)| (words[i].literal().unwrap().to_owned(), e))
+        };
+        assert_eq!(
+            via("npx cdk deploy"),
+            Some(("cdk".into(), Some(Ecosystem::Node)))
+        );
+        assert_eq!(
+            via("npx -p aws-cdk@2 cdk diff"),
+            Some(("cdk".into(), Some(Ecosystem::Node)))
+        );
+        assert_eq!(
+            via("pnpm dlx create-vite app"),
+            Some(("create-vite".into(), Some(Ecosystem::Node)))
+        );
+        assert_eq!(
+            via("uvx ruff check"),
+            Some(("ruff".into(), Some(Ecosystem::Python)))
+        );
+        assert_eq!(
+            via("sudo bundle exec rake db:migrate"),
+            Some(("rake".into(), Some(Ecosystem::Ruby)))
+        );
+        assert_eq!(via("npm install"), Some(("npm".into(), None)));
+        assert_eq!(via("npx -c 'echo hi'"), None);
     }
 
     #[test]

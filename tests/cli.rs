@@ -395,6 +395,34 @@ fn explain_reports_the_diagnosis_and_runs_nothing() {
     assert!(!bin.join("ran").exists());
 }
 
+#[test]
+fn json_reports_the_diagnosis_for_automation() {
+    let workspace = Workspace::new();
+    let bin = fake_aws(&workspace);
+    let output = finish(
+        workspace
+            .command("")
+            .env("PATH", system_path(&bin))
+            .args([
+                "--json",
+                "--force-command",
+                "aws ec2 describ-instances | cat",
+            ])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"]["kind"], "suggestion");
+    let candidate = &report["candidates"][0];
+    assert_eq!(candidate["command"], "aws ec2 describe-instances | cat");
+    assert_eq!(candidate["safety"]["decision"], "allow");
+    assert_eq!(candidate["edits"][0]["from"], "describ-instances");
+    assert_eq!(candidate["edits"][0]["start"], 8);
+    assert_eq!(report["output"], serde_json::Value::Null);
+    assert!(!bin.join("ran").exists());
+}
+
 /// The alias hands the failed command's exit status (127) to the engine,
 /// which makes the missing-executable diagnosis strong enough for `-y`.
 #[test]

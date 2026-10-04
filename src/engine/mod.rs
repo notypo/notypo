@@ -611,12 +611,21 @@ impl<'a> Run<'a> {
 
     fn repair(&mut self, script: &Script, index: usize) -> Vec<State> {
         let words = &script.commands[index].words;
-        let Some(p) = diagnosis::effective_program(words) else {
+        let Some((p, runner)) = diagnosis::effective_program_via(words) else {
             return Vec::new();
         };
         let Some(name) = words[p].literal() else {
             return Vec::new();
         };
+        if let Some(ecosystem) = runner {
+            return match self.resolve_package(name, ecosystem) {
+                Some(start) => self.walk(script, index, p, start),
+                None => Vec::new(),
+            }
+            .into_iter()
+            .filter(|s| !s.edits.is_empty())
+            .collect();
+        }
         let starts = match self.resolve(name) {
             Resolution::Executable(path) => vec![State::new(name, Some(path))],
             Resolution::ShellDefined => {
@@ -649,6 +658,42 @@ impl<'a> Run<'a> {
         finished.extend(self.path_candidates(script, index, p, None));
         finished.retain(|s| !s.edits.is_empty());
         finished
+    }
+
+    /// The installed program a package runner would run, without fetching
+    /// anything: on `$PATH`, or (for Node) in a `node_modules/.bin` above
+    /// the working directory, which is used but never probed.
+    fn resolve_package(&mut self, spec: &str, ecosystem: diagnosis::Ecosystem) -> Option<State> {
+        if spec.starts_with('@') || spec.contains('/') {
+            self.note(format!(
+                "{spec}: scoped or path packages are not resolved to a program"
+            ));
+            return None;
+        }
+        let name = spec.split('@').next().unwrap_or(spec);
+        if let Some(path) = self.ctx.which(name) {
+            return Some(State::new(name, Some(path)));
+        }
+        if ecosystem == diagnosis::Ecosystem::Node
+            && let Some(cwd) = self
+                .failure
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+            && cwd
+                .ancestors()
+                .take(16)
+                .any(|dir| dir.join("node_modules/.bin").join(name).is_file())
+        {
+            self.note(format!(
+                "{name}: a local package binary; its completion is not probed automatically"
+            ));
+            return Some(State::new(name, None));
+        }
+        self.note(format!(
+            "{name} is not installed; the package runner would fetch it, so its name is not checked"
+        ));
+        None
     }
 
     fn has_native(&mut self, state: &State) -> bool {
@@ -1879,6 +1924,26 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
                 .candidates()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn package_runners_resolve_installed_apps_only() {
+        let fake = fake_aws();
+        let ctx = context(&fake)
+            .with_which("cdkk", None)
+            .with_which("cdk", None);
+        let report = correct(&failure("npx aws ec2 describ-instances"), &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "npx aws ec2 describe-instances"
+        );
+        let report = correct(&failure("npx cdkk deploy"), &ctx);
+        assert!(
+            report.outcome.candidates().is_empty(),
+            "{:?}",
+            report.outcome
+        );
+        assert!(report.notes.iter().any(|n| n.contains("not installed")));
     }
 
     #[test]

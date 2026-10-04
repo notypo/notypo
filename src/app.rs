@@ -200,7 +200,7 @@ pub fn fix_command(args: &Args) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let expanded = ctx.shell.from_shell(&script);
-    let code = if ctx.settings.engine == EngineMode::Native || args.explain {
+    let code = if ctx.settings.engine == EngineMode::Native || args.explain || args.json {
         fix_with_engine(args, &ctx, &script, &expanded, status_applies)
     } else {
         let output = output_readers::get_output(&script, &expanded, &ctx.settings);
@@ -240,7 +240,8 @@ fn fix_with_engine(
         Some((text, origin)) => CapturedOutput::Combined { text, origin },
         None => CapturedOutput::Unknown,
     };
-    if output == CapturedOutput::Unknown && ctx.settings.replay_for_diagnosis && !args.explain {
+    let inspecting = args.explain || args.json;
+    if output == CapturedOutput::Unknown && ctx.settings.replay_for_diagnosis && !inspecting {
         let gate = safety::assess_replay(expanded);
         if gate.decision == Decision::Allow {
             if let Some(text) = output_readers::get_output(script, expanded, &ctx.settings) {
@@ -272,6 +273,10 @@ fn fix_with_engine(
         report.outcome.describe(),
         report.probes
     ));
+    if args.json {
+        println!("{}", report_json(&failure, &report));
+        return ExitCode::SUCCESS;
+    }
     if args.explain {
         eprint!("{}", explain(&failure, &report));
         return ExitCode::SUCCESS;
@@ -555,6 +560,63 @@ fn explain(failure: &FailureContext, report: &Report) -> String {
     }
     let _ = writeln!(out, "probes:      {}", report.probes);
     out
+}
+
+/// The `--json` report. Field names are part of the CLI's interface.
+fn report_json(failure: &FailureContext, report: &Report) -> serde_json::Value {
+    use serde_json::json;
+    let (kind, listed) = match &report.outcome {
+        Outcome::Suggestion(c) => ("suggestion", c.as_slice()),
+        Outcome::Ambiguous(c) => ("ambiguous", c.as_slice()),
+        Outcome::Unsafe(c) => ("unsafe", c.as_slice()),
+        Outcome::UnsupportedSyntax(_) => ("unsupported_syntax", &[][..]),
+        Outcome::InsufficientEvidence(_) => ("insufficient_evidence", &[][..]),
+        Outcome::NoCorrection(_) => ("no_correction", &[][..]),
+    };
+    let evidence = |e: &[engine::Evidence]| -> Vec<serde_json::Value> {
+        e.iter()
+            .map(|e| json!({"source": e.source.setting_name(), "detail": e.detail}))
+            .collect()
+    };
+    json!({
+        "command": failure.source,
+        "exit_status": failure.exit_status,
+        "pipe_status": failure.pipe_status,
+        "output": match &failure.output {
+            CapturedOutput::Unknown => serde_json::Value::Null,
+            CapturedOutput::Combined { origin, .. } => json!({"streams": "combined", "origin": format!("{origin:?}")}),
+            CapturedOutput::Separate { .. } => json!({"streams": "separate"}),
+        },
+        "outcome": {"kind": kind, "description": report.outcome.describe()},
+        "candidates": listed.iter().map(|c| json!({
+            "command": c.script,
+            "score": c.score,
+            "weak": c.weak,
+            "safety": {
+                "decision": format!("{:?}", c.safety.decision).to_lowercase(),
+                "reasons": c.safety.reasons,
+            },
+            "edits": c.edits.iter().map(|e| json!({
+                "role": format!("{:?}", e.role),
+                "from": e.from,
+                "to": e.to,
+                "via": e.via,
+                "start": e.span.start,
+                "end": e.span.end,
+                "similarity": e.score.similarity,
+                "distance": e.score.distance,
+            })).collect::<Vec<_>>(),
+            "evidence": evidence(&c.evidence),
+        })).collect::<Vec<_>>(),
+        "suspicions": report.suspicions.iter().map(|s| json!({
+            "role": format!("{:?}", s.role),
+            "token": s.token,
+            "strength": s.score,
+            "evidence": evidence(&s.evidence),
+        })).collect::<Vec<_>>(),
+        "notes": report.notes,
+        "probes": report.probes,
+    })
 }
 
 /// `CorrectedCommand.run`: side effect, history, then print for the alias to eval.
