@@ -43,13 +43,25 @@ pub struct ScoreBreakdown {
 }
 
 pub fn score_token(typed: &str, candidate: &str, hinted: bool, uses: u32) -> ScoreBreakdown {
-    let (a, b) = (typed.to_lowercase(), candidate.to_lowercase());
-    let a_core = a.trim_start_matches('-');
-    let b_core = b.trim_start_matches('-');
-    let distance = osa_distance(&a, &b);
-    let longest = a.chars().count().max(b.chars().count()).max(1);
+    let a: Vec<char> = typed.to_lowercase().chars().collect();
+    let b: Vec<char> = candidate.to_lowercase().chars().collect();
+    let distance = osa_chars(&a, &b, usize::MAX, &mut Rows::default()).unwrap_or(usize::MAX);
+    breakdown(typed, candidate, &a, &b, distance, hinted, uses)
+}
+
+fn breakdown(
+    typed: &str,
+    candidate: &str,
+    a: &[char],
+    b: &[char],
+    distance: usize,
+    hinted: bool,
+    uses: u32,
+) -> ScoreBreakdown {
+    let longest = a.len().max(b.len()).max(1);
     let similarity = 1.0 - distance as f64 / longest as f64;
-    let first_letter = if !a_core.is_empty() && a_core.chars().next() == b_core.chars().next() {
+    let core = |s: &[char]| s.iter().copied().find(|c| *c != '-');
+    let first_letter = if core(a).is_some() && core(a) == core(b) {
         FIRST_LETTER_BONUS
     } else {
         0.0
@@ -81,27 +93,48 @@ pub fn score_token(typed: &str, candidate: &str, hinted: bool, uses: u32) -> Sco
 pub fn osa_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    let width = b.len() + 1;
-    let mut d = vec![0usize; (a.len() + 1) * width];
-    for i in 0..=a.len() {
-        d[i * width] = i;
+    osa_chars(&a, &b, usize::MAX, &mut Rows::default()).unwrap_or(usize::MAX)
+}
+
+/// Three rolling rows of the distance table, reused between candidates.
+#[derive(Default)]
+struct Rows(Vec<usize>, Vec<usize>, Vec<usize>);
+
+/// The OSA distance, or `None` once it must exceed `bound`.
+fn osa_chars(a: &[char], b: &[char], bound: usize, rows: &mut Rows) -> Option<usize> {
+    if a.len().abs_diff(b.len()) > bound {
+        return None;
     }
-    for (j, cell) in d.iter_mut().enumerate().take(width) {
+    let width = b.len() + 1;
+    let Rows(before, previous, current) = rows;
+    for row in [&mut *before, &mut *previous, &mut *current] {
+        row.clear();
+        row.resize(width, 0);
+    }
+    for (j, cell) in previous.iter_mut().enumerate() {
         *cell = j;
     }
     for i in 1..=a.len() {
-        for j in 1..=b.len() {
+        current[0] = i;
+        let mut row_min = i;
+        for j in 1..width {
             let cost = usize::from(a[i - 1] != b[j - 1]);
-            let mut best = (d[(i - 1) * width + j] + 1)
-                .min(d[i * width + j - 1] + 1)
-                .min(d[(i - 1) * width + j - 1] + cost);
+            let mut best = (previous[j] + 1)
+                .min(current[j - 1] + 1)
+                .min(previous[j - 1] + cost);
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                best = best.min(d[(i - 2) * width + j - 2] + 1);
+                best = best.min(before[j - 2] + 1);
             }
-            d[i * width + j] = best;
+            current[j] = best;
+            row_min = row_min.min(best);
         }
+        if row_min > bound {
+            return None;
+        }
+        std::mem::swap(before, previous);
+        std::mem::swap(previous, current);
     }
-    d[a.len() * width + b.len()]
+    Some(previous[b.len()]).filter(|d| *d <= bound)
 }
 
 /// The best `limit` replacements for `typed` among `vocabulary`, highest
@@ -114,16 +147,34 @@ pub fn rank_tokens<'v>(
     uses: &dyn Fn(&str) -> u32,
     limit: usize,
 ) -> Vec<(&'v str, ScoreBreakdown)> {
-    let mut scored: Vec<(usize, &str, ScoreBreakdown)> = vocabulary
-        .into_iter()
-        .filter(|word| *word != typed)
-        .enumerate()
-        .map(|(n, word)| {
-            let hinted = hints.iter().any(|h| h == word);
-            (n, word, score_token(typed, word, hinted, uses(word)))
-        })
-        .filter(|(_, _, score)| score.total >= FLOOR)
-        .collect();
+    let a: Vec<char> = typed.to_lowercase().chars().collect();
+    let mut b: Vec<char> = Vec::new();
+    let mut rows = Rows::default();
+    let mut scored: Vec<(usize, &str, ScoreBreakdown)> = Vec::new();
+    for (n, word) in vocabulary.into_iter().filter(|w| *w != typed).enumerate() {
+        let hinted = hints.iter().any(|h| h == word);
+        let used = uses(word);
+        // The largest distance that could still reach the floor with every
+        // bonus this word can get.
+        b.clear();
+        b.extend(word.chars().flat_map(char::to_lowercase));
+        let bonus = FIRST_LETTER_BONUS
+            + if hinted { HINT_BONUS } else { 0.0 }
+            + if used > 0 {
+                HISTORY_BONUS.0 + HISTORY_BONUS.1
+            } else {
+                0.0
+            };
+        let longest = a.len().max(b.len()).max(1) as f64;
+        let bound = ((1.0 - FLOOR + bonus) * longest).floor() as usize;
+        let Some(distance) = osa_chars(&a, &b, bound, &mut rows) else {
+            continue;
+        };
+        let score = breakdown(typed, word, &a, &b, distance, hinted, used);
+        if score.total >= FLOOR {
+            scored.push((n, word, score));
+        }
+    }
     scored.sort_by(|(na, _, a), (nb, _, b)| b.total.total_cmp(&a.total).then(na.cmp(nb)));
     scored.dedup_by(|(_, a, _), (_, b, _)| a == b);
     scored

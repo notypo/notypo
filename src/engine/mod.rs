@@ -102,6 +102,8 @@ pub struct Candidate {
     pub safety: SafetyAssessment,
     /// Only structural evidence: the shell never reported the failure.
     pub weak: bool,
+    /// A corrected program's own completer accepted the following word.
+    pub confirmed: bool,
 }
 
 impl Candidate {
@@ -274,6 +276,8 @@ const NOT_ON_PATH: f64 = 0.6;
 const EXIT_127: f64 = 0.8;
 const OUTPUT_NAMES_IT: f64 = 0.85;
 const PATH_MISSING: f64 = 0.6;
+/// Ranking bonus for a corrected program that accepts the rest of the line.
+const CONTEXT_FITS: f64 = 0.1;
 const COMMAND_FAILED: f64 = 0.5;
 /// Weaker suspicions can't be repaired without the user confirming.
 const STRONG_SUSPICION: f64 = 0.75;
@@ -321,6 +325,8 @@ struct State {
     context: Vec<String>,
     /// The subcommands among them.
     command_path: Vec<String>,
+    /// A corrected program's completer accepted the word after it.
+    confirmed: bool,
     edits: Vec<TokenEdit>,
     score: f64,
     evidence: Vec<Evidence>,
@@ -334,6 +340,7 @@ impl State {
             path,
             context: Vec::new(),
             command_path: Vec::new(),
+            confirmed: false,
             edits: Vec::new(),
             score: 1.0,
             evidence: Vec::new(),
@@ -372,6 +379,8 @@ enum Branching {
 enum Check {
     Valid {
         takes_value: Option<bool>,
+        /// The app itself (not documentation or history) listed the word.
+        confirmed: bool,
     },
     Invalid(providers::Vocabulary),
     /// Nothing here is a subcommand: arguments follow.
@@ -520,6 +529,7 @@ impl<'a> Run<'a> {
                         existing.score = candidate.score;
                         existing.edits = candidate.edits;
                         existing.weak = candidate.weak;
+                        existing.confirmed = candidate.confirmed;
                     }
                 }
                 None => candidates.push(candidate),
@@ -935,6 +945,7 @@ impl<'a> Run<'a> {
                 if let Some(word) = vocabulary.words.iter().find(|w| w.value == typed) {
                     Check::Valid {
                         takes_value: word.takes_value,
+                        confirmed: vocabulary.authoritative,
                     }
                 } else if vocabulary.words.is_empty() {
                     if role == TokenRole::OptionName {
@@ -1013,6 +1024,7 @@ impl<'a> Run<'a> {
         match merged.words.iter().find(|w| w.value == typed) {
             Some(word) => Check::Valid {
                 takes_value: word.takes_value,
+                confirmed: false,
             },
             None => Check::Invalid(merged),
         }
@@ -1088,7 +1100,24 @@ impl<'a> Run<'a> {
                     (TokenRole::Subcommand, text)
                 };
                 let vocabulary = match self.check(&state, role, typed) {
-                    Check::Valid { takes_value } => {
+                    Check::Valid {
+                        takes_value,
+                        confirmed,
+                    } => {
+                        // A misspelled program whose own completer accepts
+                        // the next word fits the whole command.
+                        if confirmed
+                            && !is_option
+                            && state.command_path.is_empty()
+                            && state.edits.iter().any(|e| e.role == TokenRole::Executable)
+                        {
+                            state.score = (state.score + CONTEXT_FITS).min(1.0);
+                            state.confirmed = true;
+                            state.evidence.push(Evidence {
+                                source: Source::NativeCompletion,
+                                detail: format!("{} completion lists `{text}`", state.program),
+                            });
+                        }
                         // `--output=jsn`: check the attached value too.
                         if let Some(value) =
                             text.strip_prefix(typed).and_then(|t| t.strip_prefix('='))
@@ -1470,6 +1499,7 @@ impl<'a> Run<'a> {
                 reasons: Vec::new(),
             },
             weak: state.weak,
+            confirmed: state.confirmed,
         })
     }
 }
@@ -1492,7 +1522,8 @@ fn attached_value_span(word: &parser::Word, src: &str, name: &str) -> Option<Spa
 /// equally backed by hints and history: only word length would separate
 /// them (`mal` → `mail` or `man`), which is no reason to choose alone.
 fn equally_supported(a: &Candidate, b: &Candidate) -> bool {
-    a.edits.len() == b.edits.len()
+    a.confirmed == b.confirmed
+        && a.edits.len() == b.edits.len()
         && a.edits.iter().zip(&b.edits).all(|(x, y)| {
             (x.command, x.word) == (y.command, y.word)
                 && x.score.distance == y.score.distance
@@ -2007,6 +2038,34 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
             correct(&f, &ctx).outcome,
             Outcome::NoCorrection(_)
         ));
+    }
+
+    #[test]
+    fn a_program_that_accepts_the_rest_of_the_line_ranks_first() {
+        let fake = fake_aws();
+        let gtr = fake.dir.script("bin/gtr", "#!/bin/sh\n");
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_executables(&["gtr", "git"])
+            .with_which("gtr", Some(gtr.to_str().unwrap()))
+            .with_which("git", Some(fake.dir.0.join("bin/git").to_str().unwrap()))
+            .with_which("gti", None)
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let mut f = failure("gti status");
+        f.exit_status = Some(127);
+        let report = correct(&f, &ctx);
+        assert_eq!(scripts(&report.outcome), ["git status", "gtr status"]);
+        assert!(
+            matches!(report.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            report.outcome
+        );
+        let mut f = failure("gti frobnicate");
+        f.exit_status = Some(127);
+        assert!(
+            matches!(correct(&f, &ctx).outcome, Outcome::Ambiguous(_)),
+            "without context agreement, equally close names are a tie"
+        );
     }
 
     #[test]

@@ -22,6 +22,10 @@ path = "src/main.rs"
 name = "correction"
 harness = false
 
+[[bench]]
+name = "engine"
+harness = false
+
 [dependencies]
 libc = "0.2.190"
 regex = "1.13.1"
