@@ -34,26 +34,7 @@ This prints `git status`; the standalone binary does not execute the printed cor
 
 ## Performance
 
-`notypo` was **14–39× faster** than the original Python `thefuck` in these CLI correction benchmarks. Measured on an Apple M1 running macOS on October 4, 2026, using `thefuck` 3.32 with Python 3.14.8 and a Rust 1.98.1 release build with thin LTO. Each case used 100 fresh processes per implementation after five warmups, with warm filesystem caches and the Rust PATH cache enabled.
-
-Median CLI times, including startup, default rule loading, failed-command output acquisition and printing the first correction:
-
-| Command | Python | Rust | Speedup |
-|---|---:|---:|---:|
-| `cd..` | 179.8 ms | 4.6 ms | 38.9× |
-| `mkdir missing/child` | 181.8 ms | 6.3 ms | 29.0× |
-| `git sttus` | 189.0 ms | 13.9 ms | 13.6× |
-| `gti status` | 184.1 ms | 6.4 ms | 28.8× |
-
-Both implementations produced matching corrections. A separate warm engine benchmark using five preloaded rules and 2,000 executable candidates showed **10–62× speedups**, excluding startup, rule imports, log parsing and command reruns.
-
-Median peak resident memory for the `cd..` correction was **40.6 MiB for Python versus 3.8 MiB for Rust**, measured over five runs. These results describe warm local macOS runs; performance on other platforms and with cold caches may differ.
-
-See the [full report](benchmarks/results.md), [raw samples](benchmarks/results.json) and [benchmark setup](benchmarks/README.md). After setup, rerun the comparison with:
-
-```sh
-python3 benchmarks/compare.py
-```
+`notypo` was **14–39× faster** than the original Python `thefuck` in these CLI correction benchmarks.
 
 ## License
 

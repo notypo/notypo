@@ -6,6 +6,8 @@ rust-version = "1.98"
 description = "A fast Rust port of thefuck: corrects errors in previous console commands"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/notypo/notypo"
+exclude = ["/benches/", "/benchmarks/"]
 keywords = ["cli", "shell", "thefuck", "typo"]
 categories = ["command-line-utilities"]
 

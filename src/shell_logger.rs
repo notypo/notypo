@@ -112,7 +112,8 @@ fn open_pty(size: &libc::winsize) -> io::Result<(File, File)> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            // Linux accepts a const pointer; macOS/BSD require a mutable one.
+            &raw mut size,
         )
     } == -1
     {

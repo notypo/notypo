@@ -111,10 +111,6 @@ jobs:
             target: x86_64-unknown-freebsd
             mode: freebsd-vm
             arch: x86_64
-          - runner: ubuntu-latest
-            target: aarch64-unknown-freebsd
-            mode: freebsd-vm
-            arch: aarch64
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -229,12 +225,6 @@ jobs:
             mode: freebsd-vm
             arch: x86_64
             os-arch: freebsd-x86_64
-            asset_ext: .tar.gz
-          - runner: ubuntu-latest
-            target: aarch64-unknown-freebsd
-            mode: freebsd-vm
-            arch: aarch64
-            os-arch: freebsd-arm64
             asset_ext: .tar.gz
     steps:
       - name: Require a release tag
