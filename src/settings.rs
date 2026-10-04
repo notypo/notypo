@@ -33,6 +33,37 @@ pub struct Settings {
     /// Used by the `fix_file` rule (`@default_settings` in Python).
     pub fixlinecmd: String,
     pub fixcolcmd: Option<String>,
+    /// The rule-based compatibility engine, or the structured pipeline in
+    /// [`crate::engine`] (opt-in while it is being measured).
+    pub engine: EngineMode,
+    /// Candidate sources the structured engine must not use (see
+    /// [`crate::engine::Source::setting_name`]).
+    pub disabled_sources: Vec<String>,
+    /// Programs whose generic completion protocol may be probed; `*` trusts
+    /// every program that declares one. Built-in backends need no entry.
+    pub trusted_completers: Vec<String>,
+    /// Seconds a single discovery probe (such as a native completer) may run.
+    pub probe_timeout: f64,
+    /// Lets the structured engine rerun the failed command to read its
+    /// output when none was captured, if the safety gate allows the command.
+    pub replay_for_diagnosis: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngineMode {
+    #[default]
+    Legacy,
+    Native,
+}
+
+impl EngineMode {
+    pub fn from_name(name: &str) -> Option<EngineMode> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "legacy" | "rules" => Some(EngineMode::Legacy),
+            "native" | "structured" => Some(EngineMode::Native),
+            _ => None,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -62,6 +93,11 @@ impl Default for Settings {
             excluded_search_path_prefixes: Vec::new(),
             fixlinecmd: "{editor} {file} +{line}".into(),
             fixcolcmd: None,
+            engine: EngineMode::Legacy,
+            disabled_sources: Vec::new(),
+            trusted_completers: Vec::new(),
+            probe_timeout: 3.0,
+            replay_for_diagnosis: false,
         }
     }
 }
@@ -94,6 +130,11 @@ const DEFAULTS_DOC: &str = "# rules = [<const: All rules enabled>]
 # num_close_matches = 3
 # env = {'LC_ALL': 'C', 'LANG': 'C', 'GIT_TRACE': '1'}
 # excluded_search_path_prefixes = []
+# engine = 'legacy'
+# disabled_sources = []
+# trusted_completers = []
+# probe_timeout = 3
+# replay_for_diagnosis = False
 ";
 
 impl Settings {
@@ -137,8 +178,12 @@ impl Settings {
         settings
     }
 
-    /// Applies `THEFUCK_*` variables. Like the Python dict comprehension,
-    /// one bad value discards the whole env layer.
+    pub fn is_source_enabled(&self, name: &str) -> bool {
+        !self.disabled_sources.iter().any(|s| s == name)
+    }
+
+    /// Applies `THEFUCK_*` (and notypo's own `NOTYPO_*`) variables. Like the
+    /// Python dict comprehension, one bad value discards the whole env layer.
     pub fn apply_env(&mut self, var: impl Fn(&str) -> Option<String>) -> Result<(), String> {
         let mut next = self.clone();
         let int = |v: &str| -> Result<i64, String> {
@@ -203,6 +248,25 @@ impl Settings {
         }
         if let Some(v) = var("THEFUCK_EXCLUDED_SEARCH_PATH_PREFIXES") {
             next.excluded_search_path_prefixes = list(&v);
+        }
+        if let Some(v) = var("NOTYPO_ENGINE") {
+            next.engine =
+                EngineMode::from_name(&v).ok_or_else(|| format!("unknown engine: '{v}'"))?;
+        }
+        if let Some(v) = var("NOTYPO_DISABLED_SOURCES") {
+            next.disabled_sources = list(&v).into_iter().filter(|s| !s.is_empty()).collect();
+        }
+        if let Some(v) = var("NOTYPO_TRUSTED_COMPLETERS") {
+            next.trusted_completers = list(&v).into_iter().filter(|s| !s.is_empty()).collect();
+        }
+        if let Some(v) = var("NOTYPO_PROBE_TIMEOUT") {
+            next.probe_timeout = v
+                .trim()
+                .parse()
+                .map_err(|_| format!("could not convert string to float: '{v}'"))?;
+        }
+        if let Some(v) = var("NOTYPO_REPLAY_FOR_DIAGNOSIS") {
+            next.replay_for_diagnosis = flag(&v);
         }
         *self = next;
         Ok(())
@@ -306,6 +370,23 @@ impl Settings {
                 Some(s) => self.fixlinecmd = s.to_owned(),
                 None => return false,
             },
+            "engine" => match v.as_str().and_then(EngineMode::from_name) {
+                Some(mode) => self.engine = mode,
+                None => return false,
+            },
+            "disabled_sources" | "trusted_completers" => {
+                let Some(list) = strings(v) else { return false };
+                if key == "disabled_sources" {
+                    self.disabled_sources = list;
+                } else {
+                    self.trusted_completers = list;
+                }
+            }
+            "probe_timeout" => match v.as_f64() {
+                Some(n) => self.probe_timeout = n,
+                None => return false,
+            },
+            "replay_for_diagnosis" => self.replay_for_diagnosis = v.truthy(),
             "fixcolcmd" => match v {
                 V::None => self.fixcolcmd = None,
                 other => match other.as_str() {
@@ -720,6 +801,38 @@ no_colors = True
         assert!(s.is_rule_enabled("git_push", || true));
         assert!(!s.is_rule_enabled("git_push", || false));
         assert!(s.is_rule_enabled("my_rule", || false));
+    }
+
+    #[test]
+    fn structured_engine_settings() {
+        let mut s = Settings::default();
+        assert_eq!(s.engine, EngineMode::Legacy);
+        s.apply_file(
+            "engine = 'native'\ndisabled_sources = ['stderr']\ntrusted_completers = ['mytool']\nprobe_timeout = 1.5\nreplay_for_diagnosis = True\n",
+        );
+        assert_eq!(s.engine, EngineMode::Native);
+        assert!(!s.is_source_enabled("stderr"));
+        assert!(s.is_source_enabled("native"));
+        assert_eq!(s.trusted_completers, ["mytool"]);
+        assert_eq!(s.probe_timeout, 1.5);
+        assert!(s.replay_for_diagnosis);
+
+        let env: HashMap<&str, &str> = [
+            ("NOTYPO_ENGINE", "legacy"),
+            ("NOTYPO_DISABLED_SOURCES", "native:legacy"),
+            ("NOTYPO_PROBE_TIMEOUT", "0.25"),
+            ("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false"),
+        ]
+        .into();
+        s.apply_env(|k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(s.engine, EngineMode::Legacy);
+        assert_eq!(s.disabled_sources, ["native", "legacy"]);
+        assert_eq!(s.probe_timeout, 0.25);
+        assert!(!s.replay_for_diagnosis);
+        assert!(
+            s.apply_env(|k| (k == "NOTYPO_ENGINE").then(|| "fast".into()))
+                .is_err()
+        );
     }
 
     #[test]

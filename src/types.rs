@@ -313,10 +313,12 @@ pub struct CorrectedCommand {
     pub script: String,
     pub side_effect: Option<SideEffect>,
     pub priority: i64,
+    /// The rule that proposed it.
+    pub rule: &'static str,
 }
 
 impl PartialEq for CorrectedCommand {
-    /// Ignores `priority`, like Python.
+    /// Ignores `priority` (and the rule), like Python.
     fn eq(&self, other: &Self) -> bool {
         self.script == other.script
             && self.side_effect.map(|f| f as usize) == other.side_effect.map(|f| f as usize)

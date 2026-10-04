@@ -269,3 +269,187 @@ fn zsh_alias_corrects_command_from_current_multiline_history_event() {
         );
     }
 }
+
+/// A fake `aws` whose `aws_completer` answers from a small command tree.
+/// Running `aws` itself would leave a `ran` marker.
+fn fake_aws(workspace: &Workspace) -> PathBuf {
+    let bin = workspace.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let script = |name: &str, body: &str| {
+        let path = bin.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    script("aws", "#!/bin/sh\ntouch \"$(dirname \"$0\")/ran\"\n");
+    script(
+        "aws_completer",
+        "#!/bin/sh\n# awscli test double\nline=${COMP_LINE#aws }\nprefix=${line##* }\ncontext=${line% *}\n[ \"$context\" = \"$line\" ] && context=\nwhile IFS='|' read -r pattern word; do\n  case $context in\n    $pattern) case $word in \"$prefix\"*) printf '%s\\n' \"$word\";; esac;;\n  esac\ndone < \"$(dirname \"$0\")/tree\"\n",
+    );
+    fs::write(
+        bin.join("tree"),
+        "|ec2\n|s3\nec2|describe-instances\nec2|run-instances\nec2|terminate-instances\nec2 *-instances*|--region\nec2 *-instances*|--dry-run\n",
+    )
+    .unwrap();
+    bin
+}
+
+/// `bin` first, then the system directories the fake scripts rely on.
+fn system_path(bin: &std::path::Path) -> String {
+    format!("{}:/usr/bin:/bin", bin.display())
+}
+
+#[test]
+fn native_engine_never_replays_the_failed_command() {
+    let workspace = Workspace::new();
+    for replay in ["false", "true"] {
+        let output = finish(
+            workspace
+                .command("")
+                .env("NOTYPO_ENGINE", "native")
+                .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", replay)
+                .args(["-y", "--force-command", "printf rerun > marker"])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            !workspace.0.join("marker").exists(),
+            "replay={replay}: context capture must not run the command"
+        );
+    }
+}
+
+#[test]
+fn native_engine_repairs_through_the_apps_completer() {
+    let workspace = Workspace::new();
+    let bin = fake_aws(&workspace);
+    let output = finish(
+        workspace
+            .command("")
+            .env("NOTYPO_ENGINE", "native")
+            .env("PATH", system_path(&bin))
+            .env(
+                "TF_HISTORY",
+                "aws ec2 describ-instances --regoin eu-west-1 | cat\nfuck",
+            )
+            .env("NOTYPO_EXIT_STATUS", "252")
+            .arg("-y")
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "aws ec2 describe-instances --region eu-west-1 | cat"
+    );
+    assert!(!bin.join("ran").exists(), "discovery must not run aws");
+}
+
+#[test]
+fn native_engine_needs_a_person_for_risky_corrections() {
+    let workspace = Workspace::new();
+    let bin = fake_aws(&workspace);
+    let output = finish(
+        workspace
+            .command("")
+            .env("NOTYPO_ENGINE", "native")
+            .env("PATH", system_path(&bin))
+            .args(["-y", "--force-command", "aws ec2 terminat-instances"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "nothing for the alias to run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Not running"), "{stderr}");
+    assert!(stderr.contains("destructive"), "{stderr}");
+}
+
+#[test]
+fn explain_reports_the_diagnosis_and_runs_nothing() {
+    let workspace = Workspace::new();
+    let bin = fake_aws(&workspace);
+    let output = finish(
+        workspace
+            .command("")
+            .env("PATH", system_path(&bin))
+            .args(["--explain", "--force-command", "aws ec2 describ-instances"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("suggestion: aws ec2 describe-instances"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("evidence (native)"), "{stderr}");
+    assert!(stderr.contains("not captured"), "{stderr}");
+    assert!(!bin.join("ran").exists());
+}
+
+/// The alias hands the failed command's exit status (127) to the engine,
+/// which makes the missing-executable diagnosis strong enough for `-y`.
+#[test]
+fn shell_aliases_pass_the_exit_status_to_the_native_engine() {
+    for shell in ["bash", "zsh"] {
+        let Some(path) = notypo::utils::which(shell) else {
+            continue;
+        };
+        let workspace = Workspace::new();
+        let bin = workspace.0.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let git = bin.join("git");
+        fs::write(
+            &git,
+            "#!/bin/sh\n[ \"$1\" = status ] && printf 'correction executed\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = finish(
+            workspace
+                .command("")
+                .env("TF_SHELL", shell)
+                .arg("--alias")
+                .spawn()
+                .unwrap(),
+        );
+        let alias = String::from_utf8(output.stdout).unwrap();
+        let (flags, seed): (&[&str], _) = if shell == "bash" {
+            (
+                &["--norc", "--noprofile", "-i", "-c"],
+                "set -o history\nhistory -s 'gti status'",
+            )
+        } else {
+            (
+                &["-f", "-i", "-c"],
+                "HISTSIZE=50\nfc -p\nprint -s -- 'gti status'",
+            )
+        };
+        let script = format!("{alias}\n{seed}\ngti status\nfuck -y\n");
+        let output = finish(
+            workspace
+                .program(&path, "")
+                .env("TF_SHELL", shell)
+                .env("NOTYPO_ENGINE", "native")
+                .env("PATH", &bin)
+                .env("HISTFILE", workspace.0.join("history"))
+                .args(flags)
+                .arg(&script)
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "correction executed\n",
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

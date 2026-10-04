@@ -142,6 +142,7 @@ impl Shell {
             Shell::Bash => format!(
                 "
             function {name} () {{
+                local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${{PIPESTATUS[*]}}\";
                 export TF_SHELL=bash;
                 export TF_ALIAS={name};
                 export TF_SHELL_ALIASES=$(alias);
@@ -162,6 +163,7 @@ impl Shell {
             Shell::Zsh => format!(
                 "
             {name} () {{
+                local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${{pipestatus[*]}}\";
                 local -x NOTYPO_CURRENT_COMMAND=\"${{history[$HISTCMD]-}}\";
                 export TF_SHELL=zsh;
                 export TF_ALIAS={name};
@@ -184,6 +186,8 @@ impl Shell {
             ),
             Shell::Fish => format!(
                 "function {name} -d \"Correct your previous console command\"\n  \
+                 set -lx NOTYPO_PIPESTATUS $pipestatus\n  \
+                 set -lx NOTYPO_EXIT_STATUS $status\n  \
                  set -l fucked_up_command $history[1]\n  \
                  env TF_SHELL=fish TF_ALIAS={name} {exe} $fucked_up_command {PLACEHOLDER} $argv | read -l unfucked_command\n  \
                  if [ \"$unfucked_command\" != \"\" ]\n    \
@@ -717,6 +721,30 @@ mod tests {
                 .app_alias("fuck", "notypo", false)
                 .contains("history -s")
         );
+    }
+
+    #[test]
+    fn aliases_capture_the_exit_status_first() {
+        for (shell, status) in [
+            (
+                Shell::Bash,
+                "local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${PIPESTATUS[*]}\"",
+            ),
+            (
+                Shell::Zsh,
+                "local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${pipestatus[*]}\"",
+            ),
+            (Shell::Fish, "set -lx NOTYPO_PIPESTATUS $pipestatus"),
+        ] {
+            let alias = shell.app_alias("fuck", "notypo", true);
+            let body = alias.split_once('\n').unwrap().1.trim_start();
+            let body = if shell == Shell::Fish {
+                body
+            } else {
+                alias.split_once("{\n").unwrap().1.trim_start()
+            };
+            assert!(body.starts_with(status), "{shell:?}: {alias}");
+        }
     }
 
     #[test]

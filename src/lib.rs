@@ -29,6 +29,7 @@ pub mod app;
 pub mod args;
 pub mod corrector;
 pub mod difflib;
+pub mod engine;
 pub mod logs;
 pub mod output_readers;
 pub mod path_index;

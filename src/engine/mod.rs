@@ -1,0 +1,1447 @@
+//! The structured correction pipeline (opt-in: `engine = 'native'`).
+//!
+//! ```text
+//! failure context → lossless parse → effective program → suspicious tokens
+//!   → candidates: native completion first, installed executables,
+//!     error-output hints → ranking → safety gate → outcome
+//! ```
+//!
+//! The installed app owns its command knowledge. When an app has a native
+//! completer, the engine asks it what is valid at each level of the command
+//! (an empty prefix enumerates the level) and only proposes words the app
+//! reports, so new commands and extensions work without a notypo release.
+//! Discovery never reruns the failed command. Legacy rules stay available
+//! as a fallback in [`crate::app`].
+
+pub mod diagnosis;
+pub mod native;
+pub mod parser;
+pub mod probe;
+pub mod providers;
+pub mod ranking;
+pub mod safety;
+
+use self::diagnosis::{OutputDiagnosis, ProblemKind};
+use self::parser::{Script, Span};
+use self::probe::Budget;
+use self::providers::CandidateProvider;
+use self::ranking::ScoreBreakdown;
+use self::safety::{Decision, SafetyAssessment};
+use crate::shells::Shell;
+use crate::types::Context;
+use std::path::PathBuf;
+
+/// Where a piece of evidence came from. Each source can be disabled with the
+/// `disabled_sources` setting, using [`Source::setting_name`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Source {
+    NativeCompletion,
+    Executables,
+    Stderr,
+    LegacyRule,
+}
+
+impl Source {
+    pub fn setting_name(self) -> &'static str {
+        match self {
+            Source::NativeCompletion => "native",
+            Source::Executables => "executables",
+            Source::Stderr => "stderr",
+            Source::LegacyRule => "legacy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenRole {
+    Executable,
+    Subcommand,
+    OptionName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Evidence {
+    pub source: Source,
+    pub detail: String,
+}
+
+/// A replacement of one word (or an option's name) of the original command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenEdit {
+    pub command: usize,
+    pub word: usize,
+    pub span: Span,
+    pub role: TokenRole,
+    pub from: String,
+    pub to: String,
+    /// Who vouched for `to`, such as `aws completion`.
+    pub via: String,
+    pub score: ScoreBreakdown,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Candidate {
+    pub script: String,
+    pub edits: Vec<TokenEdit>,
+    pub evidence: Vec<Evidence>,
+    /// A ranking signal, not a probability.
+    pub score: f64,
+    pub safety: SafetyAssessment,
+    /// Only structural evidence: the shell never reported the failure.
+    pub weak: bool,
+}
+
+impl Candidate {
+    /// One line describing each change, for the selection prompt.
+    pub fn reason(&self) -> String {
+        self.edits
+            .iter()
+            .map(|e| format!("{} → {} ({})", e.from, e.to, e.via))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// What is known about the failed command. Unknown facts stay `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FailureContext {
+    pub source: String,
+    pub cwd: Option<PathBuf>,
+    pub exit_status: Option<i32>,
+    /// Exit statuses of the last pipeline's stages, when the shell gave them.
+    pub pipe_status: Option<Vec<i32>>,
+    pub output: CapturedOutput,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CapturedOutput {
+    #[default]
+    Unknown,
+    /// stdout and stderr interleaved, as a terminal log records them.
+    Combined {
+        text: String,
+        origin: OutputOrigin,
+    },
+    Separate {
+        stdout: String,
+        stderr: String,
+    },
+}
+
+impl CapturedOutput {
+    /// The text error diagnostics are read from.
+    pub fn diagnostic_text(&self) -> Option<&str> {
+        match self {
+            CapturedOutput::Unknown => None,
+            CapturedOutput::Combined { text, .. } => Some(text),
+            CapturedOutput::Separate { stderr, .. } => Some(stderr),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputOrigin {
+    ShellLogger,
+    InstantModeLog,
+    /// The command was rerun because `replay_for_diagnosis` allowed it.
+    Replay,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Outcome {
+    /// The first candidate is clearly best.
+    Suggestion(Vec<Candidate>),
+    /// Candidates are too close (or too weakly supported) to choose alone.
+    Ambiguous(Vec<Candidate>),
+    /// Every candidate was refused by the safety gate.
+    Unsafe(Vec<Candidate>),
+    UnsupportedSyntax(String),
+    /// Something looks wrong, but nothing valid is close enough.
+    InsufficientEvidence(String),
+    NoCorrection(String),
+}
+
+impl Outcome {
+    pub fn candidates(&self) -> &[Candidate] {
+        match self {
+            Outcome::Suggestion(c) | Outcome::Ambiguous(c) => c,
+            _ => &[],
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Outcome::Suggestion(c) => format!("suggestion: {}", c[0].script),
+            Outcome::Ambiguous(c) => format!("{} close candidates; choose one", c.len()),
+            Outcome::Unsafe(c) => format!(
+                "refused: {}",
+                c.first()
+                    .map_or(String::new(), |c| c.safety.reasons.join("; "))
+            ),
+            Outcome::UnsupportedSyntax(why) => format!("unsupported syntax: {why}"),
+            Outcome::InsufficientEvidence(why) => format!("insufficient evidence: {why}"),
+            Outcome::NoCorrection(why) => format!("no correction: {why}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Report {
+    pub outcome: Outcome,
+    /// Tokens found to be wrong, with the evidence against each.
+    pub suspicions: Vec<Suspicion>,
+    /// Capability limits, discovery results, and probe failures.
+    pub notes: Vec<String>,
+    pub probes: usize,
+}
+
+/// Reads the status the shell function captured before it ran anything.
+pub fn status_from_env() -> (Option<i32>, Option<Vec<i32>>) {
+    let status = std::env::var("NOTYPO_EXIT_STATUS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let pipe: Option<Vec<i32>> = std::env::var("NOTYPO_PIPESTATUS").ok().and_then(|s| {
+        s.split_whitespace()
+            .map(|n| n.parse().ok())
+            .collect::<Option<Vec<i32>>>()
+            .filter(|v| !v.is_empty())
+    });
+    (status, pipe)
+}
+
+/// Runs the pipeline for one failed command.
+pub fn correct(failure: &FailureContext, ctx: &Context) -> Report {
+    let mut run = Run::new(failure, ctx);
+    let outcome = run.execute();
+    Report {
+        outcome,
+        suspicions: run.suspicions,
+        probes: run.budget.spawned(),
+        notes: run.notes,
+    }
+}
+
+/// How many competing interpretations are followed.
+const BEAM: usize = 3;
+/// Alternatives this far behind the best replacement are not followed.
+const BRANCH_WINDOW: f64 = 0.2;
+/// Discount for an interpretation that left a later invalid token unfixed.
+const UNRESOLVED_PENALTY: f64 = 0.8;
+/// Discount per later occurrence when a hint names a repeated token.
+const LATER_OCCURRENCE_PENALTY: f64 = 0.03;
+
+/// How strongly each kind of evidence says a token is wrong. Independent
+/// pieces combine as `1 - Π(1 - p)`.
+const APP_REJECTS: f64 = 0.9;
+const NOT_ON_PATH: f64 = 0.6;
+const EXIT_127: f64 = 0.8;
+const OUTPUT_NAMES_IT: f64 = 0.85;
+/// Weaker suspicions can't be repaired without the user confirming.
+const STRONG_SUSPICION: f64 = 0.75;
+
+fn combine(evidence: &[f64]) -> f64 {
+    1.0 - evidence.iter().map(|p| 1.0 - p).product::<f64>()
+}
+
+/// A token the engine believes is wrong, and why.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Suspicion {
+    pub command: usize,
+    pub word: usize,
+    pub role: TokenRole,
+    pub token: String,
+    /// Combined strength of the evidence, in `[0, 1]`.
+    pub score: f64,
+    pub evidence: Vec<Evidence>,
+}
+
+struct Run<'a> {
+    failure: &'a FailureContext,
+    ctx: &'a Context,
+    budget: Budget,
+    diagnosis: OutputDiagnosis,
+    notes: Vec<String>,
+    native: Option<providers::NativeCompletion<'a>>,
+    executables: Option<providers::Executables<'a>>,
+    hints: Option<providers::ErrorHints>,
+    suspicions: Vec<Suspicion>,
+    /// Some words could not be checked (a failed probe, an exhausted budget).
+    unchecked: bool,
+}
+
+/// One interpretation of a command being repaired.
+#[derive(Clone, Debug)]
+struct State {
+    program: String,
+    path: Option<PathBuf>,
+    /// The words after the program, as corrected so far.
+    context: Vec<String>,
+    edits: Vec<TokenEdit>,
+    score: f64,
+    evidence: Vec<Evidence>,
+    weak: bool,
+}
+
+impl State {
+    fn new(program: &str, path: Option<PathBuf>) -> State {
+        State {
+            program: program.to_owned(),
+            path,
+            context: Vec::new(),
+            edits: Vec::new(),
+            score: 1.0,
+            evidence: Vec::new(),
+            weak: false,
+        }
+    }
+}
+
+enum Resolution {
+    Executable(PathBuf),
+    /// An alias, builtin, or function: the shell knows it.
+    ShellDefined,
+    ExplicitPath,
+    Missing,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// The app may still expect a subcommand or group here.
+    Commands,
+    /// Only arguments follow; words are no longer checked.
+    Arguments,
+}
+
+/// What the app said about one word of the walk.
+enum Check {
+    Valid {
+        takes_value: Option<bool>,
+    },
+    Invalid(providers::Vocabulary),
+    /// Nothing here is a subcommand: arguments follow.
+    Arguments,
+    Unknown,
+}
+
+impl<'a> Run<'a> {
+    fn new(failure: &'a FailureContext, ctx: &'a Context) -> Self {
+        let settings = &ctx.settings;
+        let enabled = |source: Source| settings.is_source_enabled(source.setting_name());
+        let mut notes = Vec::new();
+        for source in [
+            Source::NativeCompletion,
+            Source::Executables,
+            Source::Stderr,
+        ] {
+            if !enabled(source) {
+                notes.push(format!(
+                    "the {} source is disabled by settings",
+                    source.setting_name()
+                ));
+            }
+        }
+        let diagnosis = match failure.output.diagnostic_text() {
+            Some(text) if enabled(Source::Stderr) => diagnosis::diagnose_output(text),
+            _ => OutputDiagnosis::default(),
+        };
+        Run {
+            failure,
+            ctx,
+            budget: Budget::for_timeout(settings.probe_timeout),
+            notes,
+            native: enabled(Source::NativeCompletion)
+                .then(|| providers::NativeCompletion::new(&settings.trusted_completers)),
+            executables: enabled(Source::Executables).then_some(providers::Executables { ctx }),
+            hints: enabled(Source::Stderr).then(|| providers::ErrorHints {
+                suggestions: diagnosis.suggestions.clone(),
+            }),
+            diagnosis,
+            suspicions: Vec::new(),
+            unchecked: false,
+        }
+    }
+
+    fn note(&mut self, note: String) {
+        if !self.notes.contains(&note) {
+            self.notes.push(note);
+        }
+    }
+
+    fn collect_notes(&mut self) {
+        let mut notes = self.native.as_mut().map(|n| n.notes()).unwrap_or_default();
+        if let Some(executables) = self.executables.as_mut() {
+            notes.extend(executables.notes());
+        }
+        for note in notes {
+            self.note(note);
+        }
+    }
+
+    fn suspect(
+        &mut self,
+        index: usize,
+        word: usize,
+        role: TokenRole,
+        token: &str,
+        evidence: Vec<(f64, Evidence)>,
+    ) -> f64 {
+        let score = combine(&evidence.iter().map(|(p, _)| *p).collect::<Vec<_>>());
+        let evidence = evidence.into_iter().map(|(_, e)| e).collect();
+        match self
+            .suspicions
+            .iter_mut()
+            .find(|s| s.command == index && s.word == word && s.token == token)
+        {
+            Some(existing) => existing.score = existing.score.max(score),
+            None => self.suspicions.push(Suspicion {
+                command: index,
+                word,
+                role,
+                token: token.to_owned(),
+                score,
+                evidence,
+            }),
+        }
+        score
+    }
+
+    fn execute(&mut self) -> Outcome {
+        let shell = self.ctx.shell;
+        if !matches!(shell, Shell::Bash | Shell::Zsh | Shell::Generic) {
+            return Outcome::UnsupportedSyntax(format!(
+                "{} command lines are not parsed yet",
+                shell.friendly_name()
+            ));
+        }
+        let script = parser::parse(&self.failure.source);
+        if let Some(diagnostic) = script.diagnostics.first() {
+            return Outcome::UnsupportedSyntax(format!(
+                "{:?} at `{}`",
+                diagnostic.kind,
+                diagnostic.span.of(&script.source)
+            ));
+        }
+
+        let mut states = Vec::new();
+        for index in self.failed_commands(&script) {
+            states.extend(self.repair(&script, index));
+        }
+        self.collect_notes();
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for state in states {
+            let Some(candidate) = self.build(&script, state) else {
+                continue;
+            };
+            match candidates.iter_mut().find(|c| c.script == candidate.script) {
+                Some(existing) => {
+                    for evidence in candidate.evidence {
+                        if !existing.evidence.contains(&evidence) {
+                            existing.evidence.push(evidence);
+                        }
+                    }
+                    if candidate.score > existing.score {
+                        existing.score = candidate.score;
+                        existing.edits = candidate.edits;
+                        existing.weak = candidate.weak;
+                    }
+                }
+                None => candidates.push(candidate),
+            }
+        }
+        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+        if candidates.is_empty() {
+            return if !self.suspicions.is_empty() {
+                Outcome::InsufficientEvidence(
+                    "a token looks wrong, but no valid word is close to it".into(),
+                )
+            } else if self.unchecked {
+                Outcome::InsufficientEvidence(
+                    "some words could not be checked against the app".into(),
+                )
+            } else if let Some(failure) = self.diagnosis.operational {
+                Outcome::NoCorrection(format!(
+                    "the output points to {}, which a spelling change can't fix",
+                    failure.describe()
+                ))
+            } else {
+                Outcome::NoCorrection("every checked token is valid".into())
+            };
+        }
+        let (refused, mut allowed): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .map(|mut c| {
+                c.safety = safety::assess(&script, &c.script, &[]);
+                c
+            })
+            .partition(|c| c.safety.decision == Decision::Refuse);
+        for candidate in &refused {
+            self.note(format!(
+                "refused {}: {}",
+                candidate.script,
+                candidate.safety.reasons.join("; ")
+            ));
+        }
+        if allowed.is_empty() {
+            return Outcome::Unsafe(refused);
+        }
+        allowed.truncate(BEAM * 2);
+        let scores: Vec<f64> = allowed.iter().map(|c| c.score).collect();
+        if ranking::is_decisive(&scores) && !allowed[0].weak {
+            Outcome::Suggestion(allowed)
+        } else {
+            Outcome::Ambiguous(allowed)
+        }
+    }
+
+    /// The commands worth repairing. A single pipeline whose stage statuses
+    /// single out one failure narrows it; otherwise every command is checked.
+    fn failed_commands(&self, script: &Script) -> Vec<usize> {
+        let all: Vec<usize> = (0..script.commands.len()).collect();
+        let one_pipeline = script
+            .commands
+            .iter()
+            .skip(1)
+            .all(|c| c.connector.is_some_and(parser::Connector::is_pipe));
+        match &self.failure.pipe_status {
+            Some(status) if one_pipeline && status.len() == all.len() => {
+                let failed: Vec<usize> = all.iter().copied().filter(|&i| status[i] != 0).collect();
+                if failed.len() == 1 { failed } else { all }
+            }
+            _ => all,
+        }
+    }
+
+    fn resolve(&self, name: &str) -> Resolution {
+        if name.contains('/') {
+            return Resolution::ExplicitPath;
+        }
+        if self.ctx.shell.get_aliases().contains_key(name)
+            || self.ctx.shell.get_builtin_commands().contains(&name)
+        {
+            return Resolution::ShellDefined;
+        }
+        match self.ctx.which(name) {
+            Some(path) => Resolution::Executable(path),
+            // The shell ran something under this name (a function, say).
+            None if self.failure.exit_status.is_some_and(|s| s != 127) => Resolution::ShellDefined,
+            None => Resolution::Missing,
+        }
+    }
+
+    fn repair(&mut self, script: &Script, index: usize) -> Vec<State> {
+        let words = &script.commands[index].words;
+        let Some(p) = diagnosis::effective_program(words) else {
+            return Vec::new();
+        };
+        let Some(name) = words[p].literal() else {
+            return Vec::new();
+        };
+        let starts = match self.resolve(name) {
+            Resolution::Executable(path) => vec![State::new(name, Some(path))],
+            Resolution::ShellDefined | Resolution::ExplicitPath => return Vec::new(),
+            Resolution::Missing => self.executable_candidates(script, index, p, name),
+        };
+        let mut finished = Vec::new();
+        for start in starts {
+            let resolved_typo = !start.edits.is_empty();
+            match self.walk(script, index, p, start.clone()) {
+                Some(states) => finished.extend(states),
+                None if resolved_typo => finished.push(start),
+                None => finished.extend(self.hint_candidates(script, index, p, start)),
+            }
+        }
+        finished.retain(|s| !s.edits.is_empty());
+        finished
+    }
+
+    fn executable_candidates(
+        &mut self,
+        script: &Script,
+        index: usize,
+        p: usize,
+        name: &str,
+    ) -> Vec<State> {
+        let mut evidence = vec![(
+            NOT_ON_PATH,
+            Evidence {
+                source: Source::Executables,
+                detail: format!("`{name}` is not an installed executable, alias, or builtin"),
+            },
+        )];
+        if self.failure.exit_status == Some(127) {
+            evidence.push((
+                EXIT_127,
+                Evidence {
+                    source: Source::Executables,
+                    detail: "the shell exited with 127 (command not found)".into(),
+                },
+            ));
+        }
+        if self.diagnosis.mentions(ProblemKind::CommandNotFound, name) {
+            evidence.push((
+                OUTPUT_NAMES_IT,
+                Evidence {
+                    source: Source::Stderr,
+                    detail: format!("the output says `{name}` was not found"),
+                },
+            ));
+        }
+        let suspicion = self.suspect(index, p, TokenRole::Executable, name, evidence.clone());
+        let Some(provider) = self.executables.as_mut() else {
+            return Vec::new();
+        };
+        let slot = providers::Slot {
+            role: TokenRole::Executable,
+            program: "",
+            path: None,
+            context: &[],
+            typed: name,
+        };
+        let providers::Answer::Words(vocabulary) = provider.vocabulary(&slot, &mut self.budget)
+        else {
+            return Vec::new();
+        };
+        let ranked = within_window(ranking::rank_tokens(
+            name,
+            vocabulary.words.iter().map(|w| w.value.as_str()),
+            &self.diagnosis.suggestions,
+            BEAM,
+        ));
+        if ranked.is_empty() {
+            self.note(format!("no installed executable is close to `{name}`"));
+        }
+        let word = &script.commands[index].words[p];
+        ranked
+            .into_iter()
+            .map(|(to, score)| {
+                let mut state = State::new(to, self.ctx.which(to));
+                state.weak = suspicion < STRONG_SUSPICION;
+                state.score = score.total;
+                state
+                    .evidence
+                    .extend(evidence.iter().map(|(_, e)| e.clone()));
+                state.edits.push(TokenEdit {
+                    command: index,
+                    word: p,
+                    span: word.span,
+                    role: TokenRole::Executable,
+                    from: name.to_owned(),
+                    to: to.to_owned(),
+                    via: vocabulary.via.clone(),
+                    score,
+                });
+                state
+            })
+            .collect()
+    }
+
+    /// Asks the app's completer about one word of the walk.
+    fn check(&mut self, state: &State, role: TokenRole, typed: &str) -> Check {
+        let Some(native) = self.native.as_mut() else {
+            return Check::Unknown;
+        };
+        let slot = providers::Slot {
+            role,
+            program: &state.program,
+            path: state.path.as_ref(),
+            context: &state.context,
+            typed,
+        };
+        match native.vocabulary(&slot, &mut self.budget) {
+            providers::Answer::Words(vocabulary) => {
+                if let Some(word) = vocabulary.words.iter().find(|w| w.value == typed) {
+                    Check::Valid {
+                        takes_value: word.takes_value,
+                    }
+                } else if vocabulary.words.is_empty() {
+                    if role == TokenRole::OptionName {
+                        Check::Unknown
+                    } else {
+                        Check::Arguments
+                    }
+                } else {
+                    Check::Invalid(vocabulary)
+                }
+            }
+            providers::Answer::NotApplicable | providers::Answer::Failed(_) => Check::Unknown,
+        }
+    }
+
+    /// Checks the words after the program against the app's completer, from
+    /// the first level down, branching on close alternatives. `None` when
+    /// the program has no native backend (or native completion is off).
+    fn walk(
+        &mut self,
+        script: &Script,
+        index: usize,
+        p: usize,
+        start: State,
+    ) -> Option<Vec<State>> {
+        let native = self.native.as_mut()?;
+        native.backend(&start.program, start.path.as_ref())?;
+        let src = &script.source;
+        let words = &script.commands[index].words;
+        let mut done = Vec::new();
+        let mut frontier = vec![(start, p + 1, Level::Commands, false)];
+        while let Some((mut state, mut i, mut level, mut pending_value)) = frontier.pop() {
+            while i < words.len() {
+                if self.budget.exhausted() {
+                    self.note("probe budget exhausted; later words were not checked".into());
+                    self.unchecked = true;
+                    break;
+                }
+                let word = &words[i];
+                if pending_value {
+                    state.context.push(word.literal().unwrap_or("x").to_owned());
+                    pending_value = false;
+                    i += 1;
+                    continue;
+                }
+                let Some(text) = word.literal() else {
+                    // An expansion: its meaning is unknown, so words after it
+                    // can no longer be checked as subcommands.
+                    level = Level::Arguments;
+                    state.context.push("x".into());
+                    i += 1;
+                    continue;
+                };
+                if text == "--" {
+                    break;
+                }
+                let is_option = text.len() > 1 && text.starts_with('-');
+                if !is_option && level == Level::Arguments {
+                    state.context.push(text.to_owned());
+                    i += 1;
+                    continue;
+                }
+                let (role, typed) = if is_option {
+                    (
+                        TokenRole::OptionName,
+                        text.split('=').next().unwrap_or(text),
+                    )
+                } else {
+                    (TokenRole::Subcommand, text)
+                };
+                let vocabulary = match self.check(&state, role, typed) {
+                    Check::Valid { takes_value } => {
+                        pending_value =
+                            is_option && !text.contains('=') && takes_value != Some(false);
+                        state.context.push(text.to_owned());
+                        i += 1;
+                        continue;
+                    }
+                    Check::Arguments => {
+                        level = Level::Arguments;
+                        state.context.push(text.to_owned());
+                        i += 1;
+                        continue;
+                    }
+                    Check::Unknown if is_option => {
+                        pending_value = !text.contains('=');
+                        state.context.push(text.to_owned());
+                        i += 1;
+                        continue;
+                    }
+                    Check::Unknown => {
+                        self.unchecked = true;
+                        break;
+                    }
+                    Check::Invalid(_) if is_option && word.option_name_span(src).is_none() => {
+                        // A quoted option name can't be edited in place.
+                        pending_value = !text.contains('=');
+                        state.context.push(text.to_owned());
+                        i += 1;
+                        continue;
+                    }
+                    Check::Invalid(vocabulary) => vocabulary,
+                };
+
+                // `typed` is not valid here: branch on the closest valid words.
+                let kind = if is_option {
+                    ProblemKind::UnknownOption
+                } else {
+                    ProblemKind::UnknownCommand
+                };
+                let mut evidence = vec![(
+                    APP_REJECTS,
+                    Evidence {
+                        source: Source::NativeCompletion,
+                        detail: format!(
+                            "{} does not list `{typed}` after `{} {}`",
+                            vocabulary.via,
+                            state.program,
+                            state.context.join(" ")
+                        ),
+                    },
+                )];
+                if self.diagnosis.mentions(kind, typed) {
+                    evidence.push((
+                        OUTPUT_NAMES_IT,
+                        Evidence {
+                            source: Source::Stderr,
+                            detail: format!("the error output names `{typed}`"),
+                        },
+                    ));
+                }
+                let suspicion = self.suspect(index, i, role, typed, evidence.clone());
+                let ranked = within_window(ranking::rank_tokens(
+                    typed,
+                    vocabulary.words.iter().map(|v| v.value.as_str()),
+                    &self.diagnosis.suggestions,
+                    BEAM,
+                ));
+                if ranked.is_empty() {
+                    self.note(format!(
+                        "{}: `{typed}` is not valid after `{}`, and nothing valid is close",
+                        state.program,
+                        state.context.join(" ")
+                    ));
+                    state.score *= UNRESOLVED_PENALTY;
+                    break;
+                }
+                let span = match role {
+                    TokenRole::OptionName => word.option_name_span(src).unwrap_or(word.span),
+                    _ => word.span,
+                };
+                let mut branches: Vec<_> = ranked
+                    .into_iter()
+                    .map(|(to, score)| {
+                        let mut next = state.clone();
+                        let item = vocabulary.words.iter().find(|v| v.value == to);
+                        next.context.push(format!("{to}{}", &text[typed.len()..]));
+                        next.score *= score.total;
+                        next.weak |= suspicion < STRONG_SUSPICION;
+                        next.evidence
+                            .extend(evidence.iter().map(|(_, e)| e.clone()));
+                        next.edits.push(TokenEdit {
+                            command: index,
+                            word: i,
+                            span,
+                            role,
+                            from: typed.to_owned(),
+                            to: to.to_owned(),
+                            via: vocabulary.via.clone(),
+                            score,
+                        });
+                        let pending = is_option
+                            && !text.contains('=')
+                            && item.is_none_or(|i| i.takes_value != Some(false));
+                        (next, pending)
+                    })
+                    .collect();
+                let (first, first_pending) = branches.remove(0);
+                for (other, pending) in branches.into_iter().rev() {
+                    frontier.push((other, i + 1, level, pending));
+                }
+                state = first;
+                pending_value = first_pending;
+                i += 1;
+            }
+            done.push(state);
+        }
+        Some(done)
+    }
+
+    /// Replacements offered by the error output, for apps without a native
+    /// completer. Each occurrence of the named token is its own candidate.
+    fn hint_candidates(
+        &mut self,
+        script: &Script,
+        index: usize,
+        p: usize,
+        start: State,
+    ) -> Vec<State> {
+        if self.hints.is_none() {
+            return Vec::new();
+        }
+        let src = &script.source;
+        let words = &script.commands[index].words;
+        let problems: Vec<_> = self
+            .diagnosis
+            .problems
+            .iter()
+            .filter(|problem| {
+                matches!(
+                    problem.kind,
+                    ProblemKind::UnknownCommand | ProblemKind::UnknownOption
+                )
+            })
+            .cloned()
+            .collect();
+        let mut states = Vec::new();
+        for problem in problems {
+            let option = problem.kind == ProblemKind::UnknownOption;
+            let role = if option {
+                TokenRole::OptionName
+            } else {
+                TokenRole::Subcommand
+            };
+            let positions: Vec<usize> = (p + 1..words.len())
+                .filter(|&i| {
+                    let Some(text) = words[i].literal() else {
+                        return false;
+                    };
+                    if option {
+                        text.split('=').next() == Some(&problem.token)
+                            && words[i].option_name_span(src).is_some()
+                    } else {
+                        text == problem.token
+                    }
+                })
+                .collect();
+            for &i in &positions {
+                let evidence = vec![(
+                    OUTPUT_NAMES_IT,
+                    Evidence {
+                        source: Source::Stderr,
+                        detail: format!("the error output rejects `{}`", problem.token),
+                    },
+                )];
+                self.suspect(index, i, role, &problem.token, evidence);
+            }
+            let slot = providers::Slot {
+                role,
+                program: &start.program,
+                path: start.path.as_ref(),
+                context: &[],
+                typed: &problem.token,
+            };
+            let Some(providers::Answer::Words(vocabulary)) = self
+                .hints
+                .as_mut()
+                .map(|hints| hints.vocabulary(&slot, &mut self.budget))
+            else {
+                continue;
+            };
+            let ranked = ranking::rank_tokens(
+                &problem.token,
+                vocabulary.words.iter().map(|w| w.value.as_str()),
+                &self.diagnosis.suggestions,
+                BEAM,
+            );
+            for (n, &i) in positions.iter().enumerate() {
+                let word = &words[i];
+                for (to, score) in &ranked {
+                    let mut state = start.clone();
+                    state.score = score.total * (1.0 - LATER_OCCURRENCE_PENALTY * n as f64);
+                    state.evidence.push(Evidence {
+                        source: Source::Stderr,
+                        detail: format!(
+                            "the error output rejects `{}` and suggests `{to}`",
+                            problem.token
+                        ),
+                    });
+                    state.edits.push(TokenEdit {
+                        command: index,
+                        word: i,
+                        span: if option {
+                            word.option_name_span(src).unwrap_or(word.span)
+                        } else {
+                            word.span
+                        },
+                        role,
+                        from: problem.token.clone(),
+                        to: (*to).to_owned(),
+                        via: vocabulary.via.clone(),
+                        score: score.clone(),
+                    });
+                    states.push(state);
+                }
+            }
+        }
+        states
+    }
+
+    /// Applies a state's edits and checks that only the intended words
+    /// changed: same commands, operators, redirections, and other words.
+    fn build(&mut self, script: &Script, state: State) -> Option<Candidate> {
+        if state.edits.is_empty() {
+            return None;
+        }
+        let edits: Vec<parser::Edit> = state
+            .edits
+            .iter()
+            .map(|e| parser::Edit {
+                span: e.span,
+                replacement: parser::quote_word(&e.to),
+            })
+            .collect();
+        let source = parser::apply_edits(&script.source, &edits)?;
+        if let Err(why) = check_structure(script, &source, &state.edits) {
+            self.note(format!("rejected {source}: {why}"));
+            return None;
+        }
+        Some(Candidate {
+            script: source,
+            edits: state.edits,
+            evidence: state.evidence,
+            score: state.score,
+            safety: SafetyAssessment {
+                decision: Decision::Allow,
+                reasons: Vec::new(),
+            },
+            weak: state.weak,
+        })
+    }
+}
+
+/// Drops alternatives too far behind the best one to be worth probing.
+fn within_window<T>(mut ranked: Vec<(T, ScoreBreakdown)>) -> Vec<(T, ScoreBreakdown)> {
+    if let Some(best) = ranked.first().map(|(_, s)| s.total) {
+        ranked.retain(|(_, s)| s.total >= best - BRANCH_WINDOW);
+    }
+    ranked
+}
+
+/// Reparses an edited command line and verifies that the edits changed
+/// exactly the intended words and nothing else.
+fn check_structure(old: &Script, source: &str, edits: &[TokenEdit]) -> Result<(), String> {
+    let new = parser::parse(source);
+    if !new.is_fully_supported() {
+        return Err("the edit produced syntax that can't be analyzed".into());
+    }
+    if new.commands.len() != old.commands.len() {
+        return Err("the number of commands changed".into());
+    }
+    let literal = |script: &Script, w: &parser::Word| {
+        w.literal()
+            .map_or_else(|| format!("\0{}", w.span.of(&script.source)), str::to_owned)
+    };
+    for (n, (a, b)) in old.commands.iter().zip(&new.commands).enumerate() {
+        if a.connector != b.connector
+            || a.words.len() != b.words.len()
+            || a.assignments.len() != b.assignments.len()
+            || a.redirections.len() != b.redirections.len()
+        {
+            return Err("the command structure changed".into());
+        }
+        for (x, y) in a.assignments.iter().zip(&b.assignments) {
+            if literal(old, x) != literal(&new, y) {
+                return Err("an assignment changed".into());
+            }
+        }
+        for (x, y) in a.redirections.iter().zip(&b.redirections) {
+            let target =
+                |s: &Script, r: &parser::Redirection| r.target.as_ref().map(|t| literal(s, t));
+            if x.operator.of(&old.source) != y.operator.of(&new.source)
+                || target(old, x) != target(&new, y)
+            {
+                return Err("a redirection changed".into());
+            }
+        }
+        for (i, (x, y)) in a.words.iter().zip(&b.words).enumerate() {
+            let expected = match edits.iter().find(|e| e.command == n && e.word == i) {
+                Some(edit) if edit.role == TokenRole::OptionName => {
+                    let old_text = literal(old, x);
+                    format!(
+                        "{}{}",
+                        edit.to,
+                        &old_text[edit.from.len().min(old_text.len())..]
+                    )
+                }
+                Some(edit) => edit.to.clone(),
+                None => literal(old, x),
+            };
+            if literal(&new, y) != expected {
+                return Err(format!("word {i} would read `{}`", literal(&new, y)));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::native::tests::Dir;
+    use super::*;
+    use crate::settings::Settings;
+    use std::fs;
+
+    /// An aws_completer double that answers from a `tree` file of
+    /// `<context glob>|<word>` lines, so tests can change the app's
+    /// command surface between requests.
+    const TREE_COMPLETER: &str = r#"#!/bin/sh
+# awscli test double
+line=${COMP_LINE#aws }
+prefix=${line##* }
+context=${line% *}
+[ "$context" = "$line" ] && context=
+# Like the real completer, global options don't change the level.
+case $context in
+  "--region "*) rest=${context#--region }
+    case $rest in *" "*) context=${rest#* };; *) context=;; esac;;
+esac
+while IFS='|' read -r pattern word; do
+  case $context in
+    $pattern) case $word in "$prefix"*) printf '%s\n' "$word";; esac;;
+  esac
+done < "$(dirname "$0")/tree"
+"#;
+
+    const TREE: &str = "|ec2\n|s3\n|sts\n|--region\n|--profile\n\
+ec2|describe-instances\nec2|describe-instance-status\nec2|run-instances\nec2|terminate-instances\n\
+ec2 *-instances*|--instance-ids\nec2 *-instances*|--region\nec2 *-instances*|--dry-run\n";
+
+    struct Fake {
+        dir: Dir,
+        aws: PathBuf,
+    }
+
+    fn fake_aws() -> Fake {
+        let dir = Dir::new("engine");
+        let aws = dir.script("bin/aws", "#!/bin/sh\ntouch \"$(dirname \"$0\")/ran\"\n");
+        dir.script("bin/aws_completer", TREE_COMPLETER);
+        fs::write(dir.0.join("bin/tree"), TREE).unwrap();
+        Fake { dir, aws }
+    }
+
+    fn context(fake: &Fake) -> Context {
+        Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_executables(&["aws", "git", "grep", "gzip", "ls"])
+            .with_which("aws", Some(fake.aws.to_str().unwrap()))
+            .with_which("git", Some("/usr/bin/git"))
+            .with_which("ls", Some("/bin/ls"))
+            .with_which("gti", None)
+            .with_which("jq", Some("/usr/bin/jq"))
+    }
+
+    fn failure(source: &str) -> FailureContext {
+        FailureContext {
+            source: source.into(),
+            ..FailureContext::default()
+        }
+    }
+
+    fn scripts(outcome: &Outcome) -> Vec<&str> {
+        outcome
+            .candidates()
+            .iter()
+            .map(|c| c.script.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn native_completion_repairs_operations_and_options() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let report = correct(
+            &failure("aws ec2 describ-instances --regoin eu-west-1"),
+            &ctx,
+        );
+        let Outcome::Suggestion(candidates) = &report.outcome else {
+            panic!("{:?} {:?}", report.outcome, report.notes);
+        };
+        assert_eq!(
+            candidates[0].script,
+            "aws ec2 describe-instances --region eu-west-1"
+        );
+        assert_eq!(candidates[0].edits.len(), 2);
+        assert!(
+            candidates[0]
+                .evidence
+                .iter()
+                .all(|e| e.source == Source::NativeCompletion)
+        );
+        assert_eq!(candidates[0].safety.decision, Decision::Allow);
+        assert!(
+            !fake.dir.0.join("bin/ran").exists(),
+            "discovery must not run the app's failed operation"
+        );
+        assert!(report.probes <= 3, "{} probes", report.probes);
+    }
+
+    #[test]
+    fn only_the_diagnosed_token_changes() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let source = "AWS_PAGER='' aws ec2 describ-instances --region=eu-west-1 | jq '.x y' > \"out file\" # note";
+        let report = correct(&failure(source), &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "AWS_PAGER='' aws ec2 describe-instances --region=eu-west-1 | jq '.x y' > \"out file\" # note"
+        );
+    }
+
+    #[test]
+    fn new_operations_are_used_without_code_changes() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let source = "aws ec2 describe-capacity-blocks";
+        assert!(matches!(
+            correct(&failure(source), &ctx).outcome,
+            Outcome::Suggestion(_) | Outcome::Ambiguous(_) | Outcome::InsufficientEvidence(_)
+        ));
+        // The installed CLI gains an operation: the same request now validates.
+        let tree = fs::read_to_string(fake.dir.0.join("bin/tree")).unwrap();
+        fs::write(
+            fake.dir.0.join("bin/tree"),
+            format!("{tree}ec2|describe-capacity-blocks\n"),
+        )
+        .unwrap();
+        let report = correct(&failure(source), &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::NoCorrection(_)),
+            "{:?}",
+            report.outcome
+        );
+        let report = correct(&failure("aws ec2 describe-capacity-block"), &ctx);
+        assert_eq!(scripts(&report.outcome)[0], source);
+    }
+
+    #[test]
+    fn missing_executables_need_shell_evidence_to_be_decisive() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let mut f = failure("gti status");
+        let weak = correct(&f, &ctx);
+        assert!(
+            matches!(weak.outcome, Outcome::Ambiguous(_)),
+            "{:?}",
+            weak.outcome
+        );
+        assert_eq!(scripts(&weak.outcome)[0], "git status");
+        assert!(weak.suspicions[0].score < STRONG_SUSPICION);
+        f.exit_status = Some(127);
+        let strong = correct(&f, &ctx);
+        assert_eq!(strong.suspicions.len(), 1);
+        assert_eq!(strong.suspicions[0].role, TokenRole::Executable);
+        assert!(strong.suspicions[0].score > STRONG_SUSPICION);
+        assert!(
+            matches!(strong.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            strong.outcome
+        );
+        assert_eq!(scripts(&strong.outcome)[0], "git status");
+        f.exit_status = Some(1);
+        assert!(matches!(
+            correct(&f, &ctx).outcome,
+            Outcome::NoCorrection(_)
+        ));
+    }
+
+    #[test]
+    fn misspelled_app_names_continue_into_native_completion() {
+        let fake = fake_aws();
+        let ctx = context(&fake).with_which("asw", None);
+        let mut f = failure("asw ec2 describ-instances");
+        f.exit_status = Some(127);
+        let report = correct(&f, &ctx);
+        assert_eq!(scripts(&report.outcome)[0], "aws ec2 describe-instances");
+    }
+
+    #[test]
+    fn error_output_hints_help_apps_without_native_completion() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let mut f = failure("ls --colro=auto");
+        f.output = CapturedOutput::Combined {
+            text: "ls: unrecognized option '--colro=auto'\nTry 'ls --help' for more information."
+                .into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        assert!(matches!(
+            correct(&f, &ctx).outcome,
+            Outcome::InsufficientEvidence(_)
+        ));
+        f.output = CapturedOutput::Combined {
+            text: "ls: unrecognized option '--colro=auto'\nDid you mean --color?".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&f, &ctx);
+        assert_eq!(scripts(&report.outcome), ["ls --color=auto"]);
+        let mut f = failure("git sttus sttus");
+        f.output = CapturedOutput::Combined {
+            text: "git: 'sttus' is not a git command. See 'git --help'.\n\nThe most similar command is\n\tstatus\n".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&f, &ctx);
+        assert_eq!(scripts(&report.outcome)[0], "git status sttus");
+    }
+
+    #[test]
+    fn printed_hints_cannot_inject_commands() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let mut f = failure("git sttus");
+        f.output = CapturedOutput::Combined {
+            text: "git: 'sttus' is not a git command.\nDid you mean 'sttus;rm'?".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&f, &ctx);
+        for script in scripts(&report.outcome) {
+            assert_eq!(parser::parse(script).commands.len(), 1, "{script}");
+        }
+    }
+
+    #[test]
+    fn risky_and_unsupported_cases_have_explicit_outcomes() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let report = correct(&failure("aws ec2 terminat-instances"), &ctx);
+        let candidate = &report.outcome.candidates()[0];
+        assert_eq!(candidate.script, "aws ec2 terminate-instances");
+        assert_eq!(candidate.safety.decision, Decision::Confirm);
+        assert!(matches!(
+            correct(&failure("if true; then gti; fi"), &ctx).outcome,
+            Outcome::UnsupportedSyntax(_)
+        ));
+        let fish = Context::new(Settings::default(), Shell::Fish, "fuck".into());
+        assert!(matches!(
+            correct(&failure("gti status"), &fish).outcome,
+            Outcome::UnsupportedSyntax(_)
+        ));
+        let mut f = failure("aws sts get-caller-identity");
+        f.output = CapturedOutput::Combined {
+            text: "Unable to locate credentials.".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let tree = fs::read_to_string(fake.dir.0.join("bin/tree")).unwrap();
+        fs::write(
+            fake.dir.0.join("bin/tree"),
+            format!("{tree}sts|get-caller-identity\n"),
+        )
+        .unwrap();
+        let report = correct(&f, &ctx);
+        assert!(
+            matches!(&report.outcome, Outcome::NoCorrection(why) if why.contains("authentication")),
+            "{:?}",
+            report.outcome
+        );
+    }
+
+    /// An argcomplete app (gcloud or az flavored) answering on fd 8 from a
+    /// tree file, which tests rewrite to install new groups or extensions.
+    fn fake_argcomplete(app: &str) -> (Dir, PathBuf) {
+        let dir = Dir::new(app);
+        let marker = if app == "az" {
+            "# azure.cli test double"
+        } else {
+            ""
+        };
+        let path = dir.script(
+            &format!("sdk/bin/{app}"),
+            &format!(
+                "#!/bin/sh\n{marker}\n[ \"$_ARGCOMPLETE\" = 1 ] || {{ touch \"$(dirname \"$0\")/ran\"; exit 0; }}\n\
+line=${{COMP_LINE#{app} }}\nprefix=${{line##* }}\ncontext=${{line% *}}\n[ \"$context\" = \"$line\" ] && context=\n\
+while IFS='|' read -r pattern word; do\n  case $context in\n    $pattern) case $word in \"$prefix\"*) printf '%s\\v' \"$word\" >&8;; esac;;\n  esac\n\
+done < \"$(dirname \"$0\")/tree\"\n"
+            ),
+        );
+        fs::create_dir_all(dir.0.join("sdk/lib/googlecloudsdk")).unwrap();
+        fs::write(
+            dir.0.join("sdk/bin/tree"),
+            "|storage\n|vm\nstorage|account\nstorage|blob\nstorage account|list\nstorage account|create\n\
+storage account *|--resource-group=\nstorage account *|--verbose\n",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn argcomplete_apps_reflect_newly_installed_groups() {
+        for app in ["gcloud", "az"] {
+            let (dir, path) = fake_argcomplete(app);
+            let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+                .with_which(app, Some(path.to_str().unwrap()));
+            let report = correct(
+                &failure(&format!("{app} storage acount list --resorce-group=rg")),
+                &ctx,
+            );
+            assert_eq!(
+                scripts(&report.outcome)[0],
+                format!("{app} storage account list --resource-group=rg"),
+                "{app}: {:?}",
+                report.notes
+            );
+            // An extension adds a group: it is accepted and repaired at once.
+            let typo = format!("{app} containerap up");
+            assert!(!matches!(
+                correct(&failure(&typo), &ctx).outcome,
+                Outcome::Suggestion(_)
+            ));
+            let tree = fs::read_to_string(dir.0.join("sdk/bin/tree")).unwrap();
+            fs::write(
+                dir.0.join("sdk/bin/tree"),
+                format!("{tree}|containerapp\ncontainerapp|up\n"),
+            )
+            .unwrap();
+            let report = correct(&failure(&typo), &ctx);
+            assert_eq!(
+                scripts(&report.outcome)[0],
+                format!("{app} containerapp up"),
+                "{app}: {:?}",
+                report.notes
+            );
+            assert!(
+                !dir.0.join("sdk/bin/ran").exists(),
+                "{app} ran an operation"
+            );
+        }
+    }
+
+    #[test]
+    fn global_options_before_subcommands_keep_their_values() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let report = correct(
+            &failure("aws --region eu-west-1 ec2 describ-instances"),
+            &ctx,
+        );
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "aws --region eu-west-1 ec2 describe-instances"
+        );
+    }
+
+    #[test]
+    fn a_broken_completer_is_not_mistaken_for_valid_input() {
+        let fake = fake_aws();
+        fs::remove_file(fake.dir.0.join("bin/tree")).unwrap();
+        let ctx = context(&fake);
+        let report = correct(&failure("aws ec2 describ-instances"), &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::InsufficientEvidence(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert!(report.notes.iter().any(|n| n.contains("failed")));
+    }
+
+    #[test]
+    fn disabled_sources_are_reported() {
+        let fake = fake_aws();
+        let settings = Settings {
+            disabled_sources: vec!["native".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("aws", Some(fake.aws.to_str().unwrap()));
+        let report = correct(&failure("aws ec2 describ-instances"), &ctx);
+        assert!(report.outcome.candidates().is_empty());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("native source is disabled"))
+        );
+        assert_eq!(report.probes, 0);
+    }
+
+    #[test]
+    fn pipeline_status_narrows_the_failed_stage() {
+        let fake = fake_aws();
+        let ctx = context(&fake).with_which("gerp", None);
+        let mut f = failure("gti log | gerp x");
+        f.pipe_status = Some(vec![0, 127]);
+        f.exit_status = Some(127);
+        let report = correct(&f, &ctx);
+        for candidate in report.outcome.candidates() {
+            assert!(
+                candidate.script.starts_with("gti log | "),
+                "{}",
+                candidate.script
+            );
+        }
+    }
+}

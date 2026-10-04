@@ -283,7 +283,7 @@ pub fn run_output(program: &str, args: &[&str]) -> Option<(String, String)> {
     ))
 }
 
-fn cache_dir() -> PathBuf {
+pub(crate) fn cache_dir() -> PathBuf {
     match env::var("XDG_CACHE_HOME") {
         Ok(d) if !d.is_empty() => PathBuf::from(d).join("notypo"),
         _ => expand_user("~/.cache/notypo"),
