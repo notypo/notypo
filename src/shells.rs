@@ -143,6 +143,7 @@ impl Shell {
                 "
             function {name} () {{
                 local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${{PIPESTATUS[*]}}\";
+                local -x NOTYPO_SHELL_FUNCTIONS=\"$(compgen -A function -X '_*')\";
                 export TF_SHELL=bash;
                 export TF_ALIAS={name};
                 export TF_SHELL_ALIASES=$(alias);
@@ -164,6 +165,7 @@ impl Shell {
                 "
             {name} () {{
                 local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${{pipestatus[*]}}\";
+                local -x NOTYPO_SHELL_FUNCTIONS=\"${{(k)functions[(I)[^_]*]}}\";
                 local -x NOTYPO_CURRENT_COMMAND=\"${{history[$HISTCMD]-}}\";
                 export TF_SHELL=zsh;
                 export TF_ALIAS={name};
@@ -264,6 +266,22 @@ impl Shell {
             "export THEFUCK_INSTANT_MODE=True;\nexport THEFUCK_OUTPUT_LOG={path};\n{} --shell-logger {path};\nrm -f {path};\nexit",
             self.quote(exe)
         )
+    }
+
+    /// Names of shell functions the shell function passed along (bash and
+    /// zsh; fish functions are among [`Shell::get_aliases`]), without the
+    /// `_`-prefixed completion helpers. Memoized for the process.
+    pub fn get_functions(self) -> &'static std::collections::HashSet<String> {
+        static FUNCTIONS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+        FUNCTIONS.get_or_init(|| match self {
+            Shell::Bash | Shell::Zsh => env::var("NOTYPO_SHELL_FUNCTIONS")
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter(|name| !DEFAULT_ALIASES.contains(name))
+                .map(str::to_owned)
+                .collect(),
+            _ => Default::default(),
+        })
     }
 
     /// Shell aliases (and fish functions), memoized for the process.

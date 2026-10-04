@@ -302,6 +302,7 @@ fn revalidate(ctx: &Context, report: &Report, selected: &Choice) -> Result<(), S
         if edit.role != engine::TokenRole::Executable
             || ctx.shell.get_builtin_commands().contains(&edit.to.as_str())
             || ctx.shell.get_aliases().contains_key(&edit.to)
+            || ctx.shell.get_functions().contains(&edit.to)
         {
             continue;
         }

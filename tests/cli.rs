@@ -439,6 +439,58 @@ fn json_reports_the_diagnosis_for_automation() {
     assert!(!bin.join("ran").exists());
 }
 
+/// The alias passes the shell's function names: a function is a valid
+/// command, and a misspelled one is corrected to it.
+#[test]
+fn shell_aliases_pass_function_names() {
+    for shell in ["bash", "zsh"] {
+        let Some(path) = notypo::utils::which(shell) else {
+            continue;
+        };
+        let workspace = Workspace::new();
+        let output = finish(
+            workspace
+                .command("")
+                .env("TF_SHELL", shell)
+                .arg("--alias")
+                .spawn()
+                .unwrap(),
+        );
+        let alias = String::from_utf8(output.stdout).unwrap();
+        let (flags, seed): (&[&str], _) = if shell == "bash" {
+            (
+                &["--norc", "--noprofile", "-i", "-c"],
+                "set -o history\nhistory -s 'deploy_site now'",
+            )
+        } else {
+            (
+                &["-f", "-i", "-c"],
+                "HISTSIZE=50\nfc -p\nprint -s -- 'deploy_site now'",
+            )
+        };
+        let script = format!(
+            "{alias}\ndeploy_app() {{ echo \"deployed $1\"; }}\n{seed}\ndeploy_site now\nfuck -y\n"
+        );
+        let output = finish(
+            workspace
+                .program(&path, "")
+                .env("TF_SHELL", shell)
+                .env("PATH", workspace.0.join("bin"))
+                .env("HISTFILE", workspace.0.join("history"))
+                .args(flags)
+                .arg(&script)
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "deployed now\n",
+            "{shell}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// The alias hands the failed command's exit status (127) to the engine,
 /// which makes the missing-executable diagnosis strong enough for `-y`.
 #[test]

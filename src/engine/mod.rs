@@ -618,6 +618,7 @@ impl<'a> Run<'a> {
             return Resolution::ExplicitPath;
         }
         if self.ctx.shell.get_aliases().contains_key(name)
+            || self.ctx.shell.get_functions().contains(name)
             || self.ctx.shell.get_builtin_commands().contains(&name)
         {
             return Resolution::ShellDefined;

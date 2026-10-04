@@ -83,7 +83,8 @@ impl Context {
     }
 
     /// `get_all_executables()`: names in non-excluded `$PATH` directories
-    /// (minus our entry points) followed by shell aliases (minus our alias).
+    /// (minus our entry points) followed by shell aliases and functions
+    /// (minus our alias).
     pub fn executables(&self) -> &[String] {
         self.executables.get_or_init(|| {
             let mut seen = HashSet::new();
@@ -97,6 +98,7 @@ impl Context {
                 .shell
                 .get_aliases()
                 .keys()
+                .chain(self.shell.get_functions())
                 .filter(|a| **a != self.alias)
                 .cloned();
             bins.chain(aliases)
