@@ -50,16 +50,25 @@ pub struct OutputDiagnosis {
 }
 
 impl OutputDiagnosis {
+    /// Whether the output names `token` as a problem of `kind`. Options are
+    /// compared without dashes: git prints ``unknown option `amend'``.
     pub fn mentions(&self, kind: ProblemKind, token: &str) -> bool {
+        let bare = |t: &str| {
+            if kind == ProblemKind::UnknownOption {
+                t.trim_start_matches('-').to_owned()
+            } else {
+                t.to_owned()
+            }
+        };
         self.problems
             .iter()
-            .any(|p| p.kind == kind && p.token == token)
+            .any(|p| p.kind == kind && bare(&p.token) == bare(token))
     }
 }
 
 pub fn diagnose_output(output: &str) -> OutputDiagnosis {
     let mut diagnosis = OutputDiagnosis::default();
-    let patterns: [(ProblemKind, &regex::Regex); 18] = [
+    let patterns: [(ProblemKind, &regex::Regex); 20] = [
         (
             ProblemKind::CommandNotFound,
             regex!(r"(?m)(?:^|: )(?:line \d+: |\d+: )?([^\s:'`]+): (?:command )?not found\s*$"),
@@ -109,6 +118,14 @@ pub fn diagnose_output(output: &str) -> OutputDiagnosis {
         (
             ProblemKind::UnknownOption,
             regex!(r"(?i)unknown options?: (-[^\s,=]+)"),
+        ),
+        (
+            ProblemKind::UnknownOption,
+            regex!(r"(?i)unknown (?:option|switch) `([^'\s=]+)'"),
+        ),
+        (
+            ProblemKind::UnknownOption,
+            regex!(r"(?i)unrecognized argument: (-[^\s=]+)"),
         ),
         (
             ProblemKind::UnknownOption,
@@ -409,6 +426,16 @@ mod tests {
                 "error: unexpected argument '--relese' found",
                 ProblemKind::UnknownOption,
                 "--relese",
+            ),
+            (
+                "error: unknown option `amen'",
+                ProblemKind::UnknownOption,
+                "--amen",
+            ),
+            (
+                "fatal: unrecognized argument: --grpah",
+                ProblemKind::UnknownOption,
+                "--grpah",
             ),
             (
                 "cat: fiel.txt: No such file or directory",

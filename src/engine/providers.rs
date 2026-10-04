@@ -5,6 +5,7 @@
 //! system itself (the app's completer, the `$PATH` listing): words outside
 //! it are invalid, and other sources may only raise scores within it.
 
+use super::cache::CompletionCache;
 use super::native::{self, CompletionError, CompletionItem, Discovery, NativeCompletionBackend};
 use super::probe::Budget;
 use super::{Source, TokenRole};
@@ -22,6 +23,8 @@ pub struct Slot<'s> {
     /// The words between the program and the slot, as corrected so far.
     pub context: &'s [String],
     pub typed: &'s str,
+    /// Ask the app itself, not a cached answer.
+    pub fresh: bool,
 }
 
 /// Valid words one provider knows for a slot.
@@ -32,6 +35,8 @@ pub struct Vocabulary {
     pub authoritative: bool,
     /// Who answered, such as `aws completion`.
     pub via: String,
+    /// The answer came from the on-disk cache and may be out of date.
+    pub cached: bool,
 }
 
 impl Vocabulary {
@@ -87,17 +92,21 @@ impl CandidateProvider for Executables<'_> {
             words,
             authoritative: true,
             via: "installed executables".into(),
+            cached: false,
         })
     }
 }
 
-/// Completer answers by (program, context words, prefix), within one run.
-type Memo = HashMap<(String, Vec<String>, String), Result<Vec<CompletionItem>, CompletionError>>;
+/// Completer answers by (program, context words, prefix) within one run,
+/// and whether each came from the disk cache.
+type Memo =
+    HashMap<(String, Vec<String>, String), (Result<Vec<CompletionItem>, CompletionError>, bool)>;
 
 /// The installed app's own completer, for its subcommands and options.
 pub struct NativeCompletion<'c> {
     pub trusted: &'c [String],
     backends: HashMap<String, Option<native::Backend>>,
+    caches: HashMap<String, Option<CompletionCache>>,
     memo: Memo,
     notes: Vec<String>,
 }
@@ -107,9 +116,27 @@ impl<'c> NativeCompletion<'c> {
         NativeCompletion {
             trusted,
             backends: HashMap::new(),
+            caches: HashMap::new(),
             memo: HashMap::new(),
             notes: Vec::new(),
         }
+    }
+
+    /// Writes new answers to the disk cache.
+    pub fn persist(&mut self) {
+        for cache in self.caches.values_mut().flatten() {
+            cache.save();
+        }
+    }
+
+    fn cache(&mut self, program: &str, backend: &native::Backend) -> Option<&mut CompletionCache> {
+        self.caches
+            .entry(program.to_owned())
+            .or_insert_with(|| {
+                let identity = backend.cache_identity()?;
+                CompletionCache::open(backend.id(), &identity)
+            })
+            .as_mut()
     }
 
     fn note(&mut self, note: String) {
@@ -162,6 +189,10 @@ impl CandidateProvider for NativeCompletion<'_> {
         };
         // An empty prefix enumerates the level; a dash prefix its options.
         let options = slot.role == TokenRole::OptionName;
+        let short = slot.typed.len() > 1 && !slot.typed.starts_with("--");
+        if options && short && !backend.capabilities().short_options {
+            return Answer::NotApplicable;
+        }
         let prefix = if options {
             backend.capabilities().option_prefix
         } else {
@@ -172,15 +203,30 @@ impl CandidateProvider for NativeCompletion<'_> {
             slot.context.to_vec(),
             prefix.to_owned(),
         );
-        let result = match self.memo.get(&key) {
-            Some(hit) => hit.clone(),
-            None => {
-                let words: Vec<&str> = slot.context.iter().map(String::as_str).collect();
-                let result = backend.complete(&words, prefix, budget);
-                self.memo.insert(key, result.clone());
-                result
+        let disk_key = format!("{}\x1e{prefix}", slot.context.join("\x1f"));
+        let (result, cached) = match self.memo.get(&key) {
+            Some((hit, cached)) if !(slot.fresh && *cached) => (hit.clone(), *cached),
+            _ => {
+                let from_disk = (!slot.fresh)
+                    .then(|| self.cache(slot.program, &backend))
+                    .flatten()
+                    .and_then(|cache| cache.get(&disk_key).map(<[_]>::to_vec));
+                match from_disk {
+                    Some(items) => (Ok(items), true),
+                    None => {
+                        let words: Vec<&str> = slot.context.iter().map(String::as_str).collect();
+                        let result = backend.complete(&words, prefix, budget);
+                        if let Ok(items) = &result
+                            && let Some(cache) = self.cache(slot.program, &backend)
+                        {
+                            cache.put(disk_key, items.clone());
+                        }
+                        (result, false)
+                    }
+                }
             }
         };
+        self.memo.insert(key, (result.clone(), cached));
         let via = format!("{} completion", backend.id());
         match result {
             Ok(items) => Answer::Words(Vocabulary {
@@ -188,8 +234,9 @@ impl CandidateProvider for NativeCompletion<'_> {
                     .into_iter()
                     .filter(|i| i.is_option() == options)
                     .collect(),
-                authoritative: true,
+                authoritative: !options || backend.capabilities().complete_options,
                 via,
+                cached,
             }),
             // The protocol has no data for this position (gcloud's static
             // tree and positionals): nothing here is a subcommand.
@@ -197,6 +244,7 @@ impl CandidateProvider for NativeCompletion<'_> {
                 words: Vec::new(),
                 authoritative: true,
                 via,
+                cached: false,
             }),
             Err(error) => {
                 self.note(format!(
@@ -243,6 +291,7 @@ impl CandidateProvider for ErrorHints {
             words,
             authoritative: false,
             via: "error output".into(),
+            cached: false,
         })
     }
 }

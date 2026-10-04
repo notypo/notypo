@@ -12,9 +12,14 @@
 
 use super::probe::{self, Budget, Capture, Probe, ProbeError};
 use crate::shlex;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::{env, fs};
+
+mod git;
 
 /// One valid word for a position, as reported by the app.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +67,12 @@ pub struct Capabilities {
     pub resources: bool,
     /// The prefix that enumerates every option at a position.
     pub option_prefix: &'static str,
+    /// Short options (`-m`) are listed too; otherwise an unlisted short
+    /// option says nothing about validity.
+    pub short_options: bool,
+    /// Option lists include every option. git's helper omits options parsed
+    /// outside its option table (`git log --graph`).
+    pub complete_options: bool,
 }
 
 pub trait NativeCompletionBackend: std::fmt::Debug {
@@ -89,15 +100,83 @@ pub enum Flavor {
     Azure,
     /// Any Python app declaring `PYTHON_ARGCOMPLETE_OK` (opt-in).
     Argcomplete,
+    /// git's `--list-cmds` and `--git-completion-helper` (see [`git`]).
+    Git,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Raw probe answers within one run, keyed by the arguments that asked.
+type ProbeMemo = Rc<RefCell<HashMap<Vec<String>, Result<String, CompletionError>>>>;
+
+#[derive(Clone, Debug)]
 pub struct Backend {
     pub flavor: Flavor,
     /// The name the app is invoked by on the command line.
     pub name: String,
     /// The executable that answers completion queries.
     pub completer: PathBuf,
+    memo: ProbeMemo,
+}
+
+impl PartialEq for Backend {
+    fn eq(&self, other: &Self) -> bool {
+        (self.flavor, &self.name, &self.completer) == (other.flavor, &other.name, &other.completer)
+    }
+}
+
+impl Eq for Backend {}
+
+impl Backend {
+    pub fn new(flavor: Flavor, name: &str, completer: PathBuf) -> Backend {
+        Backend {
+            flavor,
+            name: name.to_owned(),
+            completer,
+            memo: ProbeMemo::default(),
+        }
+    }
+
+    /// What identifies this installation's answers in the disk cache:
+    /// completer and app files, extension and component directories.
+    /// `None` when answers depend on the working directory (git reads
+    /// aliases from the repository's configuration).
+    pub fn cache_identity(&self) -> Option<String> {
+        if self.flavor == Flavor::Git {
+            return None;
+        }
+        let real = fs::canonicalize(&self.completer).ok();
+        let mut files = vec![self.completer.clone()];
+        files.extend(real.clone());
+        match self.flavor {
+            Flavor::Gcloud => {
+                if let Some(root) = real
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .and_then(Path::parent)
+                {
+                    files.push(root.join(".install"));
+                    files.push(root.join("VERSION"));
+                }
+            }
+            Flavor::Azure => files.push(azure_extension_dir()),
+            _ => {}
+        }
+        Some(super::cache::fingerprint(&files, &[self.id(), &self.name]))
+    }
+
+    /// Runs `probe` once per run for the same `key`.
+    fn memoized(
+        &self,
+        key: &[&str],
+        probe: impl FnOnce() -> Result<String, CompletionError>,
+    ) -> Result<String, CompletionError> {
+        let key: Vec<String> = key.iter().map(|k| k.to_string()).collect();
+        if let Some(hit) = self.memo.borrow().get(&key) {
+            return hit.clone();
+        }
+        let result = probe();
+        self.memo.borrow_mut().insert(key, result.clone());
+        result
+    }
 }
 
 /// The outcome of looking for an app's completion entry point.
@@ -123,14 +202,10 @@ pub fn discover(name: &str, path: &Path, trusted: &[String]) -> Discovery {
         ));
     }
     let name = app_name(name);
-    let found = |flavor, completer: PathBuf| {
-        Discovery::Found(Backend {
-            flavor,
-            name: name.to_owned(),
-            completer,
-        })
-    };
+    let found =
+        |flavor, completer: PathBuf| Discovery::Found(Backend::new(flavor, name, completer));
     match name {
+        "git" => found(Flavor::Git, path.to_owned()),
         "aws" => match aws_completer(path) {
             Some(completer) => found(Flavor::AwsCompleter, completer),
             None => Discovery::None,
@@ -156,11 +231,7 @@ fn argcomplete(flavor: Flavor, name: &str, path: &Path) -> Discovery {
             "the argcomplete protocol writes to file descriptor 8, which Windows lacks".into(),
         );
     }
-    Discovery::Found(Backend {
-        flavor,
-        name: name.to_owned(),
-        completer: path.to_owned(),
-    })
+    Discovery::Found(Backend::new(flavor, name, path.to_owned()))
 }
 
 /// The program name without directories or a Windows executable extension.
@@ -270,11 +341,7 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
         Flavor::Azure => {
             // A private config directory has no login, so resource completers
             // can't authenticate; extensions still come from the user's dir.
-            let user_config = env::var_os("AZURE_CONFIG_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| crate::utils::expand_user("~/.azure"));
-            let extensions = env::var_os("AZURE_EXTENSION_DIR")
-                .unwrap_or_else(|| user_config.join("cliextensions").into_os_string());
+            let extensions = azure_extension_dir().into_os_string();
             let config = crate::utils::cache_dir().join("azure");
             let _ = fs::create_dir_all(&config);
             env.extend([
@@ -284,9 +351,57 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
                 set("AZURE_CORE_NO_COLOR", "true"),
             ]);
         }
-        Flavor::Argcomplete => {}
+        Flavor::Argcomplete | Flavor::Git => {}
     }
     env
+}
+
+/// Runs a completion helper with explicit arguments and returns its stdout.
+fn run_stdout(
+    program: &Path,
+    args: Vec<OsString>,
+    env: Vec<(OsString, Option<OsString>)>,
+    budget: &mut Budget,
+    require_success: bool,
+) -> Result<String, CompletionError> {
+    let output = probe::run(
+        &Probe {
+            program,
+            args,
+            env,
+            capture: Capture::Stdout,
+        },
+        budget,
+    )
+    .map_err(probe_error)?;
+    if require_success && output.status != Some(0) {
+        return Err(CompletionError::Failed(format!(
+            "exited with {:?}",
+            output.status
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.data).into_owned())
+}
+
+fn probe_error(error: ProbeError) -> CompletionError {
+    match error {
+        ProbeError::BudgetExhausted => CompletionError::BudgetExhausted,
+        ProbeError::Unsupported(why) => CompletionError::Unsupported(why.into()),
+        other => CompletionError::Failed(other.to_string()),
+    }
+}
+
+/// Where the user's Azure CLI extensions are installed.
+fn azure_extension_dir() -> PathBuf {
+    env::var_os("AZURE_EXTENSION_DIR").map_or_else(
+        || {
+            env::var_os("AZURE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| crate::utils::expand_user("~/.azure"))
+                .join("cliextensions")
+        },
+        PathBuf::from,
+    )
 }
 
 /// The completion line: the app name, the words so far, and the prefix.
@@ -308,6 +423,7 @@ impl NativeCompletionBackend for Backend {
             Flavor::Gcloud => "gcloud",
             Flavor::Azure => "az",
             Flavor::Argcomplete => "argcomplete",
+            Flavor::Git => "git",
         }
     }
 
@@ -315,15 +431,17 @@ impl NativeCompletionBackend for Backend {
         Capabilities {
             subcommands: true,
             options: true,
-            option_arity: self.flavor == Flavor::Gcloud,
+            option_arity: matches!(self.flavor, Flavor::Gcloud | Flavor::Git),
             values: false,
             resources: false,
             // gcloud's static tree only matches `--`; argparse apps list
-            // every option (short ones too) for `-`.
+            // every option (short ones too) for `-`; git lists long ones.
             option_prefix: match self.flavor {
                 Flavor::AwsCompleter | Flavor::Gcloud => "--",
-                Flavor::Azure | Flavor::Argcomplete => "-",
+                Flavor::Azure | Flavor::Argcomplete | Flavor::Git => "-",
             },
+            short_options: matches!(self.flavor, Flavor::Azure | Flavor::Argcomplete),
+            complete_options: self.flavor != Flavor::Git,
         }
     }
 
@@ -333,11 +451,19 @@ impl NativeCompletionBackend for Backend {
         prefix: &str,
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
+        if self.flavor == Flavor::Git {
+            let items = git::complete(self, words, prefix, budget)?;
+            return Ok(items
+                .into_iter()
+                .filter(|i| i.value.starts_with(prefix))
+                .take(budget.max_candidates)
+                .collect());
+        }
         let line = completion_line(&self.name, words, prefix);
         // aws_completer and gcloud's lookup slice the line as Python text;
         // argcomplete expects the byte offset bash supplies.
         let point = match self.flavor {
-            Flavor::AwsCompleter | Flavor::Gcloud => line.chars().count(),
+            Flavor::AwsCompleter | Flavor::Gcloud | Flavor::Git => line.chars().count(),
             Flavor::Azure | Flavor::Argcomplete => line.len(),
         };
         let mut env = offline_env(self.flavor);
@@ -366,11 +492,7 @@ impl NativeCompletionBackend for Backend {
             },
             budget,
         )
-        .map_err(|error| match error {
-            ProbeError::BudgetExhausted => CompletionError::BudgetExhausted,
-            ProbeError::Unsupported(why) => CompletionError::Unsupported(why.into()),
-            other => CompletionError::Failed(other.to_string()),
-        })?;
+        .map_err(probe_error)?;
         if output.status != Some(0) {
             return Err(match self.flavor {
                 // With tracing on, the static tree raises for positions it
@@ -471,6 +593,24 @@ pub(crate) mod tests {
     fn budget() -> Budget {
         Budget::new(Duration::from_secs(20), Duration::from_secs(10), 16)
     }
+
+    /// A git double that records every invocation, so tests can check that
+    /// only listing and helper calls on builtins ever happen.
+    pub(crate) const FAKE_GIT: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+echo "$*" >> "$dir/calls"
+case "$*" in
+  "--list-cmds=main,others,alias,nohelpers") printf 'add\ncommit\nstatus\nstash\npush\nco\n';;
+  "--list-cmds=builtins") printf 'add\ncommit\nstatus\nstash\npush\n';;
+  "-h") printf 'usage: git [-v | --version] [-C <path>] [-c <name>=<value>]\n           [--exec-path[=<path>]] [-p | --paginate | -P | --no-pager] [--git-dir=<path>]\n\nmore\n'; exit 129;;
+  init*) mkdir -p "$4/.git" && touch "$4/.git/HEAD";;
+  *"status --git-completion-helper") printf -- '--short --branch --porcelain -- --no-short\n';;
+  *"stash --git-completion-helper") printf 'apply clear drop pop push\n';;
+  *"stash pop --git-completion-helper") printf -- '--index --quiet -- --no-index\n';;
+  *"commit --git-completion-helper") printf -- '--message= --amend --all\n';;
+  *) touch "$dir/ran"; exit 1;;
+esac
+"#;
 
     /// A fake aws_completer answering from COMP_LINE like the real one.
     pub(crate) const FAKE_AWS_COMPLETER: &str = r#"#!/bin/sh

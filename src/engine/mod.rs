@@ -13,6 +13,7 @@
 //! Discovery never reruns the failed command. Legacy rules stay available
 //! as a fallback in [`crate::app`].
 
+pub mod cache;
 pub mod diagnosis;
 pub mod native;
 pub mod parser;
@@ -213,6 +214,9 @@ pub fn status_from_env() -> (Option<i32>, Option<Vec<i32>>) {
 pub fn correct(failure: &FailureContext, ctx: &Context) -> Report {
     let mut run = Run::new(failure, ctx);
     let outcome = run.execute();
+    if let Some(native) = run.native.as_mut() {
+        native.persist();
+    }
     Report {
         outcome,
         suspicions: run.suspicions,
@@ -233,6 +237,8 @@ const LATER_OCCURRENCE_PENALTY: f64 = 0.03;
 /// How strongly each kind of evidence says a token is wrong. Independent
 /// pieces combine as `1 - Π(1 - p)`.
 const APP_REJECTS: f64 = 0.9;
+/// The app's list is known to be partial (git's option helper).
+const APP_OMITS: f64 = 0.5;
 const NOT_ON_PATH: f64 = 0.6;
 const EXIT_127: f64 = 0.8;
 const OUTPUT_NAMES_IT: f64 = 0.85;
@@ -597,6 +603,7 @@ impl<'a> Run<'a> {
             path: None,
             context: &[],
             typed: name,
+            fresh: false,
         };
         let providers::Answer::Words(vocabulary) = provider.vocabulary(&slot, &mut self.budget)
         else {
@@ -641,14 +648,25 @@ impl<'a> Run<'a> {
         let Some(native) = self.native.as_mut() else {
             return Check::Unknown;
         };
-        let slot = providers::Slot {
+        let mut slot = providers::Slot {
             role,
             program: &state.program,
             path: state.path.as_ref(),
             context: &state.context,
             typed,
+            fresh: false,
         };
-        match native.vocabulary(&slot, &mut self.budget) {
+        let mut answer = native.vocabulary(&slot, &mut self.budget);
+        // A cached list may predate an upgrade: confirm with the app before
+        // calling a word invalid or a level free of subcommands.
+        if let providers::Answer::Words(vocabulary) = &answer
+            && vocabulary.cached
+            && (vocabulary.words.is_empty() || !vocabulary.contains(typed))
+        {
+            slot.fresh = true;
+            answer = native.vocabulary(&slot, &mut self.budget);
+        }
+        match answer {
             providers::Answer::Words(vocabulary) => {
                 if let Some(word) = vocabulary.words.iter().find(|w| w.value == typed) {
                     Check::Valid {
@@ -757,21 +775,43 @@ impl<'a> Run<'a> {
                     Check::Invalid(vocabulary) => vocabulary,
                 };
 
-                // `typed` is not valid here: branch on the closest valid words.
+                // `typed` is not listed here: branch on the closest valid words.
+                let ranked = within_window(ranking::rank_tokens(
+                    typed,
+                    vocabulary.words.iter().map(|v| v.value.as_str()),
+                    &self.diagnosis.suggestions,
+                    BEAM,
+                ));
+                if ranked.is_empty() && !vocabulary.authoritative {
+                    // A partial list says nothing about a word far from it.
+                    pending_value = is_option && !text.contains('=');
+                    state.context.push(text.to_owned());
+                    i += 1;
+                    continue;
+                }
                 let kind = if is_option {
                     ProblemKind::UnknownOption
                 } else {
                     ProblemKind::UnknownCommand
                 };
                 let mut evidence = vec![(
-                    APP_REJECTS,
+                    if vocabulary.authoritative {
+                        APP_REJECTS
+                    } else {
+                        APP_OMITS
+                    },
                     Evidence {
                         source: Source::NativeCompletion,
                         detail: format!(
-                            "{} does not list `{typed}` after `{} {}`",
+                            "{} does not list `{typed}` after `{} {}`{}",
                             vocabulary.via,
                             state.program,
-                            state.context.join(" ")
+                            state.context.join(" "),
+                            if vocabulary.authoritative {
+                                ""
+                            } else {
+                                " (the list is known to be partial)"
+                            }
                         ),
                     },
                 )];
@@ -785,12 +825,6 @@ impl<'a> Run<'a> {
                     ));
                 }
                 let suspicion = self.suspect(index, i, role, typed, evidence.clone());
-                let ranked = within_window(ranking::rank_tokens(
-                    typed,
-                    vocabulary.words.iter().map(|v| v.value.as_str()),
-                    &self.diagnosis.suggestions,
-                    BEAM,
-                ));
                 if ranked.is_empty() {
                     self.note(format!(
                         "{}: `{typed}` is not valid after `{}`, and nothing valid is close",
@@ -883,7 +917,8 @@ impl<'a> Run<'a> {
                         return false;
                     };
                     if option {
-                        text.split('=').next() == Some(&problem.token)
+                        text.split('=').next().map(|n| n.trim_start_matches('-'))
+                            == Some(problem.token.trim_start_matches('-'))
                             && words[i].option_name_span(src).is_some()
                     } else {
                         text == problem.token
@@ -906,6 +941,7 @@ impl<'a> Run<'a> {
                 path: start.path.as_ref(),
                 context: &[],
                 typed: &problem.token,
+                fresh: false,
             };
             let Some(providers::Answer::Words(vocabulary)) = self
                 .hints
@@ -1053,7 +1089,7 @@ fn check_structure(old: &Script, source: &str, edits: &[TokenEdit]) -> Result<()
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::native::tests::Dir;
+    use super::native::tests::{Dir, FAKE_GIT};
     use super::*;
     use crate::settings::Settings;
     use std::fs;
@@ -1092,6 +1128,7 @@ ec2 *-instances*|--instance-ids\nec2 *-instances*|--region\nec2 *-instances*|--d
         let dir = Dir::new("engine");
         let aws = dir.script("bin/aws", "#!/bin/sh\ntouch \"$(dirname \"$0\")/ran\"\n");
         dir.script("bin/aws_completer", TREE_COMPLETER);
+        dir.script("bin/git", FAKE_GIT);
         fs::write(dir.0.join("bin/tree"), TREE).unwrap();
         Fake { dir, aws }
     }
@@ -1100,7 +1137,7 @@ ec2 *-instances*|--instance-ids\nec2 *-instances*|--region\nec2 *-instances*|--d
         Context::new(Settings::default(), Shell::Bash, "fuck".into())
             .with_executables(&["aws", "git", "grep", "gzip", "ls"])
             .with_which("aws", Some(fake.aws.to_str().unwrap()))
-            .with_which("git", Some("/usr/bin/git"))
+            .with_which("git", Some(fake.dir.0.join("bin/git").to_str().unwrap()))
             .with_which("ls", Some("/bin/ls"))
             .with_which("gti", None)
             .with_which("jq", Some("/usr/bin/jq"))
@@ -1187,6 +1224,82 @@ ec2 *-instances*|--instance-ids\nec2 *-instances*|--region\nec2 *-instances*|--d
         );
         let report = correct(&failure("aws ec2 describe-capacity-block"), &ctx);
         assert_eq!(scripts(&report.outcome)[0], source);
+    }
+
+    #[test]
+    fn git_commands_options_and_subcommands_come_from_git() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        for (typo, fixed, decisive) in [
+            ("git sttus", "git status", true),
+            ("git stash pp", "git stash pop", true),
+            // git's option lists are partial: without output, ask.
+            (
+                "git -C repo stash pop --idex",
+                "git -C repo stash pop --index",
+                false,
+            ),
+            (
+                "git commit --amnd -m 'msg here'",
+                "git commit --amend -m 'msg here'",
+                false,
+            ),
+        ] {
+            let report = correct(&failure(typo), &ctx);
+            assert_eq!(
+                matches!(report.outcome, Outcome::Suggestion(_)),
+                decisive,
+                "{typo}: {:?} {:?}",
+                report.outcome,
+                report.notes
+            );
+            assert_eq!(scripts(&report.outcome)[0], fixed);
+        }
+        for valid in [
+            "git commit -m x -a",
+            "git co main",
+            "git --no-pager status --short",
+        ] {
+            let report = correct(&failure(valid), &ctx);
+            assert!(
+                matches!(report.outcome, Outcome::NoCorrection(_)),
+                "{valid}: {:?}",
+                report.outcome
+            );
+        }
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn partial_option_lists_are_weak_evidence() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        // git's helper omits `log`'s revision options: unlisted is not wrong.
+        let report = correct(&failure("git commit --graph"), &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::NoCorrection(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert!(report.suspicions.is_empty());
+        let mut f = failure("git commit --amen");
+        let report = correct(&f, &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::Ambiguous(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(scripts(&report.outcome)[0], "git commit --amend");
+        f.output = CapturedOutput::Combined {
+            text: "error: unknown option `amen'".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&f, &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            report.outcome
+        );
     }
 
     #[test]
@@ -1378,6 +1491,30 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
                 "{app} ran an operation"
             );
         }
+    }
+
+    #[test]
+    fn cached_answers_are_reused_but_never_hide_new_commands() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let first = correct(&failure("aws ec2 describe-instances --dry-run"), &ctx);
+        assert!(matches!(first.outcome, Outcome::NoCorrection(_)));
+        assert!(first.probes > 0);
+        let again = correct(&failure("aws ec2 describe-instances --dry-run"), &ctx);
+        assert_eq!(again.probes, 0, "valid words are confirmed from the cache");
+        let tree = fs::read_to_string(fake.dir.0.join("bin/tree")).unwrap();
+        fs::write(
+            fake.dir.0.join("bin/tree"),
+            format!("{tree}ec2|describe-hosts\n"),
+        )
+        .unwrap();
+        let report = correct(&failure("aws ec2 describe-hosts"), &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::NoCorrection(_)),
+            "a stale cached list must not reject a new command: {:?}",
+            report.outcome
+        );
+        assert_eq!(report.probes, 1);
     }
 
     #[test]
