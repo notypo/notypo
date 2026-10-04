@@ -1,0 +1,356 @@
+name: CI and Release
+
+on:
+  push:
+    branches: [main, develop]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      task_to_run:
+        description: Which part of the workflow to run
+        type: choice
+        options: [test, release]
+        required: true
+        default: test
+      tag_name:
+        description: 'Required for release: an existing tag (e.g., v0.1.0)'
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  BINARY_NAME: notypo
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Rustfmt
+    if: |
+      (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.task_to_run == 'test')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    if: |
+      (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.task_to_run == 'test')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  test_and_check:
+    name: Test/build on ${{ matrix.target }}
+    if: |
+      (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.task_to_run == 'test')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            mode: native-test
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            mode: native-test
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+            mode: native-test
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            mode: cross-linux
+          - runner: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            mode: cross-linux
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            mode: build-only
+          - runner: macos-26
+            target: aarch64-apple-darwin
+            mode: native-test
+          - runner: ubuntu-latest
+            target: x86_64-unknown-freebsd
+            mode: freebsd-vm
+            arch: x86_64
+          - runner: ubuntu-latest
+            target: aarch64-unknown-freebsd
+            mode: freebsd-vm
+            arch: aarch64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        if: matrix.mode != 'freebsd-vm'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache Cargo dependencies and build artifacts
+        if: matrix.mode != 'freebsd-vm'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            test-${{ runner.os }}-${{ matrix.target }}-
+      - name: Configure Linux ARM cross-compilation
+        if: matrix.mode == 'cross-linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          case '${{ matrix.target }}' in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+              echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+              ;;
+            armv7-unknown-linux-gnueabihf)
+              sudo apt-get install -y gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+              echo 'CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc' >> "$GITHUB_ENV"
+              ;;
+          esac
+      - name: Run native tests
+        if: matrix.mode == 'native-test'
+        run: cargo test --locked --all-targets --target ${{ matrix.target }}
+      - name: Compile tests for non-native targets
+        if: matrix.mode == 'cross-linux' || matrix.mode == 'build-only'
+        run: cargo test --locked --all-targets --no-run --target ${{ matrix.target }}
+      - name: Build and test in FreeBSD VM
+        if: matrix.mode == 'freebsd-vm'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14'
+          arch: ${{ matrix.arch }}
+          usesh: true
+          sync: rsync
+          copyback: false
+          mem: '6144'
+          cache-after-prepare: true
+          envs: CARGO_TERM_COLOR RUST_BACKTRACE CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          prepare: |
+            set -e
+            pkg install -y curl ca_root_nss bash zsh git
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+            sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            rustc -vV
+            cargo test --locked --all-targets --target ${{ matrix.target }}
+
+  build_release_artifacts:
+    name: Build release for ${{ matrix.target }}
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.task_to_run == 'release')
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            mode: native
+            os-arch: linux-x86_64
+            asset_ext: .tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            mode: native
+            os-arch: windows-x86_64
+            asset_ext: .exe
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+            mode: native
+            os-arch: macos-x86_64
+            asset_ext: .tar.gz
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            mode: cross-linux
+            os-arch: linux-arm64
+            asset_ext: .tar.gz
+          - runner: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            mode: cross-linux
+            os-arch: linux-armv7
+            asset_ext: .tar.gz
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            mode: native
+            os-arch: windows-arm64
+            asset_ext: .exe
+          - runner: macos-26
+            target: aarch64-apple-darwin
+            mode: native
+            os-arch: macos-arm64
+            asset_ext: .tar.gz
+          - runner: ubuntu-latest
+            target: x86_64-unknown-freebsd
+            mode: freebsd-vm
+            arch: x86_64
+            os-arch: freebsd-x86_64
+            asset_ext: .tar.gz
+          - runner: ubuntu-latest
+            target: aarch64-unknown-freebsd
+            mode: freebsd-vm
+            arch: aarch64
+            os-arch: freebsd-arm64
+            asset_ext: .tar.gz
+    steps:
+      - name: Require a release tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || (github.event_name == 'push' && github.ref_name) || '' }}
+        run: |
+          if [ -z "$RELEASE_TAG" ]; then
+            echo '::error::The tag_name input is required for a manual release.'
+            exit 1
+          fi
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+      - name: Install Rust toolchain
+        if: matrix.mode != 'freebsd-vm'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache Cargo dependencies and build artifacts
+        if: matrix.mode != 'freebsd-vm'
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            release-${{ runner.os }}-${{ matrix.target }}-
+      - name: Configure Linux ARM cross-compilation
+        if: matrix.mode == 'cross-linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          case '${{ matrix.target }}' in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+              echo 'CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc' >> "$GITHUB_ENV"
+              ;;
+            armv7-unknown-linux-gnueabihf)
+              sudo apt-get install -y gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
+              echo 'CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc' >> "$GITHUB_ENV"
+              ;;
+          esac
+      - name: Build binary
+        if: matrix.mode != 'freebsd-vm'
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin ${{ env.BINARY_NAME }}
+      - name: Build binary in FreeBSD VM
+        if: matrix.mode == 'freebsd-vm'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: '14'
+          arch: ${{ matrix.arch }}
+          usesh: true
+          sync: rsync
+          copyback: true
+          mem: '6144'
+          cache-after-prepare: true
+          envs: BINARY_NAME CARGO_TERM_COLOR RUST_BACKTRACE CARGO_INCREMENTAL
+          prepare: |
+            set -e
+            pkg install -y curl ca_root_nss git
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+            sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            rustc -vV
+            cargo build --locked --release --target ${{ matrix.target }} --bin "$BINARY_NAME"
+      - name: Package artifact
+        shell: bash
+        env:
+          BINARY_DIR: target/${{ matrix.target }}/release
+          ASSET_NAME: ${{ env.BINARY_NAME }}-${{ matrix.os-arch }}${{ matrix.asset_ext }}
+        run: |
+          mkdir -p dist
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "$BINARY_DIR/$BINARY_NAME.exe" "dist/$ASSET_NAME"
+          else
+            tar -czf "dist/$ASSET_NAME" \
+              -C "$BINARY_DIR" "$BINARY_NAME" \
+              -C "$GITHUB_WORKSPACE" README.md LICENSE-MIT LICENSE-APACHE NOTICE
+          fi
+      - name: Upload artifact for release
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifact-${{ matrix.os-arch }}
+          path: dist/${{ env.BINARY_NAME }}-${{ matrix.os-arch }}${{ matrix.asset_ext }}
+          if-no-files-found: error
+
+  create_github_release:
+    name: Create GitHub Release
+    if: |
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.task_to_run == 'release')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: build_release_artifacts
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-artifact-*
+          merge-multiple: true
+          path: release-artifacts
+      - name: Generate release checksums
+        working-directory: release-artifacts
+        run: sha256sum notypo-* > SHA256SUMS
+      - name: Create draft release and upload artifacts
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          draft: true
+          files: release-artifacts/*
+          fail_on_unmatched_files: true
