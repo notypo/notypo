@@ -12,8 +12,16 @@ use notypo::shells::Shell;
 use notypo::types::Context;
 
 const CASES: &[(&str, &str, &str)] = &[
-    ("aws", "aws ec2 describ-instances --regoin eu-west-1", "aws ec2 describe-instances --region eu-west-1"),
-    ("gcloud", "gcloud compte instnaces list", "gcloud compute instances list"),
+    (
+        "aws",
+        "aws ec2 describ-instances --regoin eu-west-1",
+        "aws ec2 describe-instances --region eu-west-1",
+    ),
+    (
+        "gcloud",
+        "gcloud compte instnaces list",
+        "gcloud compute instances list",
+    ),
     ("az", "az storage acount list", "az storage account list"),
     ("git", "git sttus", "git status"),
     ("kubectl", "kubectl gt pods", "kubectl get pods"),
@@ -30,8 +38,8 @@ const CASES: &[(&str, &str, &str)] = &[
 #[test]
 #[ignore = "uses the CLIs installed on this machine"]
 fn installed_clis_repair_typos_from_their_own_completion() {
-    let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
-        .with_history::<&str>(&[]);
+    let ctx =
+        Context::new(Settings::default(), Shell::Bash, "fuck".into()).with_history::<&str>(&[]);
     let mut failures = Vec::new();
     for (app, typo, expected) in CASES {
         if ctx.which(app).is_none() {
@@ -44,7 +52,11 @@ fn installed_clis_repair_typos_from_their_own_completion() {
             ..FailureContext::default()
         };
         let report = engine::correct(&failure, &ctx);
-        let got = report.outcome.candidates().first().map(|c| c.script.clone());
+        let got = report
+            .outcome
+            .candidates()
+            .first()
+            .map(|c| c.script.clone());
         let decided = matches!(report.outcome, Outcome::Suggestion(_));
         eprintln!(
             "{app:>9}: {typo} -> {} ({}, {} probes)",
