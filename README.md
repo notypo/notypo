@@ -1,6 +1,6 @@
 # notypo
 
-`notypo` is a crossplatform Rust port of [thefuck](https://github.com/nvbn/thefuck). It suggests fixes for failed shell commands and can run the selected correction.
+notypo is a crossplatform Rust port of thefuck. It suggests fixes for failed shell commands and can run the selected correction.
 Mac/Linux/Windows/FreeBSD supported. x64 and ARM
 
 ## Shell setup
@@ -34,7 +34,7 @@ This prints `git status`; the standalone binary does not execute the printed cor
 
 ## Performance
 
-`notypo` was **14–39× faster** than the original Python `thefuck` in these CLI correction benchmarks.
+notypo **14–39× faster** than the original Python `thefuck` and uses **10x** less memory
 
 ## License
 
@@ -42,4 +42,4 @@ Licensed under either MIT or APACHE 2.0, at your option.
 
 ## Attribution
 
-The original [thefuck](https://github.com/nvbn/thefuck) was created by Vladimir Iakovlev. See [NOTICE](NOTICE)
+The original app was created by Vladimir Iakovlev. See [NOTICE](NOTICE)
