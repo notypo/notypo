@@ -8,6 +8,11 @@
 //! it. Callers abstain unless the best candidate is strong enough and clearly
 //! ahead of the runner-up.
 
+// Calibrated on tests/corpus.rs (715 labeled typos of real aws, gcloud,
+// az, git, kubectl, docker, helm, and system command names): with these
+// values 95.9% are decided alone and none wrongly; a smaller margin starts
+// choosing wrong commands, a larger one only asks more often.
+
 /// Minimum score for an automatic first choice.
 pub const ACCEPT: f64 = 0.6;
 /// Required lead over the second-best candidate.
@@ -131,10 +136,15 @@ pub fn rank_tokens<'v>(
 /// Whether the best of `scores` (sorted, highest first) can be chosen
 /// without asking: strong enough and clearly ahead of the next one.
 pub fn is_decisive(scores: &[f64]) -> bool {
+    is_decisive_with(scores, ACCEPT, MARGIN)
+}
+
+/// [`is_decisive`] with explicit thresholds, for calibration.
+pub fn is_decisive_with(scores: &[f64], accept: f64, margin: f64) -> bool {
     match scores {
         [] => false,
-        [best] => *best >= ACCEPT,
-        [best, second, ..] => *best >= ACCEPT && best - second >= MARGIN,
+        [best] => *best >= accept,
+        [best, second, ..] => *best >= accept && best - second >= margin,
     }
 }
 

@@ -227,7 +227,23 @@ pub fn status_from_env() -> (Option<i32>, Option<Vec<i32>>) {
 
 /// Runs the pipeline for one failed command.
 pub fn correct(failure: &FailureContext, ctx: &Context) -> Report {
+    correct_with_backends(failure, ctx, Vec::new())
+}
+
+/// [`correct`], answering native completion for the named programs from
+/// the given backends instead of discovering them (tests, corpora, and
+/// embedders with their own protocol bridges).
+pub fn correct_with_backends(
+    failure: &FailureContext,
+    ctx: &Context,
+    backends: Vec<(String, std::rc::Rc<dyn native::NativeCompletionBackend>)>,
+) -> Report {
     let mut run = Run::new(failure, ctx);
+    if let Some(native) = run.native.take() {
+        run.native = Some(backends.into_iter().fold(native, |n, (program, backend)| {
+            n.with_backend(&program, backend)
+        }));
+    }
     let outcome = run.execute();
     if let Some(native) = run.native.as_mut() {
         native.persist();
@@ -548,7 +564,10 @@ impl<'a> Run<'a> {
         }
         allowed.truncate(BEAM * 2);
         let scores: Vec<f64> = allowed.iter().map(|c| c.score).collect();
-        if ranking::is_decisive(&scores) && !allowed[0].weak {
+        let tied = allowed
+            .get(1)
+            .is_some_and(|second| equally_supported(&allowed[0], second));
+        if ranking::is_decisive(&scores) && !allowed[0].weak && !tied {
             Outcome::Suggestion(allowed)
         } else {
             Outcome::Ambiguous(allowed)
@@ -1422,6 +1441,20 @@ fn attached_value_span(word: &parser::Word, src: &str, name: &str) -> Option<Spa
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"-_.:,@%+".contains(&c)))
     .then(|| Span::new(name_span.end + 1, word.span.end))
+}
+
+/// Two repairs of the same words that are equally many edits away and
+/// equally backed by hints and history: only word length would separate
+/// them (`mal` → `mail` or `man`), which is no reason to choose alone.
+fn equally_supported(a: &Candidate, b: &Candidate) -> bool {
+    a.edits.len() == b.edits.len()
+        && a.edits.iter().zip(&b.edits).all(|(x, y)| {
+            (x.command, x.word) == (y.command, y.word)
+                && x.score.distance == y.score.distance
+                && x.score.first_letter == y.score.first_letter
+                && x.score.hint == y.score.hint
+                && x.score.history == y.score.history
+        })
 }
 
 /// Drops alternatives too far behind the best one to be worth probing.

@@ -12,6 +12,7 @@ use super::{Source, TokenRole};
 use crate::types::Context;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 /// A position in a command that needs a valid word.
 #[derive(Clone, Copy, Debug)]
@@ -111,7 +112,7 @@ pub struct NativeCompletion<'c> {
     pub trusted: &'c [String],
     /// Value queries may look up resources over the network.
     pub network: bool,
-    backends: HashMap<String, Option<native::Backend>>,
+    backends: HashMap<String, Option<Rc<dyn NativeCompletionBackend>>>,
     caches: HashMap<String, Option<CompletionCache>>,
     memo: Memo,
     notes: Vec<String>,
@@ -139,7 +140,7 @@ impl<'c> NativeCompletion<'c> {
         context: &[String],
         budget: &mut Budget,
     ) -> Option<Vocabulary> {
-        let backend = self.backend(program, path)?.clone();
+        let backend = self.backend(program, path)?;
         if !backend.capabilities().values {
             return None;
         }
@@ -168,7 +169,7 @@ impl<'c> NativeCompletion<'c> {
             via: format!(
                 "{} {}",
                 backend.id(),
-                if backend.network {
+                if backend.capabilities().resources {
                     "resource lookup"
                 } else {
                     "completion"
@@ -186,7 +187,18 @@ impl<'c> NativeCompletion<'c> {
         }
     }
 
-    fn cache(&mut self, program: &str, backend: &native::Backend) -> Option<&mut CompletionCache> {
+    /// Uses `backend` for `program` instead of discovering one (tests and
+    /// embedders).
+    pub fn with_backend(mut self, program: &str, backend: Rc<dyn NativeCompletionBackend>) -> Self {
+        self.backends.insert(program.to_owned(), Some(backend));
+        self
+    }
+
+    fn cache(
+        &mut self,
+        program: &str,
+        backend: &dyn NativeCompletionBackend,
+    ) -> Option<&mut CompletionCache> {
         self.caches
             .entry(program.to_owned())
             .or_insert_with(|| {
@@ -203,7 +215,11 @@ impl<'c> NativeCompletion<'c> {
     }
 
     /// The backend for `program`, discovered once per run.
-    pub fn backend(&mut self, program: &str, path: Option<&PathBuf>) -> Option<&native::Backend> {
+    pub fn backend(
+        &mut self,
+        program: &str,
+        path: Option<&PathBuf>,
+    ) -> Option<Rc<dyn NativeCompletionBackend>> {
         if !self.backends.contains_key(program) {
             let found = match path {
                 None => None,
@@ -212,7 +228,7 @@ impl<'c> NativeCompletion<'c> {
                         backend.network = self.network;
                         self.note(format!(
                             "{program}: native completion via {} ({} protocol); {}",
-                            backend.completer.display(),
+                            backend.location(),
                             backend.id(),
                             if backend.network {
                                 "resource names may be looked up with your credentials"
@@ -220,7 +236,7 @@ impl<'c> NativeCompletion<'c> {
                                 "resource names are not looked up offline"
                             }
                         ));
-                        Some(backend)
+                        Some(Rc::new(backend) as Rc<dyn NativeCompletionBackend>)
                     }
                     Discovery::None => {
                         self.note(format!("{program}: no native completion found"));
@@ -234,7 +250,7 @@ impl<'c> NativeCompletion<'c> {
             };
             self.backends.insert(program.to_owned(), found);
         }
-        self.backends[program].as_ref()
+        self.backends[program].clone()
     }
 }
 
@@ -247,7 +263,7 @@ impl CandidateProvider for NativeCompletion<'_> {
         if slot.role == TokenRole::Executable {
             return Answer::NotApplicable;
         }
-        let Some(backend) = self.backend(slot.program, slot.path).cloned() else {
+        let Some(backend) = self.backend(slot.program, slot.path) else {
             return Answer::NotApplicable;
         };
         // An empty prefix enumerates the level; a dash prefix its options.
@@ -271,7 +287,7 @@ impl CandidateProvider for NativeCompletion<'_> {
             Some((hit, cached)) if !(slot.fresh && *cached) => (hit.clone(), *cached),
             _ => {
                 let from_disk = (!slot.fresh)
-                    .then(|| self.cache(slot.program, &backend))
+                    .then(|| self.cache(slot.program, &*backend))
                     .flatten()
                     .and_then(|cache| cache.get(&disk_key).map(<[_]>::to_vec));
                 match from_disk {
@@ -280,7 +296,7 @@ impl CandidateProvider for NativeCompletion<'_> {
                         let words: Vec<&str> = slot.context.iter().map(String::as_str).collect();
                         let result = backend.complete(&words, prefix, budget);
                         if let Ok(items) = &result
-                            && let Some(cache) = self.cache(slot.program, &backend)
+                            && let Some(cache) = self.cache(slot.program, &*backend)
                         {
                             cache.put(disk_key, items.clone());
                         }

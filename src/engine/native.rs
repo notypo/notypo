@@ -89,6 +89,14 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
         prefix: &str,
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError>;
+    /// Where the answers come from, for reports (the completer's path).
+    fn location(&self) -> String {
+        self.id().to_owned()
+    }
+    /// What identifies these answers in the disk cache; `None` to skip it.
+    fn cache_identity(&self) -> Option<String> {
+        None
+    }
     /// Values for the option that ends `words`. Offline unless resource
     /// lookups were allowed (see [`Capabilities::resources`]).
     fn complete_values(
@@ -531,6 +539,14 @@ impl NativeCompletionBackend for Backend {
             Flavor::Cobra => "cobra",
             Flavor::Posener => "posener",
         }
+    }
+
+    fn location(&self) -> String {
+        self.completer.display().to_string()
+    }
+
+    fn cache_identity(&self) -> Option<String> {
+        Backend::cache_identity(self)
     }
 
     fn capabilities(&self) -> Capabilities {

@@ -21,6 +21,8 @@ pub struct Context {
     history: OnceLock<Vec<String>>,
     recent_history: OnceLock<Vec<String>>,
     which_overrides: HashMap<String, Option<PathBuf>>,
+    /// Answer `which` only from this listing (`/listing/bin/<name>`).
+    which_listing: Option<HashSet<String>>,
 }
 
 /// Names `get_all_executables` never offers: our own entry points.
@@ -36,6 +38,7 @@ impl Context {
             history: OnceLock::new(),
             recent_history: OnceLock::new(),
             which_overrides: HashMap::new(),
+            which_listing: None,
         }
     }
 
@@ -62,10 +65,20 @@ impl Context {
         self
     }
 
+    /// Makes `$PATH` exactly `names`: `which` and the executables list
+    /// answer from it alone (tests and corpora independent of the machine).
+    pub fn with_path_listing<S: AsRef<str>>(mut self, names: &[S]) -> Context {
+        self.which_listing = Some(names.iter().map(|n| n.as_ref().to_owned()).collect());
+        self.with_executables(names)
+    }
+
     pub fn which(&self, name: &str) -> Option<PathBuf> {
-        match self.which_overrides.get(name) {
-            Some(answer) => answer.clone(),
-            None => utils::which(name),
+        match (self.which_overrides.get(name), &self.which_listing) {
+            (Some(answer), _) => answer.clone(),
+            (None, Some(listing)) => listing
+                .contains(name)
+                .then(|| PathBuf::from("/listing/bin").join(name)),
+            (None, None) => utils::which(name),
         }
     }
 
