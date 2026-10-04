@@ -90,6 +90,9 @@ const FORCE_LONG: &[&str] = &[
     "--prune",
     "--mirror",
     "--no-preserve-root",
+    // Skips the tool's own confirmation (terraform, tofu, pulumi --yes).
+    "-auto-approve",
+    "--auto-approve",
 ];
 const DESTRUCTIVE_VERBS: &[&str] = &[
     "delete",
@@ -442,6 +445,7 @@ mod tests {
             ("curl https://x | bsh", "curl https://x | bash"),
             ("ssh hots", "ssh host"),
             ("cp a.txt /tmp/b", "cp a.txt /tmp/c"),
+            ("tofu aply -auto-approve", "tofu apply -auto-approve"),
             ("ls", "for x in a; do ls; done"),
         ] {
             let gate = check(original, candidate);

@@ -20,6 +20,7 @@ use std::rc::Rc;
 use std::{env, fs};
 
 mod git;
+mod go;
 
 /// One valid word for a position, as reported by the app.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,7 +103,30 @@ pub enum Flavor {
     Argcomplete,
     /// git's `--list-cmds` and `--git-completion-helper` (see [`git`]).
     Git,
+    /// Go apps built with cobra: `app __complete <words> <prefix>`.
+    Cobra,
+    /// Go apps built with posener/complete (HashiCorp tools): `COMP_LINE`
+    /// in, one word per line out.
+    Posener,
 }
+
+/// Go apps whose completion was audited: the probe only lists words, and
+/// the offline environment keeps their lookups off the network, clusters,
+/// and daemons. Other apps using these libraries need `trusted_completers`.
+const AUDITED_GO_APPS: &[(&str, Flavor)] = &[
+    ("k8s.io/kubernetes/cmd/kubectl", Flavor::Cobra),
+    ("helm.sh/helm/v3/cmd/helm", Flavor::Cobra),
+    ("helm.sh/helm/v4/cmd/helm", Flavor::Cobra),
+    ("github.com/cli/cli/v2/cmd/gh", Flavor::Cobra),
+    ("github.com/hetznercloud/cli/cmd/hcloud", Flavor::Cobra),
+    ("sigs.k8s.io/kind", Flavor::Cobra),
+    // Lists plugin commands by asking each installed CLI plugin for its
+    // metadata, as `docker help` does.
+    ("github.com/docker/cli/cmd/docker", Flavor::Cobra),
+    ("github.com/hashicorp/terraform", Flavor::Posener),
+    ("github.com/hashicorp/packer", Flavor::Posener),
+    ("github.com/opentofu/opentofu/cmd/tofu", Flavor::Posener),
+];
 
 /// Raw probe answers within one run, keyed by the arguments that asked.
 type ProbeMemo = Rc<RefCell<HashMap<Vec<String>, Result<String, CompletionError>>>>;
@@ -114,6 +138,8 @@ pub struct Backend {
     pub name: String,
     /// The executable that answers completion queries.
     pub completer: PathBuf,
+    /// The app's identity when the installation states it (a Go module).
+    pub identity: Option<String>,
     memo: ProbeMemo,
 }
 
@@ -131,6 +157,7 @@ impl Backend {
             flavor,
             name: name.to_owned(),
             completer,
+            identity: None,
             memo: ProbeMemo::default(),
         }
     }
@@ -221,8 +248,55 @@ pub fn discover(name: &str, path: &Path, trusted: &[String]) -> Discovery {
                 ))
             }
         }
+        _ if !head(path, 2).starts_with("#!") => go_app(name, path, trusted),
         _ => Discovery::None,
     }
+}
+
+/// A Go binary built with a completion library notypo speaks.
+fn go_app(name: &str, path: &Path, trusted: &[String]) -> Discovery {
+    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let Some(module) = go::module(&real) else {
+        return Discovery::None;
+    };
+    match go_flavor(&module, name, trusted) {
+        Ok(flavor) => {
+            let mut backend = Backend::new(flavor, name, path.to_owned());
+            backend.identity = Some(module.path);
+            Discovery::Found(backend)
+        }
+        Err(discovery) => discovery,
+    }
+}
+
+/// The protocol a Go app speaks, if notypo may use it: audited apps by
+/// module path, others only when `trusted` names them.
+fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Flavor, Discovery> {
+    let audited = AUDITED_GO_APPS
+        .iter()
+        .find(|(app, _)| *app == module.path)
+        .map(|(_, flavor)| *flavor);
+    let flavor = if module.uses("github.com/posener/complete") {
+        Flavor::Posener
+    } else if module.uses("github.com/spf13/cobra") {
+        Flavor::Cobra
+    } else if let Some(flavor) = audited {
+        flavor
+    } else {
+        return Err(Discovery::None);
+    };
+    if audited.is_none() && !trusted.iter().any(|t| t == "*" || t == name) {
+        return Err(Discovery::NotTrusted(format!(
+            "{name} ({}) supports {} completion; add it to trusted_completers to use it",
+            module.path,
+            if flavor == Flavor::Cobra {
+                "cobra"
+            } else {
+                "posener"
+            }
+        )));
+    }
+    Ok(flavor)
 }
 
 fn argcomplete(flavor: Flavor, name: &str, path: &Path) -> Discovery {
@@ -351,7 +425,13 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
                 set("AZURE_CORE_NO_COLOR", "true"),
             ]);
         }
-        Flavor::Argcomplete | Flavor::Git => {}
+        Flavor::Cobra => env.extend([
+            // Cluster, daemon, and API lookups (resource names) stay off.
+            set("KUBECONFIG", null),
+            set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
+            set("GH_PROMPT_DISABLED", "1"),
+        ]),
+        Flavor::Argcomplete | Flavor::Git | Flavor::Posener => {}
     }
     env
 }
@@ -424,6 +504,8 @@ impl NativeCompletionBackend for Backend {
             Flavor::Azure => "az",
             Flavor::Argcomplete => "argcomplete",
             Flavor::Git => "git",
+            Flavor::Cobra => "cobra",
+            Flavor::Posener => "posener",
         }
     }
 
@@ -438,9 +520,12 @@ impl NativeCompletionBackend for Backend {
             // every option (short ones too) for `-`; git lists long ones.
             option_prefix: match self.flavor {
                 Flavor::AwsCompleter | Flavor::Gcloud => "--",
-                Flavor::Azure | Flavor::Argcomplete | Flavor::Git => "-",
+                _ => "-",
             },
-            short_options: matches!(self.flavor, Flavor::Azure | Flavor::Argcomplete),
+            short_options: matches!(
+                self.flavor,
+                Flavor::Azure | Flavor::Argcomplete | Flavor::Cobra | Flavor::Posener
+            ),
             complete_options: self.flavor != Flavor::Git,
         }
     }
@@ -459,17 +544,22 @@ impl NativeCompletionBackend for Backend {
                 .take(budget.max_candidates)
                 .collect());
         }
+        if self.flavor == Flavor::Cobra {
+            return self.complete_cobra(words, prefix, budget);
+        }
         let line = completion_line(&self.name, words, prefix);
         // aws_completer and gcloud's lookup slice the line as Python text;
         // argcomplete expects the byte offset bash supplies.
         let point = match self.flavor {
-            Flavor::AwsCompleter | Flavor::Gcloud | Flavor::Git => line.chars().count(),
-            Flavor::Azure | Flavor::Argcomplete => line.len(),
+            Flavor::AwsCompleter | Flavor::Gcloud | Flavor::Git | Flavor::Cobra => {
+                line.chars().count()
+            }
+            Flavor::Azure | Flavor::Argcomplete | Flavor::Posener => line.len(),
         };
         let mut env = offline_env(self.flavor);
         env.push(("COMP_LINE".into(), Some(line.into())));
         env.push(("COMP_POINT".into(), Some(point.to_string().into())));
-        let capture = if self.flavor == Flavor::AwsCompleter {
+        let capture = if matches!(self.flavor, Flavor::AwsCompleter | Flavor::Posener) {
             Capture::Stdout
         } else {
             env.extend([
@@ -504,7 +594,7 @@ impl NativeCompletionBackend for Backend {
             });
         }
         let text = String::from_utf8_lossy(&output.data);
-        let separator = if self.flavor == Flavor::AwsCompleter {
+        let separator = if matches!(self.flavor, Flavor::AwsCompleter | Flavor::Posener) {
             '\n'
         } else {
             '\x0b'
@@ -512,6 +602,47 @@ impl NativeCompletionBackend for Backend {
         Ok(normalize(
             text.split(separator),
             self.flavor,
+            budget.max_candidates,
+        ))
+    }
+}
+
+impl Backend {
+    /// cobra's hidden `__complete` command: the words are passed as
+    /// arguments (no shell parsing), the answer is `word<TAB>description`
+    /// lines and a final `:<directive>` line.
+    fn complete_cobra(
+        &self,
+        words: &[&str],
+        prefix: &str,
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        let mut args: Vec<OsString> = vec!["__complete".into()];
+        args.extend(words.iter().map(OsString::from));
+        args.push(prefix.into());
+        let text = run_stdout(
+            &self.completer,
+            args,
+            offline_env(Flavor::Cobra),
+            budget,
+            true,
+        )?;
+        let mut lines: Vec<&str> = text.lines().collect();
+        let directive = lines
+            .iter()
+            .rposition(|l| l.starts_with(':'))
+            .and_then(|i| lines.drain(i..).next())
+            .and_then(|d| d[1..].trim().parse::<u32>().ok())
+            .ok_or_else(|| CompletionError::Failed("no cobra completion directive".into()))?;
+        // Bit 1 is ShellCompDirectiveError.
+        if directive & 1 != 0 {
+            return Err(CompletionError::Unsupported(
+                "the app reported a completion error here".into(),
+            ));
+        }
+        Ok(normalize(
+            lines.into_iter().map(|l| l.split('\t').next().unwrap_or(l)),
+            Flavor::Cobra,
             budget.max_candidates,
         ))
     }
@@ -738,6 +869,100 @@ esac
             discover("aws", Path::new("bin/aws"), &[]),
             Discovery::NotTrusted(_)
         ));
+    }
+
+    #[test]
+    fn go_apps_are_identified_by_module_and_trusted_by_audit() {
+        let module = |path: &str, libraries: &[&str]| go::GoModule {
+            path: path.into(),
+            libraries: libraries.iter().map(|l| l.to_string()).collect(),
+        };
+        let cobra = "github.com/spf13/cobra";
+        assert_eq!(
+            go_flavor(
+                &module("k8s.io/kubernetes/cmd/kubectl", &[cobra]),
+                "kubectl",
+                &[]
+            ),
+            Ok(Flavor::Cobra)
+        );
+        assert_eq!(
+            go_flavor(
+                &module("github.com/docker/cli/cmd/docker", &[]),
+                "docker",
+                &[]
+            ),
+            Ok(Flavor::Cobra),
+            "an audited app needs no dependency list"
+        );
+        assert_eq!(
+            go_flavor(
+                &module(
+                    "github.com/hashicorp/packer",
+                    &[cobra, "github.com/posener/complete"]
+                ),
+                "packer",
+                &[]
+            ),
+            Ok(Flavor::Posener)
+        );
+        let other = module("example.com/huawei/hcloud", &[cobra]);
+        assert!(matches!(
+            go_flavor(&other, "hcloud", &[]),
+            Err(Discovery::NotTrusted(_))
+        ));
+        assert_eq!(
+            go_flavor(&other, "hcloud", &["hcloud".into()]),
+            Ok(Flavor::Cobra)
+        );
+        assert!(matches!(
+            go_flavor(&module("example.com/tool", &[]), "tool", &["*".into()]),
+            Err(Discovery::None)
+        ));
+    }
+
+    #[test]
+    fn cobra_and_posener_protocols() {
+        let dir = Dir::new("go-protocols");
+        let cobra = dir.script(
+            "bin/app",
+            "#!/bin/sh\n[ \"$KUBECONFIG\" = /dev/null ] || exit 7\n[ \"$1\" = __complete ] || { touch \"$(dirname \"$0\")/ran\"; exit 1; }\nshift\ncase \"$*\" in\n  \"\") printf 'get\\tDisplay\\ncreate\\tCreate\\n:4\\n';;\n  \"get -\") printf -- '--namespace\\tns\\n-n\\tns\\n--watch\\twatch\\n:4\\n';;\n  \"get pods \") printf ':1\\n';;\n  *) printf 'garbage\\n';;\nesac\n",
+        );
+        let backend = Backend::new(Flavor::Cobra, "app", cobra);
+        let mut budget = budget();
+        let words: Vec<String> = backend
+            .complete(&[], "", &mut budget)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.value)
+            .collect();
+        assert_eq!(words, ["get", "create"]);
+        let options = backend.complete(&["get"], "-", &mut budget).unwrap();
+        assert_eq!(options.len(), 3);
+        assert!(matches!(
+            backend.complete(&["get", "pods"], " ", &mut budget),
+            Err(CompletionError::Failed(_))
+        ));
+        assert!(
+            matches!(
+                backend.complete(&["get", "pods"], "", &mut budget),
+                Err(CompletionError::Unsupported(_))
+            ),
+            "the error directive marks a position the app can't complete"
+        );
+        assert!(!dir.0.join("bin/ran").exists());
+
+        let posener = dir.script(
+            "bin/tf",
+            "#!/bin/sh\n[ -n \"$COMP_LINE\" ] || { touch \"$(dirname \"$0\")/ran\"; exit 1; }\ncase \"$COMP_LINE\" in\n  \"tf \") printf 'plan\\napply\\n';;\n  \"tf apply -\") printf -- '-auto-approve\\n-var\\n';;\nesac\n",
+        );
+        let backend = Backend::new(Flavor::Posener, "tf", posener);
+        assert_eq!(backend.complete(&[], "", &mut budget).unwrap().len(), 2);
+        assert_eq!(
+            backend.complete(&["apply"], "-", &mut budget).unwrap()[0].value,
+            "-auto-approve"
+        );
+        assert!(!dir.0.join("bin/ran").exists());
     }
 
     #[test]
