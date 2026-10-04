@@ -1,8 +1,9 @@
 NOTYPO: STRUCTURED COMMAND CORRECTION PLAN
 
-Status: first slice implemented in src/engine/ behind engine = 'native'
-        (NOTYPO_ENGINE=native); the legacy engine stays the default.
-        Second and third slices not started.
+Status: first and second slices implemented in src/engine/ behind
+        engine = 'native' (NOTYPO_ENGINE=native) on branch
+        structured-engine; the legacy engine stays the default.
+        Third slice not started.
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.
         [ ] NOT DONE = work required to deliver this plan.
@@ -141,8 +142,11 @@ engine, and a provider can return structured edits with recorded provenance.
     by default. Missing output must not silently replay the original command.
 [x] DONE: Put any explicitly requested diagnostic replay behind the
     same execution policy as a corrected command; never replay just to rank.
-[ ] NOT DONE: Bound history/output reads, filter correction aliases, and
+[x] DONE: Bound history/output reads, filter correction aliases, and
     avoid logging secrets or caching full history by default.
+    History: the last megabyte, at most history_limit (5000) entries, held
+    in memory only; correction calls are skipped. Output stays capped at
+    1 MiB. Debug mode still prints captured output, as before.
 
 Acceptance: requesting a correction for a command that writes a marker file
 does not create that marker during context capture or candidate discovery.
@@ -183,18 +187,18 @@ Unsupported syntax produces an explicit outcome and cannot execute silently.
 
 [x] DONE: Add structured diagnostics for command-not-found, unknown
     subcommand, invalid option, missing path, and explicit "did you mean" hints.
-[ ] NOT DONE: Classify AST tokens as executable, subcommand, option, option
+[x] DONE: Classify AST tokens as executable, subcommand, option, option
     value, path argument, assignment, or redirection target where evidence allows.
-    PARTIAL: executable, subcommand, and option-name roles; option values are
-    skipped; paths, assignments, and redirection targets aren't classified.
+    Executable, subcommand, option name, option value, and path roles;
+    assignments and redirection targets are separate AST nodes.
 [x] DONE: Resolve wrappers and global options before selecting the
     effective program/subcommand; account for -- and --option=value forms.
 [ ] NOT DONE: Resolve executable identity through PATH, aliases, and supplied
     shell-function/wrapper metadata. Select the app's completion backend from
     that identity rather than from loose substring matching on command text.
-    PARTIAL: PATH, aliases, and builtins; backends are chosen from the resolved
-    installation, not substrings. Shell functions are not supplied yet (a
-    non-127 exit status is treated as a shell-defined name).
+    PARTIAL: PATH, aliases, builtins, package runners, and Go module identity;
+    shell-function names are not supplied yet (a non-127 exit status is
+    treated as a shell-defined name).
 [x] DONE: Use the app's completion results to understand valid next tokens
     at each command level; do not embed AWS/GCP/Azure command trees in diagnosis.
 [x] DONE: Map error hints to exact token spans, including repeated tokens;
@@ -217,7 +221,9 @@ and ls --colro=auto the option name while preserving its value.
 
 [ ] NOT DONE: Executable/completion provider: reuse the PATH index, builtins,
     aliases, and supplied shell-function names. Add argument-position context.
-    PARTIAL: PATH index, builtins, and aliases; shell-function names are not supplied.
+    PARTIAL: PATH index, builtins, aliases, and argument context (a program whose
+    completer accepts the next word ranks first); shell-function names are
+    not supplied.
 [ ] NOT DONE: Shell completion adapters: collect bounded results from native
     completion facilities for bash/zsh/fish/PowerShell. Completion functions
     can execute code, so invocation must obey the shared probe trust policy.
@@ -225,20 +231,21 @@ and ls --colro=auto the option name while preserving its value.
     documented completion entry point automatically. Preserve full command
     context, target token, cursor position, cwd, dialect, and relevant options;
     correctly translate cursor units and quoting for each native protocol.
-    PARTIAL: the documented entry points of aws/gcloud/az are discovered with the
-    right cursor units; shell-registered handlers are not.
+    PARTIAL: documented entry points (aws_completer, argcomplete, git helpers,
+    cobra __complete, posener COMP_LINE) are discovered with per-protocol
+    cursor units; shell-registered handlers are not.
 [ ] NOT DONE: Make app-native completion the primary command/argument provider.
     Normalize plain/rich results, replacement ranges, descriptions, enum values,
     and quoting hints. A new operation must work when the app exposes it even
     if notypo has never encountered that operation before.
-    PARTIAL: primary for commands and options; descriptions, replacement ranges, and
-    enum values are not normalized yet.
+    PARTIAL: primary for commands, options, and values; enum values are used,
+    descriptions and replacement ranges are dropped.
 [ ] NOT DONE: AWS adapter: invoke the installed aws_completer (or its Windows
     equivalent) with the native completion context. Use its service/operation,
     flag, and value results; support CLI v1/v2 capabilities without recreating
     service models or importing a separate AWS SDK command catalog.
-    PARTIAL: commands and options via aws_completer (verified with aws-cli 2.37.7);
-    value results are not used; CLI v1 is untested.
+    PARTIAL: commands, options, and values via aws_completer (verified with
+    aws-cli 2.37.7); CLI v1 is untested.
     Reference: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-completion.html
 [x] DONE: Google Cloud adapter: invoke installed gcloud completion through
     its supported shell handler; use the installation's own CLI-tree metadata
@@ -247,43 +254,55 @@ and ls --colro=auto the option name while preserving its value.
     Static completion tree over argcomplete/fd 8 (_ARGCOMPLETE_TRACE=static
     keeps it offline); verified with Google Cloud SDK 586.0.0.
     Reference: https://docs.cloud.google.com/sdk/gcloud/reference/topic/cli-trees
-[ ] NOT DONE: Azure adapter: invoke az's native completion/argcomplete protocol
+[x] DONE: Azure adapter: invoke az's native completion/argcomplete protocol
     through the installed handler, including nested command groups and currently
     installed extensions. Obtain values from the app's own completers.
-    PARTIAL: groups, commands, options, and installed extensions (verified with
-    azure-cli 2.90.0); values are not queried.
+    Groups, commands, options, installed extensions, and offline values
+    (verified with azure-cli 2.90.0); resources with network_completion.
     Reference: https://learn.microsoft.com/en-us/cli/azure/use-azure-cli-successfully-powershell#enable-tab-completion-in-powershell
-[ ] NOT DONE: Reuse backend discovery for other applications; separate a small
+[x] DONE: Reuse backend discovery for other applications; separate a small
     protocol adapter from command knowledge. Explicitly report missing or broken
     completion, then use current local help/man data as a documented fallback.
-    PARTIAL: PYTHON_ARGCOMPLETE_OK apps work when trusted; missing completion is
-    reported; there is no help/man fallback yet.
-[ ] NOT DONE: Preserve app context such as profile/account, region, project,
+    argcomplete, cobra, and posener apps are discovered by protocol (opt-in
+    unless audited); missing completion is reported, and man pages, trusted
+    --help output, and history are the fallback.
+[x] DONE: Preserve app context such as profile/account, region, project,
     subscription, and resource group when supplied in flags or active settings.
     Scope resource-name queries to that context; never invent resource names.
-    PARTIAL: global options and their values stay in the completion context; active
-    settings are not read and resources are never queried.
-[ ] NOT DONE: Support app-provided dynamic resource completion under an explicit
+    Global options and their values stay in every query; network mode uses
+    the user's active configuration; resource names only come from the app.
+[x] DONE: Support app-provided dynamic resource completion under an explicit
     read-only network policy. Honor timeouts and existing credentials, do not
     initiate login or change configuration, and keep local command/flag
     completion usable when offline, unauthenticated, or access is denied.
-[ ] NOT DONE: History provider: propose edits from relevant recent commands,
+    network_completion (off by default) runs value queries with the user's
+    credentials, under the probe timeouts and without prompts; command and
+    option queries stay offline. Not exercised against live accounts here.
+[x] DONE: History provider: propose edits from relevant recent commands,
     matching program/subcommand/cwd where available. Use recency/frequency as
     evidence; label success only when captured exit status supports it.
-[ ] NOT DONE: Filesystem provider: search the relevant parent directory,
+    Indexed by program and command path; a ranking bonus and a weak source
+    for apps without completion. Shell history files carry no cwd.
+[x] DONE: Filesystem provider: search the relevant parent directory,
     distinguish files/directories, preserve relative paths and quoting, and
     bound listings. Handle symlinks, inaccessible paths, and non-UTF-8 names.
+    cd targets, explicit program paths, reported-missing paths, and other
+    paths after a known failure; component by component, bounded listing.
 [ ] NOT DONE: CLI --help provider: parse options/subcommands from local help
     output, including nested subcommand help and option-value relationships.
-[ ] NOT DONE: Man-page provider: extract options/subcommands from locally
+    PARTIAL: options and first-level subcommands, for programs in trusted_help;
+    nested subcommand help is not read.
+[x] DONE: Man-page provider: extract options/subcommands from locally
     installed documentation; handle formatting/backspaces and disable pagers.
     Missing man support, including on Windows, must degrade gracefully.
+    Options from `man` with MANPAGER=cat, overstrike removed, cached by the
+    program's fingerprint; absent man (Windows) contributes nothing.
 [ ] NOT DONE: Program-specific plugin provider: implement trusted Rust bridges
     to native completion and app-specific diagnostic formats, starting with
     aws/gcloud/az and then git. Migrate applicable helpers from src/specific/;
     command knowledge must come from the installed app rather than rule tables.
-    PARTIAL: aws/gcloud/az bridges exist as native backends; git and src/specific/
-    migration are pending.
+    PARTIAL: aws/gcloud/az/git bridges exist as native backends; src/specific/
+    helpers are not migrated.
 [ ] NOT DONE: Define plugin registration, supported program identities,
     diagnostic hooks, candidate metadata, and declared effects. External
     executable plugins remain opt-in and use a versioned bounded protocol.
@@ -299,7 +318,8 @@ command-token correction when its backend is available. A disabled backend
 is reported as a capability limitation rather than full native support.
 
 Native completion examples (DONE: verified with aws-cli 2.37.7, Google Cloud
-SDK 586.0.0, and azure-cli 2.90.0 on macOS):
+SDK 586.0.0, and azure-cli 2.90.0 on macOS; tests/installed_clis.rs repeats
+them and the Go and git bridges with -- --ignored):
     aws ec2 describ-instances -> aws ec2 describe-instances
     gcloud compute instnaces list -> gcloud compute instances list
     az storage acount list -> az storage account list
@@ -399,7 +419,9 @@ REGIONAL CLOUDS, HOSTING, AND BARE METAL
     Source: https://github.com/linode/linode-cli
 [ ] NOT DONE: Vultr: vultr-cli.
     Source: https://github.com/vultr/vultr-cli
-[ ] NOT DONE: Hetzner Cloud: hcloud; never route it to Huawei by basename alone.
+[x] DONE: Hetzner Cloud: hcloud; never route it to Huawei by basename alone.
+    Identified by Go module github.com/hetznercloud/cli (cobra, audited);
+    verified by tests/installed_clis.rs; resource names need network mode.
     Source: https://github.com/hetznercloud/cli
 [ ] NOT DONE: OVHcloud: ovhcloud; Public Cloud OpenStack access also uses
     the shared openstack backend when that is the installed client.
@@ -566,10 +588,13 @@ command catalogs. They use the same app-native discovery/correction mechanism.
     Source: https://github.com/vmware/govmomi/blob/main/govc/README.md
 [ ] NOT DONE: Kubernetes and deployment clients: kubectl, helm, kops, kind,
     k3d, flux, argocd, kn, tkn, oc, rosa; include installed plugins/contexts.
+    PARTIAL: kubectl, helm, and kind are audited cobra apps (verified); the rest use cobra via trusted_completers.
 [ ] NOT DONE: Infrastructure/deployment tools: terraform, tofu, pulumi, packer,
     vagrant, ansible, ansible-playbook, serverless / sls, sst, s (Serverless Devs).
+    PARTIAL: terraform, tofu, and packer are audited posener apps (verified); ansible uses argcomplete via trusted_completers.
 [ ] NOT DONE: Container tools: docker, podman, nerdctl and their installed
     extensions; preserve project/context/remote-host selection.
+    PARTIAL: docker is an audited cobra app (verified; it asks its CLI plugins for metadata).
 [ ] NOT DONE: Object-storage/data-transfer clients: aws, s3cmd, mc, rclone,
     swift and provider-native storage tools listed above. Determine the
     installed application's identity before assuming what mc or aws means.
@@ -580,27 +605,35 @@ SHARED IMPLEMENTATION AND COVERAGE TASKS
     app-generated completion scripts, completion subprocess protocols,
     Python completion protocols, and PowerShell completion/cmdlet metadata.
     Reuse a protocol bridge across apps instead of writing one rule per service.
-    PARTIAL: the aws_completer subprocess protocol and the argcomplete (Python)
-    protocol are implemented; shell handlers, generated scripts, and
+    PARTIAL: completion subprocess protocols (aws_completer, git, cobra, posener) and
+    argcomplete are implemented; shell handlers, generated scripts, and
     PowerShell are pending.
-[ ] NOT DONE: Detect package-runner invocations (npx, npm exec, pnpm exec,
+[x] DONE: Detect package-runner invocations (npx, npm exec, pnpm exec,
     yarn, uvx, pipx run) and obtain the target app's installed identity without
     downloading a package or executing its failed operation during discovery.
+    npx, pnpx, bunx, npm exec/x, pnpm exec/dlx, yarn exec/dlx, bun x, uvx,
+    pipx run, uv run, poetry run, bundle exec: the target is resolved from
+    $PATH or node_modules/.bin only; scoped packages are not resolved.
 [ ] NOT DONE: Resolve basename collisions using executable path, package/app
     metadata, and completion registration. Add fixtures for hcloud, cf, metal,
     atlas, exo, stackit, s, and unrelated tools with the same name.
+    PARTIAL: Go module identity separates hcloud (tested); cf, metal, atlas, exo,
+    stackit, and s have no fixtures yet.
 [ ] NOT DONE: Track each app/backend's capabilities: commands, nested groups,
     flags, values, resources, descriptions, dialects, and required trust/network
     policy. Do not infer that every named CLI supports every completion feature.
-    PARTIAL: native::Capabilities records commands, options, option arity, values,
-    and resources per backend; dialects and policy are not tracked yet.
+    PARTIAL: native::Capabilities records commands, options, arity, values,
+    resources (network policy), short options, and list completeness;
+    dialects are not tracked.
 [ ] NOT DONE: Test upgrades, installed plugins, provider endpoints, and renamed
     executables. Fresh native results must expose new command surfaces without
     a notypo release or cloud-specific Rust command-table change.
-    PARTIAL: fake aws/gcloud/az completers gain operations and groups between
-    requests in tests; endpoints and renamed executables are untested.
-[ ] NOT DONE: Discover unlisted CLIs using supported native completion protocols
+    PARTIAL: fake aws/gcloud/az completers gain operations, groups, and extensions
+    between requests; endpoints and renamed executables are untested.
+[x] DONE: Discover unlisted CLIs using supported native completion protocols
     and registrations; inventory updates must not be required for their routing.
+    argcomplete markers and Go module dependencies route by protocol; trust
+    for unaudited apps comes from trusted_completers, not the inventory.
 
 6. CONTROL PROBES, CACHES, AND LATENCY
 
@@ -614,20 +647,28 @@ SHARED IMPLEMENTATION AND COVERAGE TASKS
     require opt-in for arbitrary executable/script completion or help probes.
     Do not automatically probe executables resolved from the working directory.
     Resource limits alone do not guarantee that --help has no side effects.
-[ ] NOT DONE: Use local evidence first; invoke expensive providers only when
+[x] DONE: Use local evidence first; invoke expensive providers only when
     useful evidence is still missing and the request budget allows it. An
     available native app completer is part of the main correction path, not a
     last-resort provider skipped because a legacy rule happened to match.
-[ ] NOT DONE: Cache tool metadata using resolved executable identity and file
+    Cached answers first; man pages and --help only for apps without a
+    completer; history and the filesystem are local.
+[x] DONE: Cache tool metadata using resolved executable identity and file
     fingerprint, dialect, and locale; include cwd/config identity for providers
     whose answers depend on them. Bound cache size/age and handle corruption.
-[ ] NOT DONE: Invalidate native metadata when the app, completer, installed
+    engine::cache: per-backend fingerprint (completer and app files,
+    extension/component directories, locale); a week's lifetime, bounded
+    files, corruption ignored. git (cwd-dependent aliases) is not cached.
+[x] DONE: Invalidate native metadata when the app, completer, installed
     components/extensions, or completion registration changes. Query fresh
     completion on unknown tokens or empty cached matches before abstaining;
     a stale negative cache must not hide newly introduced commands.
-[ ] NOT DONE: Include profile/account/project/subscription/region context in
+    A cached list only confirms; the app is asked again before a word is
+    called invalid or a level empty.
+[x] DONE: Include profile/account/project/subscription/region context in
     dynamic-result cache keys; give resource data a short lifetime and never
     share resource results across unrelated contexts.
+    Value and resource answers are never written to disk.
 [x] DONE: Keep discovery offline by default and avoid storing captured
     secrets, environment dumps, or full shell history in metadata caches.
     Live cloud resource discovery follows the explicitly enabled read-only
@@ -651,17 +692,19 @@ requests reuse applicable metadata without hiding changes to tool identity.
     validity, explicit diagnostic hints, provider agreement, and relevant
     history. Use the selected app's current completion results as authoritative
     command vocabulary; native validation must constrain spelling candidates.
-    PARTIAL: similarity, edit size, native validity, hints, and agreement; token
-    role and history are not weighted yet.
+    PARTIAL: similarity, edit size, native validity, hints, agreement, history,
+    and context fit; token role is not weighted.
 [x] DONE: Favor a small correction to the diagnosed token over unrelated
     whole-command replacements. Handle transpositions and case sensitivity.
 [x] DONE: Deduplicate structurally equivalent edits with stable tie
     breaking. Preserve meaningful differences in arguments and side effects.
 [x] DONE: Provide a score breakdown and reason per candidate; numeric
     scores are ranking signals, not calibrated probabilities of correctness.
-[ ] NOT DONE: Establish evidence thresholds and a best/second-best margin
+[x] DONE: Establish evidence thresholds and a best/second-best margin
     using a labeled corpus. Return ambiguity or abstention when unmet.
-    PARTIAL: ranking::{ACCEPT, MARGIN, FLOOR} are hand-set; no labeled corpus yet.
+    tests/corpus.rs: 715 labeled typos; ACCEPT 0.6 / MARGIN 0.08 decide
+    95.9% alone with no wrong decisions; equally supported alternatives are
+    a tie.
 [x] DONE: Keep risk separate from confidence: a highly ranked candidate
     still has to pass the safety gate.
 
@@ -707,20 +750,21 @@ command, and rejection leaves command effects/history untouched.
     engine outcome that includes candidates, evidence, and safety decisions.
 [x] DONE: Show the changed token, brief correction reason, alternatives,
     and risk reason when the user needs to make an execution decision.
-[ ] NOT DONE: Keep shell-evaluable stdout restricted to the validated selected
+[x] DONE: Keep shell-evaluable stdout restricted to the validated selected
     command. Send explanations/prompts to stderr; define separate --explain
     and --json output modes for inspection and automation.
-    PARTIAL: --explain is implemented (stderr only); --json is pending.
+    --explain writes to stderr; --json writes the report to stdout and runs
+    nothing (it is not for the alias).
 [x] DONE: Make print-only mode free of correction side effects/history
     writes. Generated shell functions execute only an approved selection in
     the parent shell so commands such as cd retain their behavior.
     --explain runs no callbacks and writes no history.
 [x] DONE: Preserve fuck/typo/custom aliases, cancellation, history updates,
     confirmation settings, and existing shell integration regressions.
-[ ] NOT DONE: Document compatibility changes, provider/probe settings,
+[x] DONE: Document compatibility changes, provider/probe settings,
     unsupported syntax, and the limits of the safety policy.
-    PARTIAL: README documents the opt-in engine, its settings, unsupported syntax,
-    and the gate's limits; a compatibility-change list is pending.
+    README: sources, settings, safety limits, unsupported syntax, and
+    differences from the rule engine.
 
 Acceptance: git sttus -> typo offers git status with a reason; accepting
 executes it once. Aborting or a denied safety decision executes nothing.
@@ -732,7 +776,7 @@ executes it once. Aborting or a denied safety decision executes nothing.
 [ ] NOT DONE: Add parser/edit fixtures for nested quotes, Unicode, pipelines,
     wrappers, redirects, substitutions, malformed input, and each dialect.
     PARTIAL: sh/bash/zsh fixtures exist; other dialects are pending.
-[ ] NOT DONE: Add meaningful provider fixtures with isolated directories,
+[x] DONE: Add meaningful provider fixtures with isolated directories,
     history, fake executables, help/man text, unavailable tools, and timeouts.
 [x] DONE: Add fake native completers for aws/gcloud/az that introduce
     previously unknown groups/operations/flags and extensions between requests.
@@ -740,18 +784,22 @@ executes it once. Aborting or a denied safety decision executes nothing.
 [ ] NOT DONE: Extend this upgrade/extension corpus to every native protocol
     family and every provider/client entry in section 5A. Keep per-executable
     discovery, completion, correction, and environment coverage records.
+    PARTIAL: aws_completer and argcomplete fakes change between requests; git,
+    cobra, and posener have protocol fixtures but no upgrade cases.
 [ ] NOT DONE: Test mid-command token replacement, empty-prefix enumeration,
     multiple typos, nested groups, global flags, enum/resource values, quoting,
     and shell-specific native completion responses.
     PARTIAL: mid-command, empty-prefix, multiple typos, nested groups, global
-    options, and quoting are covered; values and shell-specific responses
-    are not.
-[ ] NOT DONE: Verify context separation and graceful outcomes for absent CLIs,
+    options, enum values, and quoting are covered; resource values and
+    shell-specific responses are not.
+[x] DONE: Verify context separation and graceful outcomes for absent CLIs,
     absent completers, expired credentials, offline mode, denied API reads,
     extension changes, and slow or malformed completion output.
 [ ] NOT DONE: Add opt-in integration checks for the installed clients in the
     complete cloud CLI inventory without cloud writes. Cover static completion
     without credentials; use explicit test context for any live resource reads.
+    PARTIAL: tests/installed_clis.rs (--ignored) covers the 13 installed clients;
+    the rest of the inventory has no check yet.
 [ ] NOT DONE: Test side-effect-free discovery/print-only paths and denied
     execution using marker files and instrumented fake subprocesses.
     PARTIAL: marker tests cover capture, discovery, --explain, and refusal; an
@@ -760,18 +808,23 @@ executes it once. Aborting or a denied safety decision executes nothing.
     diagnoses, malicious completion/help output, and noninteractive refusal.
     PARTIAL: hint injection, declared callbacks, ambiguity, and noninteractive
     refusal are tested; malicious completion/help output is not.
-[ ] NOT DONE: Build a labeled correction corpus; report top-1/top-3 accuracy,
+[x] DONE: Build a labeled correction corpus; report top-1/top-3 accuracy,
     ambiguity/abstention rates, and unsafe automatic acceptances.
+    tests/corpus.rs: top-1 98.7%, top-3 100%, asked 4.1%, abstained 0%,
+    wrong automatic decisions 0%.
 [ ] NOT DONE: Benchmark each pipeline stage and end-to-end cold/warm CLI
     latency (median and p95), subprocess counts, cache behavior, and RSS.
     Compare with the current Rust engine and the existing Python baseline.
-[ ] NOT DONE: Set latency/memory budgets from measurements; preserve the
+    PARTIAL: benches/engine.rs (stages) and benchmarks/structured.py (cold/warm,
+    probes, RSS, rule engine where rerunning is harmless); not yet compared
+    with the Python baseline.
+[x] DONE: Set latency/memory budgets from measurements; preserve the
     inexpensive common-command path and report quality/performance tradeoffs.
-[ ] NOT DONE: Run cargo fmt --all -- --check; cargo test --locked --all-targets;
+    Engine work stays under ~2 ms per correction; probes are bounded by
+    probe_timeout (3 s each, 9 s total); the rule engine path is unchanged.
+[x] DONE: Run cargo fmt --all -- --check; cargo test --locked --all-targets;
     cargo clippy --locked --all-targets --all-features -- -D warnings; and
     relevant benchmarks. Keep Linux Clippy verification in CI.
-    PARTIAL: fmt, tests, and clippy pass for the first slice; benchmarks of the new
-    engine are pending.
 [ ] NOT DONE: Validate Linux/macOS/Windows/FreeBSD builds and available real
     shell integrations. Report unavailable runtime coverage explicitly.
 [ ] NOT DONE: Verify cargo package and cargo publish --dry-run --locked;

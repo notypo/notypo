@@ -43,26 +43,42 @@ notypo --explain 'aws ec2 describ-instances --regoin eu-west-1'
 
 `--explain` prints the diagnosis, candidates, evidence, and safety decision without running anything. With the shell alias, `typo` offers `aws ec2 describe-instances --region eu-west-1`.
 
-How it works:
+Where the corrections come from:
 
-- The command line is parsed losslessly: an edit replaces only the misspelled word, and quotes, pipelines, redirections, and comments keep their exact bytes. Compound commands, here-documents, and fish/PowerShell/tcsh lines are reported as unsupported.
-- For `aws`, `gcloud`, and `az`, the app's own completer (`aws_completer`, or argcomplete for gcloud and az) lists the valid subcommands and options at each level, so new commands and installed extensions work without a notypo update. Other argcomplete apps are probed only when listed in `trusted_completers`.
-- Completer probes run offline. They have no credentials, HTTP goes to a closed local port, and only command and option positions are queried, never resource names. The failed command is never rerun unless `replay_for_diagnosis` is on and the command is low-risk.
-- Missing executables are matched against `$PATH`, aliases, and builtins. "Did you mean" hints in captured output help apps without a completer. The shell functions pass the failed command's exit status, which strengthens the diagnosis.
-- Every candidate passes a safety gate. Added `sudo`, deletions, force flags, destructive git or cloud operations, package changes, new redirections, operators, or substitutions all need explicit approval, even with `-y`. Without a terminal to ask on, nothing runs. Close candidates also need a choice. The gate is a heuristic, not a proof that a command is harmless.
-- If the engine finds nothing, legacy rules still run on any captured output, through the same gate.
+- **The app itself.** notypo asks the installed app's own completer what is valid at each level and only proposes words it lists, so new commands and installed extensions work without a notypo update. Built-in bridges cover `aws` (`aws_completer`), `gcloud` and `az` (argcomplete), and `git` (`--list-cmds` and `--git-completion-helper`, run in an empty repository). Go apps are recognized from the module information in their binaries: kubectl, helm, gh, Hetzner's hcloud, kind, and docker speak cobra; terraform, tofu, and packer speak posener/complete. Other argcomplete, cobra, or posener apps are probed only when listed in `trusted_completers`.
+- **Option values** such as regions or output formats are checked against the app's offline value lists. Resource names (instances, buckets) are looked up only with `network_completion`, using your credentials, read-only.
+- **Without a completer**, the first level and options are checked against the man page (formatted by the system `man`; the program never runs), `--help` output for programs in `trusted_help`, and your shell history. These lists can be incomplete, so a close match is offered for confirmation rather than run.
+- **Programs and paths:** misspelled programs are matched against `$PATH`, aliases, and builtins. A program whose own completer accepts the rest of the line ranks first. Missing paths, including `cd` targets, are repaired from the filesystem. Commands run through `npx`, `uvx`, `pipx run`, `bundle exec`, and similar are repaired as the installed program they run; nothing is downloaded.
+- **Error output**, when the shell logger or instant mode captured it, confirms the diagnosis, and "did you mean" hints raise matching candidates. Printed hints are untrusted text: they only ever become a quoted word.
+- If the engine finds nothing, legacy rules still run on any captured output, through the same safety gate.
+
+How it stays safe:
+
+- The command line is parsed losslessly: an edit replaces only the misspelled word, and quotes, pipelines, redirections, and comments keep their exact bytes. Compound commands, here-documents, and fish/PowerShell/tcsh lines get an explicit "unsupported" result.
+- The failed command is never rerun, unless `replay_for_diagnosis` is on and the command is low-risk.
+- Completer probes run offline by default: no credentials, HTTP to a closed local port, no kubeconfig or Docker daemon. Each probe is time-limited, its output is capped, and its whole process tree is killed when time runs out. Answers are cached by the app's fingerprint, but a cached list can only confirm a word: the app is asked again before anything is called invalid.
+- Every candidate passes a safety gate. These all need explicit approval, even with `-y`: added `sudo`, deletions, force or auto-approve flags, destructive git or cloud operations, package changes, changed write targets, and new redirections, operators, or substitutions. Close or weakly supported candidates also need a choice. Without a terminal to ask on, nothing runs. The gate is a heuristic, not a proof that a command is harmless.
+- The shell functions pass the failed command's exit status (and pipeline statuses) to notypo, which strengthens the diagnosis.
+
+`--json` prints the same report as `--explain`, as JSON on stdout, for automation.
 
 Engine settings (`settings.py` name, then environment variable):
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `engine` / `NOTYPO_ENGINE` | `legacy` | `native` enables the structured engine |
-| `disabled_sources` / `NOTYPO_DISABLED_SOURCES` | `[]` | any of `native`, `executables`, `stderr`, `legacy` |
-| `trusted_completers` / `NOTYPO_TRUSTED_COMPLETERS` | `[]` | extra argcomplete apps to probe; `*` for all |
-| `probe_timeout` / `NOTYPO_PROBE_TIMEOUT` | `3` | seconds per completer probe (three times that in total) |
+| `disabled_sources` / `NOTYPO_DISABLED_SOURCES` | `[]` | any of `native`, `executables`, `stderr`, `history`, `filesystem`, `man`, `help`, `legacy` |
+| `trusted_completers` / `NOTYPO_TRUSTED_COMPLETERS` | `[]` | extra argcomplete/cobra/posener apps to probe; `*` for all |
+| `trusted_help` / `NOTYPO_TRUSTED_HELP` | `[]` | programs that may be run with `--help`; `*` for all |
+| `network_completion` / `NOTYPO_NETWORK_COMPLETION` | `False` | let completers look up resource names with your credentials |
+| `probe_timeout` / `NOTYPO_PROBE_TIMEOUT` | `3` | seconds per probe (three times that in total) |
 | `replay_for_diagnosis` / `NOTYPO_REPLAY_FOR_DIAGNOSIS` | `False` | rerun low-risk commands to read their output |
 
-Not yet supported: completion caches, history/filesystem/help/man sources, git and other app bridges, option values and resource names, and dialects other than sh/bash/zsh.
+Accuracy and speed: on a corpus of 715 typos in real aws, gcloud, az, git, kubectl, docker, helm, and system command names (`tests/corpus.rs`), the first suggestion is right 98.7% of the time and one of the first three 100%. The engine decides alone in 95.9% of cases with no wrong decisions, and asks otherwise. The engine itself takes about a millisecond. End to end, time is the app's completer: 20–70 ms for git and Go CLIs, 200–450 ms warm for the Python cloud CLIs (`benchmarks/structured-results.md`).
+
+Compared with the rule engine, the structured engine never reruns the failed command, so rules that need output only work when the shell logger or instant mode captured it. `-y` no longer runs risky or uncertain corrections. Rule suggestions with side effects (`dirty_untar`, `dirty_unzip`, `ssh_known_hosts`) always ask first. To check the installed CLIs on your machine: `cargo test --test installed_clis -- --ignored --nocapture`.
+
+Not yet supported: fish, PowerShell, and tcsh command lines; shell completion functions (bash/zsh/fish/PowerShell) as a source; other completion protocols (click, oclif, yargs).
 
 ## Performance
 
