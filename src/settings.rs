@@ -43,6 +43,10 @@ pub struct Settings {
     /// subcommands, to read options and values; `*` trusts all. Running a
     /// program is never free of risk.
     pub trusted_help: Vec<String>,
+    /// Directories (and everything below them) where programs may evaluate
+    /// project files to list their commands, such as make reading a
+    /// Makefile; `*` trusts every directory (see [`crate::workspace`]).
+    pub trusted_workspaces: Vec<String>,
     /// Seconds a single discovery probe (such as a native completer) may run.
     pub probe_timeout: f64,
     /// Lets the structured engine rerun the failed command to read its
@@ -84,6 +88,7 @@ impl Default for Settings {
             disabled_sources: Vec::new(),
             trusted_completers: Vec::new(),
             trusted_help: Vec::new(),
+            trusted_workspaces: Vec::new(),
             probe_timeout: 3.0,
             replay_for_diagnosis: false,
             network_completion: false,
@@ -122,6 +127,7 @@ const DEFAULTS_DOC: &str = "# rules = [<const: All rules enabled>]
 # disabled_sources = []
 # trusted_completers = []
 # trusted_help = []
+# trusted_workspaces = []
 # probe_timeout = 3
 # replay_for_diagnosis = False
 # network_completion = False
@@ -243,10 +249,13 @@ impl Settings {
             next.disabled_sources = list(&v).into_iter().filter(|s| !s.is_empty()).collect();
         }
         if let Some(v) = var("NOTYPO_TRUSTED_COMPLETERS") {
-            next.trusted_completers = list(&v).into_iter().filter(|s| !s.is_empty()).collect();
+            next.trusted_completers = completion_trust_from_env(&v);
         }
         if let Some(v) = var("NOTYPO_TRUSTED_HELP") {
-            next.trusted_help = list(&v).into_iter().filter(|s| !s.is_empty()).collect();
+            next.trusted_help = completion_trust_from_env(&v);
+        }
+        if let Some(v) = var("NOTYPO_TRUSTED_WORKSPACES") {
+            next.trusted_workspaces = paths_from_env(&v);
         }
         if let Some(v) = var("NOTYPO_PROBE_TIMEOUT") {
             next.probe_timeout = v
@@ -362,11 +371,12 @@ impl Settings {
                 Some(s) => self.fixlinecmd = s.to_owned(),
                 None => return false,
             },
-            "disabled_sources" | "trusted_completers" | "trusted_help" => {
+            "disabled_sources" | "trusted_completers" | "trusted_help" | "trusted_workspaces" => {
                 let Some(list) = strings(v) else { return false };
                 match key {
                     "disabled_sources" => self.disabled_sources = list,
                     "trusted_completers" => self.trusted_completers = list,
+                    "trusted_workspaces" => self.trusted_workspaces = list,
                     _ => self.trusted_help = list,
                 }
             }
@@ -387,6 +397,33 @@ impl Settings {
         }
         true
     }
+}
+
+fn completion_trust_from_env(value: &str) -> Vec<String> {
+    // Keep the established colon-separated list of names. Namespaced
+    // identities need an unambiguous representation, so also accept JSON.
+    let entries = if value.trim_start().starts_with('[') {
+        serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
+    } else {
+        value.split(':').map(str::to_owned).collect()
+    };
+    entries
+        .into_iter()
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// Directories in the platform's path-list form (`:` on Unix, `;` on
+/// Windows), or a JSON array.
+fn paths_from_env(value: &str) -> Vec<String> {
+    let entries: Vec<String> = if value.trim_start().starts_with('[') {
+        serde_json::from_str(value).unwrap_or_default()
+    } else {
+        std::env::split_paths(value)
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    };
+    entries.into_iter().filter(|e| !e.is_empty()).collect()
 }
 
 fn rules_from_env(v: &str) -> (bool, Vec<String>) {
@@ -793,11 +830,34 @@ no_colors = True
     }
 
     #[test]
+    fn completion_trust_environment_preserves_namespaced_identities() {
+        for (value, expected) in [
+            (r#"["python:pip"]"#, vec!["python:pip"]),
+            (r#"["npm:@scope/tool"]"#, vec!["npm:@scope/tool"]),
+            (
+                r#"["tool","python:pip","npm:npm","other"]"#,
+                vec!["tool", "python:pip", "npm:npm", "other"],
+            ),
+            ("npm:python:pip", vec!["npm", "python", "pip"]),
+            ("::tool::*:", vec!["tool", "*"]),
+            ("python", vec!["python"]),
+            ("npm:", vec!["npm"]),
+            ("", vec![]),
+            (r#"["", "*"]"#, vec!["*"]),
+            (r#"["python:pip", 4]"#, vec![]),
+            ("[broken", vec![]),
+        ] {
+            assert_eq!(completion_trust_from_env(value), expected, "{value}");
+        }
+    }
+
+    #[test]
     fn structured_engine_settings() {
         let mut s = Settings::default();
         s.apply_file(
-            "disabled_sources = ['stderr']\ntrusted_completers = ['mytool']\ntrusted_help = ['cargo']\nprobe_timeout = 1.5\nreplay_for_diagnosis = True\n",
+            "disabled_sources = ['stderr']\ntrusted_completers = ['mytool']\ntrusted_help = ['cargo']\ntrusted_workspaces = ['~/code']\nprobe_timeout = 1.5\nreplay_for_diagnosis = True\n",
         );
+        assert_eq!(s.trusted_workspaces, ["~/code"]);
         assert!(!s.is_source_enabled("stderr"));
         assert!(s.is_source_enabled("native"));
         assert_eq!(s.trusted_completers, ["mytool"]);
@@ -809,9 +869,11 @@ no_colors = True
             ("NOTYPO_DISABLED_SOURCES", "native:legacy"),
             ("NOTYPO_PROBE_TIMEOUT", "0.25"),
             ("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false"),
+            ("NOTYPO_TRUSTED_WORKSPACES", r#"["/work/a", "C:\\work"]"#),
         ]
         .into();
         s.apply_env(|k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(s.trusted_workspaces, ["/work/a", "C:\\work"]);
         assert_eq!(s.disabled_sources, ["native", "legacy"]);
         assert_eq!(s.probe_timeout, 0.25);
         assert!(!s.replay_for_diagnosis);

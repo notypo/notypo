@@ -8,7 +8,8 @@
 //! Discovery is offline by default. Completers can reach the network for
 //! resource names or update checks, so every probe runs with outbound HTTP
 //! routed to a closed local port and, where the protocol allows it, without
-//! credentials. Only command, group, and option positions are queried.
+//! credentials. Local resource answers stay offline and require approval;
+//! network resource queries require the separate network policy.
 
 use super::probe::{self, Budget, Capture, Probe, ProbeError};
 use crate::shlex;
@@ -20,11 +21,22 @@ use std::rc::Rc;
 use std::{env, fs};
 
 mod bash;
+mod cargo;
+mod clap;
+mod click;
 mod fish;
 mod git;
 mod go;
 mod identity;
+mod kingpin;
+mod node;
+mod npm;
+mod pip;
+pub mod powershell;
+mod urfave;
 mod zsh;
+
+pub use identity::package_manager_name;
 
 /// One valid word for a position, as reported by the app.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +120,35 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
     /// Stable identity, such as `aws` or `argcomplete`.
     fn id(&self) -> &str;
     fn capabilities(&self) -> Capabilities;
+    /// Some protocols enumerate every top-level command but return partial
+    /// option or resource lists deeper in the command. Describe that position.
+    fn capabilities_for(&self, _words: &[&str]) -> Capabilities {
+        self.capabilities()
+    }
+    /// A positional list known to contain resource names rather than command
+    /// vocabulary, even when the resources are local and require no network.
+    fn candidates_are_resources(&self, _words: &[&str]) -> bool {
+        false
+    }
+    /// A mixed list may include command words and local selectors/resources.
+    fn candidate_is_resource(&self, words: &[&str], _item: &CompletionItem) -> bool {
+        self.candidates_are_resources(words)
+    }
+    /// Only a protocol with a declared value grammar may interpret slashes
+    /// as something other than paths or URIs.
+    fn value_syntax_contains_slashes(&self, _words: &[&str]) -> bool {
+        false
+    }
+    /// Adapt a declared value list to compound values, preserving separators
+    /// and already valid components. The default uses individual words.
+    fn prepare_value_candidates(
+        &self,
+        _words: &[&str],
+        _typed: &str,
+        items: Vec<CompletionItem>,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        Ok(items)
+    }
     /// Words valid after `words` (the arguments following the program name)
     /// that start with `prefix`. `Ok(vec![])` means the app knows of none.
     /// Always offline.
@@ -144,6 +185,32 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
     ) -> Result<Vec<CompletionItem>, CompletionError> {
         self.complete_values(words, budget)
     }
+
+    /// Whether `typed`, missing from a partial list after `words`, is still
+    /// a command the app accepts (an alias or hidden name it doesn't list).
+    /// `None` when the protocol can't tell.
+    fn confirms(&self, _words: &[&str], _typed: &str, _budget: &mut Budget) -> Option<bool> {
+        None
+    }
+
+    /// The first word that isn't an option starts arguments of another
+    /// program (node's script), so later words are not the app's to check.
+    fn arguments_end_options(&self) -> bool {
+        false
+    }
+
+    /// The listed option `typed` names under the protocol's own matching
+    /// rules, when they go beyond exact spelling (PowerShell parameters
+    /// ignore case and accept aliases and unambiguous prefixes). `None`
+    /// leaves exact matching in charge.
+    fn resolve_option(
+        &self,
+        _words: &[&str],
+        _typed: &str,
+        _budget: &mut Budget,
+    ) -> Option<CompletionItem> {
+        None
+    }
 }
 
 /// The protocol family of a discovered backend.
@@ -164,6 +231,22 @@ pub enum Flavor {
     /// Go apps built with posener/complete (HashiCorp tools): `COMP_LINE`
     /// in, one word per line out.
     Posener,
+    /// clap_complete's dynamic protocol, declared by an app-generated script.
+    ClapDynamic,
+    /// pip's `PIP_AUTO_COMPLETE`/`COMP_WORDS` protocol (opt-in).
+    Pip,
+    /// npm's `completion -- <words>` and COMP_* protocol (opt-in).
+    Npm,
+    /// Cargo's installed command list and bounded documentation/metadata.
+    Cargo,
+    /// Go apps built with urfave/cli: `app <commands> [-] <completion flag>`.
+    Urfave,
+    /// Click 8 apps: `<VAR>=bash_complete` with COMP_WORDS/COMP_CWORD.
+    Click,
+    /// Go apps built with kingpin or fisk: `app --completion-bash <words>`.
+    Kingpin,
+    /// Node.js's own option list, from `node --completion-bash`.
+    Node,
     /// A function registered by the app's bash completion script (opt-in).
     BashFunction,
     /// An installed fish completion script, using `complete --do-complete`.
@@ -209,6 +292,12 @@ pub struct Backend {
     pub helper: Option<PathBuf>,
     /// The actual app when another executable (a shell/helper) performs completion.
     pub application: Option<PathBuf>,
+    /// The invocation learned from a generated script, never a guessed variable.
+    clap: Option<Box<clap::Protocol>>,
+    cargo: Option<Box<cargo::Protocol>>,
+    urfave: Option<Box<urfave::Protocol>>,
+    click: Option<Box<click::Protocol>>,
+    kingpin: Option<Box<kingpin::Protocol>>,
     memo: ProbeMemo,
 }
 
@@ -222,6 +311,7 @@ impl Eq for Backend {}
 
 impl Backend {
     pub fn new(flavor: Flavor, name: &str, completer: PathBuf) -> Backend {
+        let cargo = (flavor == Flavor::Cargo).then(|| Box::new(cargo::Protocol::new(&completer)));
         Backend {
             flavor,
             name: name.to_owned(),
@@ -230,6 +320,11 @@ impl Backend {
             network: false,
             helper: None,
             application: None,
+            clap: None,
+            cargo,
+            urfave: None,
+            click: None,
+            kingpin: (flavor == Flavor::Kingpin).then(Box::default),
             trust: match flavor {
                 Flavor::AwsCompleter | Flavor::Gcloud | Flavor::Azure | Flavor::Git => {
                     Trust::Bridge
@@ -255,7 +350,19 @@ impl Backend {
     /// `None` when answers depend on the working directory (git reads
     /// aliases from the repository's configuration).
     pub fn cache_identity(&self) -> Option<String> {
-        if self.flavor == Flavor::Git {
+        // urfave/cli and click callbacks can read the working directory's
+        // project (lefthook's hooks, flask's application).
+        if matches!(
+            self.flavor,
+            Flavor::Git
+                | Flavor::ClapDynamic
+                | Flavor::Pip
+                | Flavor::Npm
+                | Flavor::Cargo
+                | Flavor::Urfave
+                | Flavor::Click
+                | Flavor::Kingpin
+        ) {
             return None;
         }
         let real = fs::canonicalize(&self.completer).ok();
@@ -363,6 +470,147 @@ pub fn discover_for_shell(
     }
 }
 
+/// Discovery that may read a trusted app's documented completion generator.
+/// Metadata probes consume the same budget as completion queries. Existing
+/// protocol discovery stays read-only and available to library callers.
+pub fn discover_for_shell_with_budget(
+    name: &str,
+    path: &Path,
+    trusted: &[String],
+    trusted_help: &[String],
+    shell: crate::shells::Shell,
+    budget: &mut Budget,
+) -> Discovery {
+    let mut found = discover_for_shell(name, path, trusted, shell);
+    if let Discovery::Found(backend) = &mut found
+        && let Some(protocol) = &mut backend.cargo
+    {
+        protocol.trusted = trusted.to_vec();
+        protocol.trusted_help = trusted_help.to_vec();
+        protocol.shell = shell;
+        return found;
+    }
+    if let Discovery::Found(backend) = &mut found
+        && let Some(protocol) = &mut backend.urfave
+    {
+        protocol.trusted_help = trusted_help.to_vec();
+        return found;
+    }
+    if let Discovery::Found(backend) = &mut found
+        && let Some(protocol) = &mut backend.kingpin
+    {
+        protocol.trusted_help = trusted_help.to_vec();
+        let protocol = protocol.clone();
+        if !protocol.allowed(backend) {
+            return Discovery::NotTrusted(format!(
+                "{} uses kingpin, whose completion runs the app's pre-actions and flag defaults; add it to trusted_help as well to use it",
+                described(&backend.name, backend.identity.as_deref())
+            ));
+        }
+        return found;
+    }
+    if !matches!(
+        &found,
+        Discovery::None
+            | Discovery::Found(Backend {
+                flavor: Flavor::BashFunction | Flavor::FishScript | Flavor::ZshFunction,
+                ..
+            })
+    ) {
+        return found;
+    }
+    if !probe::is_trusted_location(path) {
+        return found;
+    }
+    let app_identity = match &found {
+        Discovery::Found(backend) => backend.identity.clone(),
+        _ => identity::identify(path),
+    };
+    if !identity::is_trusted(trusted, app_name(name), app_identity.as_deref()) {
+        return found;
+    }
+    // Prefer a direct bridge for installed dynamic scripts; no shell needs to
+    // load or execute their registration code.
+    if let Discovery::Found(backend) = &found
+        && let Some(script) = &backend.helper
+        && let Some(text) = clap::read_script(script, budget.max_output)
+    {
+        if let Some(protocol) = clap::Protocol::from_script(&text, name, path) {
+            return Discovery::Found(
+                clap::backend(name, path, app_identity, protocol).with_helper(script.clone()),
+            );
+        }
+        if let Some(protocol) = click::Protocol::from_script(&text, name, path) {
+            return Discovery::Found(
+                click::backend(name, path, app_identity, protocol).with_helper(script.clone()),
+            );
+        }
+        // Loading this file runs the app's generator; run it directly.
+        if let Ok(Some(protocol)) = clap::shim_protocol(&text, name, path, budget) {
+            return Discovery::Found(
+                clap::backend(name, path, app_identity, protocol).with_helper(script.clone()),
+            );
+        }
+    }
+    // fish 4 embeds its completion scripts. For fish users they come before
+    // another shell's handler, and otherwise when nothing else answers.
+    let fish_user = shell == crate::shells::Shell::Fish;
+    let embedded = |budget: &mut Budget, identity: Option<String>| {
+        if !fish_user {
+            return None;
+        }
+        fish::embedded(app_name(name), budget).map(|(fish, script)| {
+            let mut backend =
+                Backend::new(Flavor::FishScript, app_name(name), fish).with_helper(script);
+            backend.identity = identity;
+            Discovery::Found(backend.with_application(path.to_owned()))
+        })
+    };
+    if fish_user
+        && matches!(
+            &found,
+            Discovery::Found(backend)
+                if matches!(backend.flavor, Flavor::BashFunction | Flavor::ZshFunction)
+        )
+        && let Some(found) = embedded(budget, app_identity.clone())
+    {
+        return found;
+    }
+    // Trusting a shell handler doesn't authorize starting its application to
+    // ask for help. Use the established help-probe permission separately.
+    let helped = trusted_help
+        .iter()
+        .any(|trusted| trusted == "*" || trusted == name || Some(trusted) == app_identity.as_ref());
+    // A Python console script may be a click app; its help says so. Python
+    // apps don't generate clap scripts.
+    let generated = if !helped {
+        Ok(None)
+    } else if app_identity
+        .as_deref()
+        .is_some_and(|identity| identity.starts_with("python:"))
+    {
+        click::discover_from_help(path, budget).map(|found| {
+            found.map(|protocol| click::backend(name, path, app_identity.clone(), protocol))
+        })
+    } else {
+        clap::discover_generated(name, path, budget).map(|found| {
+            found.map(|protocol| clap::backend(name, path, app_identity.clone(), protocol))
+        })
+    };
+    match generated {
+        Ok(Some(backend)) => Discovery::Found(backend),
+        Ok(None) if matches!(found, Discovery::None) => {
+            embedded(budget, app_identity).unwrap_or(found)
+        }
+        Ok(None) => found,
+        Err(error) => match found {
+            Discovery::None => embedded(budget, app_identity)
+                .unwrap_or_else(|| Discovery::Unavailable(format!("completion metadata: {error}"))),
+            other => other,
+        },
+    }
+}
+
 /// Looks for an installed shell completion handler: name, trust, identity.
 type HandlerDiscovery = fn(&str, &[String], Option<&str>) -> Discovery;
 
@@ -454,8 +702,54 @@ fn discover_protocol(
     let name = app_name(name);
     let found =
         |flavor, completer: PathBuf| Discovery::Found(Backend::new(flavor, name, completer));
+    // Console-script metadata establishes the entry module, including
+    // versioned or renamed pip launchers. A basename alone proves nothing.
+    if identity == Some("python:pip") {
+        return if identity::is_trusted(trusted, name, identity) {
+            found(Flavor::Pip, path.to_owned())
+        } else {
+            Discovery::NotTrusted(format!(
+                "{} supports pip completion; add it to trusted_completers to use it",
+                described(name, identity)
+            ))
+        };
+    }
+    if identity == Some("npm:npm") {
+        if identity::npm_entrypoint(path) != Some("npm") {
+            return Discovery::Unavailable(
+                "this npm package entry point does not declare npm completion".into(),
+            );
+        }
+        // npm.cmd wrappers need a shell on Windows, and npm itself only
+        // supports this protocol in Git Bash. Do not interpolate raw words.
+        if cfg!(windows) {
+            return Discovery::Unavailable(
+                "native npm completion is unsupported on Windows".into(),
+            );
+        }
+        return if identity::is_trusted(trusted, name, identity) {
+            found(Flavor::Npm, path.to_owned())
+        } else {
+            Discovery::NotTrusted(format!(
+                "{} supports npm completion; add it to trusted_completers to use it",
+                described(name, identity)
+            ))
+        };
+    }
+    if identity == Some("rust:cargo") {
+        return if identity::is_trusted(trusted, name, identity) {
+            found(Flavor::Cargo, path.to_owned())
+        } else {
+            Discovery::NotTrusted(format!(
+                "{} provides its installed command list; add it to trusted_completers to use it",
+                described(name, identity)
+            ))
+        };
+    }
     match name {
         "git" => found(Flavor::Git, path.to_owned()),
+        // The answer must be node's own completion script.
+        "node" | "nodejs" => found(Flavor::Node, path.to_owned()),
         "aws" => match aws_completer(path) {
             Some(completer) => found(Flavor::AwsCompleter, completer),
             None => Discovery::None,
@@ -489,11 +783,15 @@ fn go_app(name: &str, path: &Path, trusted: &[String]) -> Discovery {
             if AUDITED_GO_APPS.iter().any(|(app, _)| *app == module.path) {
                 backend.trust = Trust::Audited;
             }
+            if flavor == Flavor::Urfave {
+                backend.urfave = urfave::linked(&module).ok().flatten().map(Box::new);
+            }
             backend.identity = Some(module.path);
             Discovery::Found(backend)
         }
         Err(GoRefusal::NoProtocol) => Discovery::None,
         Err(GoRefusal::NotTrusted(why)) => Discovery::NotTrusted(why),
+        Err(GoRefusal::Ambiguous(why)) => Discovery::Unavailable(why),
     }
 }
 
@@ -505,6 +803,9 @@ enum GoRefusal {
     /// It doesn't use a completion library notypo speaks.
     NoProtocol,
     NotTrusted(String),
+    /// It links libraries whose protocols differ, and no audit says which
+    /// one parses its command line. A wrong guess could run the app.
+    Ambiguous(String),
 }
 
 fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Flavor, GoRefusal> {
@@ -512,12 +813,49 @@ fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Fl
         .iter()
         .find(|(app, _)| *app == module.path)
         .map(|(_, flavor)| *flavor);
-    let flavor = if module.uses("github.com/posener/complete") {
+    let posener = module.uses("github.com/posener/complete");
+    let cobra = module.uses("github.com/spf13/cobra");
+    let kingpin = kingpin::linked(module);
+    // An app that doesn't speak one library's protocol runs normally when
+    // given its request (cobra's `__complete`, posener's empty command line,
+    // urfave/cli's or kingpin's flag). Only an audit settles which library
+    // parses the command line when several are linked.
+    let urfave = urfave::linked(module);
+    if audited.is_none() {
+        if let Err(why) = &urfave {
+            return Err(GoRefusal::Ambiguous(format!(
+                "{name} ({}) {why}",
+                module.path
+            )));
+        }
+        let linked: Vec<&str> = [
+            (posener, "posener/complete"),
+            (cobra, "cobra"),
+            (matches!(urfave, Ok(Some(_))), "urfave/cli"),
+            (kingpin, "kingpin"),
+        ]
+        .into_iter()
+        .filter_map(|(linked, library)| linked.then_some(library))
+        .collect();
+        // posener with cobra keeps its long-standing posener choice.
+        if linked.len() > 1 && linked != ["posener/complete", "cobra"] {
+            return Err(GoRefusal::Ambiguous(format!(
+                "{name} ({}) links {}; notypo can't tell which one parses its command line",
+                module.path,
+                linked.join(" and ")
+            )));
+        }
+    }
+    let flavor = if posener {
         Flavor::Posener
-    } else if module.uses("github.com/spf13/cobra") {
+    } else if cobra {
         Flavor::Cobra
     } else if let Some(flavor) = audited {
         flavor
+    } else if matches!(urfave, Ok(Some(_))) {
+        Flavor::Urfave
+    } else if kingpin {
+        Flavor::Kingpin
     } else {
         return Err(GoRefusal::NoProtocol);
     };
@@ -525,10 +863,11 @@ fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Fl
         return Err(GoRefusal::NotTrusted(format!(
             "{name} ({}) supports {} completion; add it to trusted_completers to use it",
             module.path,
-            if flavor == Flavor::Cobra {
-                "cobra"
-            } else {
-                "posener"
+            match flavor {
+                Flavor::Cobra => "cobra",
+                Flavor::Urfave => "urfave/cli",
+                Flavor::Kingpin => "kingpin",
+                _ => "posener",
             }
         )));
     }
@@ -647,6 +986,8 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
             // completer whenever the static tree can't answer.
             set("_ARGCOMPLETE_TRACE", "static"),
             set("CLOUDSDK_CORE_DISABLE_PROMPTS", "1"),
+            set("CLOUDSDK_CORE_CHECK_GCE_METADATA", "false"),
+            set("CLOUDSDK_AUTH_DISABLE_CREDENTIALS", "true"),
         ]),
         Flavor::Azure => {
             // A private config directory has no login, so resource completers
@@ -661,18 +1002,125 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
                 set("AZURE_CORE_NO_COLOR", "true"),
             ]);
         }
-        Flavor::Cobra => env.extend([
+        Flavor::Cobra | Flavor::ClapDynamic => env.extend([
             // Cluster, daemon, and API lookups (resource names) stay off.
             set("KUBECONFIG", null),
             set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
             set("GH_PROMPT_DISABLED", "1"),
         ]),
-        Flavor::Argcomplete
-        | Flavor::Git
-        | Flavor::Posener
-        | Flavor::BashFunction
-        | Flavor::FishScript
-        | Flavor::ZshFunction => {}
+        Flavor::Click => env.extend([
+            set("PYTHONDONTWRITEBYTECODE", "1"),
+            set("NO_COLOR", "1"),
+            set("TERM", "dumb"),
+            unset("PYTHONINSPECT"),
+            unset("PYTHONSTARTUP"),
+        ]),
+        Flavor::Node => env.extend([unset("NODE_OPTIONS"), unset("NODE_REPL_EXTERNAL_MODULE")]),
+        Flavor::Kingpin => env.extend([
+            set("KUBECONFIG", null),
+            set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
+            set("GIT_TERMINAL_PROMPT", "0"),
+        ]),
+        Flavor::Urfave => env.extend([
+            set("KUBECONFIG", null),
+            set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
+            set("GIT_TERMINAL_PROMPT", "0"),
+            // Either variable switches the answer to `name:usage` lines,
+            // whose words are ambiguous when a name contains a colon.
+            unset("0"),
+            unset("_CLI_ZSH_AUTOCOMPLETE_HACK"),
+        ]),
+        Flavor::Pip => env.extend([
+            set("PIP_CONFIG_FILE", null),
+            set("PIP_NO_INDEX", "1"),
+            set("PIP_DISABLE_PIP_VERSION_CHECK", "1"),
+            set("PIP_NO_INPUT", "1"),
+        ]),
+        Flavor::Npm => {
+            env.extend([
+                set("npm_config_offline", "true"),
+                set("npm_config_ignore_scripts", "true"),
+                set("npm_config_update_notifier", "false"),
+                set("npm_config_audit", "false"),
+                set("npm_config_fund", "false"),
+                set("npm_config_fetch_retries", "0"),
+                set("npm_config_logs_max", "0"),
+                set("npm_config_timing", "false"),
+                set("npm_config_loglevel", "silent"),
+                set("npm_config_color", "false"),
+                unset("COMP_FISH"),
+            ]);
+            // npm creates its cache directory during startup, even when
+            // logging and network requests are disabled. Keep it private.
+            env.push((
+                "npm_config_cache".into(),
+                Some(crate::utils::cache_dir().join("npm").into()),
+            ));
+            // npm rejects loading the same null file as both config layers.
+            // Missing, distinct paths disable each user's config separately.
+            for (key, file) in [
+                ("npm_config_userconfig", "disabled-user.npmrc"),
+                ("npm_config_globalconfig", "disabled-global.npmrc"),
+            ] {
+                env.push((
+                    key.into(),
+                    Some(crate::utils::cache_dir().join("npm").join(file).into()),
+                ));
+            }
+            // npm's config names ignore case. Remove inherited duplicates
+            // rather than depend on their environment iteration order.
+            let protected: Vec<_> = env
+                .iter()
+                .filter_map(|(key, _)| key.to_str())
+                .filter(|key| key.starts_with("npm_config_"))
+                .map(str::to_owned)
+                .collect();
+            env.extend(std::env::vars_os().filter_map(|(key, _)| {
+                key.to_str().and_then(|text| {
+                    let prefix = text.get(.."npm_config_".len())?;
+                    if !prefix.eq_ignore_ascii_case("npm_config_") {
+                        return None;
+                    }
+                    // npm also treats interior underscores as hyphens.
+                    let canonical = format!(
+                        "npm_config_{}",
+                        text["npm_config_".len()..]
+                            .replace('-', "_")
+                            .to_ascii_lowercase()
+                    );
+                    protected
+                        .iter()
+                        .any(|name| text != name && canonical == *name)
+                        .then(|| (key.clone(), None))
+                })
+            }));
+        }
+        Flavor::Cargo => env.extend([
+            set("RUSTUP_AUTO_INSTALL", "0"),
+            set("RUSTUP_NO_UPDATE_CHECK", "1"),
+            set("CARGO_NET_OFFLINE", "true"),
+            set("CARGO_HTTP_PROXY", BLOCKED_PROXY),
+            set("CARGO_TERM_COLOR", "never"),
+            set("CARGO_TERM_PROGRESS_WHEN", "never"),
+            unset("CARGO_COMPLETE"),
+            unset("CARGO_LOG"),
+            unset("CARGO_LOG_PROFILE"),
+            unset("CARGO_LOG_PROFILE_CAPTURE_ARGS"),
+        ]),
+        // Handwritten handlers run whatever their app does at startup. The
+        // Cloud SDK's wrappers (bq, gsutil) load credentials, probing the GCE
+        // metadata server without a proxy, and check for updates unless told
+        // not to.
+        Flavor::BashFunction | Flavor::FishScript | Flavor::ZshFunction => env.extend([
+            set("KUBECONFIG", null),
+            set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
+            set("GH_PROMPT_DISABLED", "1"),
+            set("CLOUDSDK_CORE_DISABLE_PROMPTS", "1"),
+            set("CLOUDSDK_CORE_CHECK_GCE_METADATA", "false"),
+            set("CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK", "true"),
+            set("CLOUDSDK_AUTH_DISABLE_CREDENTIALS", "true"),
+        ]),
+        Flavor::Argcomplete | Flavor::Git | Flavor::Posener => {}
     }
     env
 }
@@ -764,6 +1212,14 @@ impl NativeCompletionBackend for Backend {
             Flavor::Git => "git",
             Flavor::Cobra => "cobra",
             Flavor::Posener => "posener",
+            Flavor::ClapDynamic => "clap",
+            Flavor::Pip => "pip",
+            Flavor::Npm => "npm",
+            Flavor::Cargo => "cargo",
+            Flavor::Urfave => "urfave",
+            Flavor::Click => "click",
+            Flavor::Kingpin => "kingpin",
+            Flavor::Node => "node",
             Flavor::BashFunction => "bash",
             Flavor::FishScript => "fish",
             Flavor::ZshFunction => "zsh",
@@ -782,19 +1238,34 @@ impl NativeCompletionBackend for Backend {
     }
 
     fn capabilities(&self) -> Capabilities {
+        if let Some(protocol) = &self.cargo {
+            return protocol.capabilities(&self.name);
+        }
+        if let Some(protocol) = &self.urfave {
+            return protocol.capabilities(self.trust);
+        }
+        if let Some(protocol) = &self.click {
+            return protocol.capabilities(self.trust);
+        }
+        if let Some(protocol) = &self.kingpin {
+            return protocol.capabilities(self.trust);
+        }
         Capabilities {
             subcommands: true,
             options: true,
             option_arity: matches!(
                 self.flavor,
-                Flavor::Gcloud | Flavor::Git | Flavor::FishScript
+                Flavor::Gcloud | Flavor::Git | Flavor::FishScript | Flavor::Node
             ),
-            values: self.flavor != Flavor::Git,
-            resources: self.network && self.flavor != Flavor::Git,
+            // pip's empty-prefix answers can be options or nested command
+            // names while an enum argument is pending, not its valid choices.
+            values: !matches!(self.flavor, Flavor::Git | Flavor::Pip | Flavor::Npm),
+            resources: self.network
+                && !matches!(self.flavor, Flavor::Git | Flavor::Pip | Flavor::Npm),
             // gcloud's static tree only matches `--`; argparse apps list
             // every option (short ones too) for `-`; git lists long ones.
             option_prefix: match self.flavor {
-                Flavor::AwsCompleter | Flavor::Gcloud => "--",
+                Flavor::AwsCompleter | Flavor::Gcloud | Flavor::Npm => "--",
                 _ => "-",
             },
             short_options: matches!(
@@ -806,24 +1277,107 @@ impl NativeCompletionBackend for Backend {
                     | Flavor::BashFunction
                     | Flavor::FishScript
                     | Flavor::ZshFunction
+                    | Flavor::ClapDynamic
+                    | Flavor::Pip
+                    | Flavor::Node
             ),
-            // git's helper and hand-written completion scripts omit options.
+            // git's helper and hand-written completion scripts omit options;
+            // node's list omits V8 flags it passes through.
             complete_options: !matches!(
                 self.flavor,
-                Flavor::Git | Flavor::BashFunction | Flavor::FishScript | Flavor::ZshFunction
+                Flavor::Git
+                    | Flavor::BashFunction
+                    | Flavor::FishScript
+                    | Flavor::ZshFunction
+                    | Flavor::Pip
+                    | Flavor::Npm
+                    | Flavor::Node
             ),
             complete_subcommands: !matches!(
                 self.flavor,
-                Flavor::BashFunction | Flavor::FishScript | Flavor::ZshFunction
+                Flavor::BashFunction
+                    | Flavor::FishScript
+                    | Flavor::ZshFunction
+                    | Flavor::Pip
+                    | Flavor::Npm
             ),
-            descriptions: matches!(self.flavor, Flavor::Cobra | Flavor::FishScript),
+            descriptions: matches!(self.flavor, Flavor::Cobra | Flavor::FishScript)
+                || self
+                    .clap
+                    .as_deref()
+                    .is_some_and(clap::Protocol::descriptions),
             query_dialect: match self.flavor {
-                Flavor::Cobra | Flavor::Git => None,
+                Flavor::Cobra
+                | Flavor::Git
+                | Flavor::ClapDynamic
+                | Flavor::Pip
+                | Flavor::Npm
+                | Flavor::Node => None,
+                Flavor::Cargo => None,
                 Flavor::FishScript => Some(super::parser::Dialect::Fish),
                 _ => Some(super::parser::Dialect::Posix),
             },
             trust: self.trust,
         }
+    }
+
+    fn capabilities_for(&self, words: &[&str]) -> Capabilities {
+        if let Some(protocol) = &self.cargo {
+            let mut capabilities = protocol.capabilities(&self.name);
+            capabilities.complete_subcommands = cargo::root_context(words);
+            return capabilities;
+        }
+        if let Some(protocol) = &self.urfave {
+            return protocol.capabilities_for(words, self.trust);
+        }
+        if let Some(protocol) = &self.click {
+            return protocol.capabilities_for(words, self.trust);
+        }
+        let mut capabilities = self.capabilities();
+        if matches!(self.flavor, Flavor::Pip | Flavor::Npm) && words.is_empty() {
+            capabilities.complete_subcommands = true;
+        }
+        capabilities
+    }
+
+    fn candidates_are_resources(&self, words: &[&str]) -> bool {
+        match self.flavor {
+            Flavor::Pip => pip::resources(self, words),
+            Flavor::Npm => npm::resources(self, words),
+            _ => false,
+        }
+    }
+
+    fn candidate_is_resource(&self, words: &[&str], item: &CompletionItem) -> bool {
+        if self.flavor == Flavor::Cargo {
+            return item.value.starts_with('+') || cargo::resource_value(words);
+        }
+        if let Some(protocol) = &self.urfave {
+            return !item.is_option() && protocol.resources(self, words);
+        }
+        self.candidates_are_resources(words)
+    }
+
+    fn value_syntax_contains_slashes(&self, words: &[&str]) -> bool {
+        self.cargo
+            .as_ref()
+            .is_some_and(|protocol| protocol.feature_value(words))
+    }
+
+    fn prepare_value_candidates(
+        &self,
+        words: &[&str],
+        typed: &str,
+        items: Vec<CompletionItem>,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        if self
+            .cargo
+            .as_ref()
+            .is_some_and(|protocol| protocol.feature_value(words))
+        {
+            return cargo::feature_items(items, typed);
+        }
+        Ok(items)
     }
 
     fn complete(
@@ -848,6 +1402,21 @@ impl NativeCompletionBackend for Backend {
         words: &[&str],
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
+        if let Some(protocol) = &self.cargo {
+            return protocol.values(self, words, budget);
+        }
+        if let Some(protocol) = &self.click {
+            return protocol.values(self, words, budget);
+        }
+        if matches!(
+            self.flavor,
+            Flavor::Pip | Flavor::Npm | Flavor::Urfave | Flavor::Kingpin
+        ) {
+            return Err(CompletionError::Unsupported(format!(
+                "{} does not enumerate finite option-value choices",
+                self.id()
+            )));
+        }
         let env = if self.network {
             network_env(self.flavor)
         } else {
@@ -861,7 +1430,29 @@ impl NativeCompletionBackend for Backend {
         words: &[&str],
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
+        if matches!(
+            self.flavor,
+            Flavor::Pip
+                | Flavor::Npm
+                | Flavor::Cargo
+                | Flavor::Urfave
+                | Flavor::Click
+                | Flavor::Kingpin
+        ) {
+            return self.complete_values(words, budget);
+        }
         self.query(words, "", budget, offline_env(self.flavor))
+    }
+
+    fn arguments_end_options(&self) -> bool {
+        self.flavor == Flavor::Node
+    }
+
+    fn confirms(&self, words: &[&str], typed: &str, budget: &mut Budget) -> Option<bool> {
+        if let Some(protocol) = &self.kingpin {
+            return protocol.confirms(self, words, typed, budget);
+        }
+        self.urfave.as_ref()?.confirms(self, words, typed, budget)
     }
 }
 
@@ -878,8 +1469,63 @@ impl Backend {
                 "git completion does not list option values".into(),
             ));
         }
+        if self.flavor == Flavor::Node {
+            // Every other word is a file: the script and its arguments.
+            if !prefix.starts_with('-') {
+                return Ok(Vec::new());
+            }
+            let text = self.memoized(&["--completion-bash"], || {
+                node::print(&self.completer, "--completion-bash", env.clone(), budget)
+            })?;
+            let mut items =
+                node::parse(&text, budget.max_candidates).map_err(CompletionError::Failed)?;
+            // Without help, arity stays unknown rather than failing the list.
+            let help = self
+                .memoized(&["--help"], || {
+                    node::print(&self.completer, "--help", env, budget)
+                })
+                .unwrap_or_default();
+            let arity = node::arity(&help);
+            for item in &mut items {
+                if let Some(takes) = arity.get(&item.value) {
+                    item.takes_value = *takes;
+                }
+            }
+            return Ok(items);
+        }
         if self.flavor == Flavor::Cobra {
             return self.complete_cobra(words, prefix, budget, env);
+        }
+        if self.flavor == Flavor::ClapDynamic {
+            let protocol = self.clap.as_ref().ok_or_else(|| {
+                CompletionError::Unsupported("no generated completion protocol".into())
+            })?;
+            return protocol.complete(self, words, prefix, env, budget);
+        }
+        if self.flavor == Flavor::Pip {
+            // pip completion only reads local parser and environment metadata.
+            return pip::complete(self, words, prefix, budget);
+        }
+        if self.flavor == Flavor::Npm {
+            return npm::complete(self, words, prefix, budget);
+        }
+        if let Some(protocol) = &self.cargo {
+            return protocol.complete(self, words, prefix, budget);
+        }
+        if self.flavor == Flavor::Urfave {
+            let protocol = self.urfave.as_ref().ok_or_else(|| {
+                CompletionError::Unsupported("no urfave/cli release was identified".into())
+            })?;
+            return protocol.complete(self, words, prefix, budget);
+        }
+        if let Some(protocol) = &self.kingpin {
+            return protocol.complete(self, words, prefix, budget);
+        }
+        if self.flavor == Flavor::Click {
+            let protocol = self.click.as_ref().ok_or_else(|| {
+                CompletionError::Unsupported("no click completion variable is known".into())
+            })?;
+            return protocol.complete(self, words, prefix, budget);
         }
         if self.flavor == Flavor::BashFunction {
             let script = self
@@ -935,8 +1581,15 @@ impl Backend {
             | Flavor::Git
             | Flavor::Cobra
             | Flavor::BashFunction => line.chars().count(),
-            Flavor::FishScript | Flavor::ZshFunction => {
+            Flavor::FishScript
+            | Flavor::ZshFunction
+            | Flavor::ClapDynamic
+            | Flavor::Pip
+            | Flavor::Npm => {
                 unreachable!("shell queries use their own driver")
+            }
+            Flavor::Cargo | Flavor::Urfave | Flavor::Click | Flavor::Kingpin | Flavor::Node => {
+                unreachable!("these queries use their own bridge")
             }
             Flavor::Azure | Flavor::Argcomplete | Flavor::Posener => line.len(),
         };
@@ -988,11 +1641,7 @@ impl Backend {
         } else {
             '\x0b'
         };
-        Ok(normalize(
-            text.split(separator),
-            self.flavor,
-            budget.max_candidates,
-        ))
+        normalize_bounded(text.split(separator), self.flavor, budget.max_candidates)
     }
 }
 
@@ -1024,11 +1673,7 @@ impl Backend {
                 "the app reported a completion error here".into(),
             ));
         }
-        Ok(normalize(
-            lines.into_iter(),
-            Flavor::Cobra,
-            budget.max_candidates,
-        ))
+        normalize_bounded(lines.into_iter(), Flavor::Cobra, budget.max_candidates)
     }
 }
 
@@ -1049,6 +1694,24 @@ pub(crate) fn clean_description(text: &str) -> Option<String> {
         n if n > 120 => Some(line.chars().take(119).chain(['…']).collect()),
         _ => Some(line),
     }
+}
+
+/// [`normalize`], failing when the answer holds more distinct words than the
+/// limit: a cut list would make every word past the cut look invalid.
+fn normalize_bounded<'a>(
+    raw: impl Iterator<Item = &'a str>,
+    flavor: Flavor,
+    limit: usize,
+) -> Result<Vec<CompletionItem>, CompletionError> {
+    let items = normalize(raw, flavor, limit.saturating_add(1));
+    if items.len() > limit {
+        return Err(over_limit());
+    }
+    Ok(items)
+}
+
+fn over_limit() -> CompletionError {
+    CompletionError::Failed("the completion answer exceeded the candidate limit".into())
 }
 
 /// Trims protocol decoration and removes duplicates, keeping the app's order.
@@ -1466,6 +2129,7 @@ esac
         let module = |path: &str, libraries: &[&str]| go::GoModule {
             path: path.into(),
             libraries: libraries.iter().map(|l| l.to_string()).collect(),
+            versions: Default::default(),
         };
         let cobra = "github.com/spf13/cobra";
         assert_eq!(
@@ -1584,6 +2248,26 @@ esac
             "-auto-approve"
         );
         assert!(!dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn answers_past_the_candidate_limit_fail_instead_of_being_cut() {
+        let dir = Dir::new("candidate-limit");
+        let app = dir.script(
+            "bin/app",
+            "#!/bin/sh\nprintf 'alpha\\nbeta\\ngamma\\n:4\\n'\n",
+        );
+        let backend = Backend::new(Flavor::Cobra, "app", app);
+        let mut budget = budget();
+        budget.max_candidates = 3;
+        assert_eq!(backend.complete(&[], "", &mut budget).unwrap().len(), 3);
+        budget.max_candidates = 2;
+        // A cut list would call `gamma` invalid and offer `beta` for it.
+        assert!(matches!(
+            backend.complete(&["x"], "", &mut budget),
+            Err(CompletionError::Failed(why)) if why.contains("candidate limit")
+        ));
+        assert!(normalize_bounded(["a", "a", "b"].into_iter(), Flavor::Posener, 2).is_ok());
     }
 
     #[test]

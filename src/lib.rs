@@ -44,5 +44,6 @@ mod terminal;
 pub mod types;
 pub mod ui;
 pub mod utils;
+pub mod workspace;
 
 pub use app::run;

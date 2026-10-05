@@ -52,6 +52,47 @@ pub(super) fn script_for(name: &str) -> Option<PathBuf> {
             [name.to_owned(), format!("{name}.bash"), format!("_{name}")].map(|file| dir.join(file))
         })
         .find(|path| path.is_file())
+        .or_else(|| {
+            let compat: Vec<PathBuf> = ["/opt/homebrew", "/usr/local", "/usr", ""]
+                .iter()
+                .map(|prefix| PathBuf::from(format!("{prefix}/etc/bash_completion.d")))
+                .collect();
+            registering_script(name, &compat)
+        })
+}
+
+/// bash-completion sources every file in `bash_completion.d` at startup,
+/// and one file may register several commands (the Cloud SDK's registers
+/// gcloud, bq, and gsutil). Find a file whose text registers `name` with a
+/// function. Files are only read here; nothing is sourced.
+fn registering_script(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let registers = |line: &str| {
+        crate::shlex::split(line.trim()).is_ok_and(|words| {
+            words.first().is_some_and(|word| word == "complete")
+                && words.iter().any(|word| word == "-F")
+                && words.last().is_some_and(|word| word == name)
+        })
+    };
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .take(512)
+            .collect();
+        paths.sort();
+        for path in paths {
+            if !path.is_file() || path.metadata().map_or(true, |m| m.len() > 1024 * 1024) {
+                continue;
+            }
+            if std::fs::read_to_string(&path).is_ok_and(|text| text.lines().any(registers)) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 pub(super) fn complete(
@@ -87,11 +128,11 @@ pub(super) fn complete(
         }
         other => other,
     })?;
-    Ok(super::normalize(
+    super::normalize_bounded(
         text.lines(),
         super::Flavor::BashFunction,
         budget.max_candidates,
-    ))
+    )
 }
 
 #[cfg(all(test, unix))]
@@ -100,6 +141,23 @@ mod tests {
     use super::super::{Backend, Flavor, NativeCompletionBackend};
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn shared_compatibility_files_are_found_by_their_registrations() {
+        let dir = Dir::new("bash-compat");
+        let sdk = dir.script(
+            "bash_completion.d/google-cloud-sdk",
+            "_python_argcomplete() { :; }\ncomplete -o nospace -F _python_argcomplete \"gcloud\"\n_bq_completer() { :; }\ncomplete -F _bq_completer bq\ncomplete -o nospace -F _python_argcomplete gsutil\n# complete -F _old gsutil-old\n",
+        );
+        dir.script("bash_completion.d/other", "complete -W 'a b' words-only\n");
+        let dirs = [dir.0.join("missing"), dir.0.join("bash_completion.d")];
+        for name in ["gcloud", "bq", "gsutil"] {
+            assert_eq!(registering_script(name, &dirs), Some(sdk.clone()), "{name}");
+        }
+        for name in ["gsutil-old", "words-only", "complete", "missing"] {
+            assert_eq!(registering_script(name, &dirs), None, "{name}");
+        }
+    }
 
     #[test]
     fn calls_the_registered_function_with_the_command_words() {

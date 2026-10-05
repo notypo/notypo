@@ -142,6 +142,15 @@ fn raw_command(args: &Args, ctx: &Context) -> (Vec<String>, bool) {
     {
         return (vec![current], true);
     }
+    // PowerShell's function passes its last history entry (and its status
+    // and error records) the same way.
+    if ctx.shell == Shell::Powershell
+        && args.command.is_empty()
+        && let Ok(current) = env::var("NOTYPO_CURRENT_COMMAND")
+        && !current.trim().is_empty()
+    {
+        return (vec![current], true);
+    }
     // Zsh's `fc -ln -10` omits a multiline paste while it is executing.
     // The shell function supplies that event separately, with real newlines.
     if ctx.shell == Shell::Zsh
@@ -240,13 +249,26 @@ fn fix_with_engine(
         Some((text, origin)) => CapturedOutput::Combined { text, origin },
         None => CapturedOutput::Unknown,
     };
+    // PowerShell's error records for the history entry, when its function
+    // passed them along with the entry.
+    if output == CapturedOutput::Unknown
+        && status_applies
+        && ctx.shell == Shell::Powershell
+        && let Ok(text) = env::var("NOTYPO_POWERSHELL_ERRORS")
+        && !text.trim().is_empty()
+    {
+        output = CapturedOutput::Combined {
+            text: text.chars().take(16384).collect(),
+            origin: OutputOrigin::ShellErrors,
+        };
+    }
     let inspecting = args.explain || args.json;
     if output == CapturedOutput::Unknown
         && ctx.settings.replay_for_diagnosis
         && !inspecting
         && let Some(dialect) = engine::parser::Dialect::for_shell(ctx.shell)
     {
-        let gate = safety::assess_replay_with_dialect(expanded, dialect);
+        let gate = safety::assess_replay_with_context(expanded, dialect, ctx);
         if gate.decision == Decision::Allow {
             if let Some(text) = output_readers::get_output(script, expanded, &ctx.settings) {
                 output = CapturedOutput::Combined {
@@ -261,8 +283,11 @@ fn fix_with_engine(
             ));
         }
     }
+    // The engine reads aliases itself: it takes vocabulary from an alias's
+    // target, judges safety through the expansion, and keeps the word the
+    // user typed. Legacy rules and replay still see thefuck's expansion.
     let failure = FailureContext {
-        source: expanded.to_owned(),
+        source: script.to_owned(),
         cwd: env::current_dir().ok(),
         exit_status,
         pipe_status,
@@ -336,6 +361,7 @@ fn revalidate(
 /// engine can't always see without output), followed by the engine's.
 /// Rules are evaluated only when needed.
 struct EngineSuggestions<'c, 'a> {
+    context: &'a Context,
     native: Vec<Choice>,
     /// The engine's first candidate was chosen on its own evidence.
     decisive: bool,
@@ -383,6 +409,7 @@ impl<'c, 'a> EngineSuggestions<'c, 'a> {
             .is_source_enabled(engine::Source::LegacyRule.setting_name())
             .then(|| Corrector::new(command));
         EngineSuggestions {
+            context: command.ctx(),
             native,
             decisive: matches!(report.outcome, Outcome::Suggestion(_)),
             led_by_legacy: false,
@@ -404,7 +431,8 @@ impl<'c, 'a> EngineSuggestions<'c, 'a> {
             .map(|_| DeclaredEffect::for_rule(corrected.rule))
             .into_iter()
             .collect();
-        let assessment = safety::assess(&self.original, &corrected.script, &effects);
+        let assessment =
+            safety::assess_with_context(&self.original, &corrected.script, &effects, self.context);
         if assessment.decision == Decision::Refuse {
             logs::debug(format_args!(
                 "Refused {}: {}",
@@ -520,6 +548,10 @@ fn explain(failure: &FailureContext, report: &Report) -> String {
         "output:      {}",
         match &failure.output {
             CapturedOutput::Unknown => "not captured (the command is not rerun)".to_owned(),
+            CapturedOutput::Combined {
+                origin: OutputOrigin::ShellErrors,
+                ..
+            } => "ShellErrors (the shell's error records only)".to_owned(),
             CapturedOutput::Combined { origin, .. } =>
                 format!("{origin:?} (stdout and stderr combined)"),
             CapturedOutput::Separate { .. } => "stdout and stderr".to_owned(),
@@ -749,6 +781,55 @@ mod tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_choices_keep_package_identity_policy_without_native_completion() {
+        let dir = engine::native::tests::Dir::new("legacy-package-policy");
+        let executable = dir.script(
+            "package-tool",
+            "#!/usr/bin/env python3\nfrom pip._internal.cli.main import main\n",
+        );
+        let settings = Settings {
+            disabled_sources: [
+                "native",
+                "help",
+                "man",
+                "history",
+                "executables",
+                "filesystem",
+                "stderr",
+                "legacy",
+            ]
+            .map(String::from)
+            .into(),
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("package-tool", Some(executable.to_str().unwrap()));
+        let failure = FailureContext {
+            source: "package-tool instal example".into(),
+            ..FailureContext::default()
+        };
+        let report = engine::correct(&failure, &ctx);
+        assert_eq!(report.probes, 0);
+        let command = Command::new(&failure.source, None, &ctx);
+        let suggestions = EngineSuggestions::new(&report, &command);
+        let choice = suggestions
+            .gate(CorrectedCommand {
+                script: "package-tool install example".into(),
+                side_effect: None,
+                priority: 1,
+                rule: "test-rule",
+            })
+            .unwrap();
+        assert!(
+            choice
+                .concerns
+                .iter()
+                .any(|reason| reason.contains("changes installed packages"))
+        );
+    }
 
     #[test]
     fn selects_failed_command_from_pasted_zsh_event() {

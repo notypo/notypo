@@ -21,6 +21,43 @@ pub enum Shell {
 }
 
 /// How to install the alias (`Generic.how_to_configure`).
+/// How the parent PowerShell session resolved one command name of the
+/// failed line, with `Get-Command` in that session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PowerShellCommand {
+    /// `Cmdlet`, `Function`, `Alias`, `Application`, ...; empty when the
+    /// session has no command by that name.
+    pub kind: String,
+    /// The type of the command that runs: an alias's resolved command, or
+    /// the command itself.
+    pub target_kind: String,
+    /// That command's name, or an application's path.
+    pub target: String,
+}
+
+/// Lines of `name<TAB>kind<TAB>target kind<TAB>target`. Lines with any
+/// other shape are ignored, and a name reported twice keeps its first line.
+pub fn parse_powershell_commands(text: &str) -> HashMap<String, PowerShellCommand> {
+    let mut commands = HashMap::new();
+    for line in text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let [name, kind, target_kind, target] = line.split('\t').collect::<Vec<_>>()[..] else {
+            continue;
+        };
+        if name.is_empty() || name.chars().any(char::is_control) {
+            continue;
+        }
+        commands
+            .entry(name.to_lowercase())
+            .or_insert_with(|| PowerShellCommand {
+                kind: kind.to_owned(),
+                target_kind: target_kind.to_owned(),
+                target: target.to_owned(),
+            });
+    }
+    commands
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShellConfiguration {
     pub content: String,
@@ -420,12 +457,37 @@ impl Shell {
                      unsetenv NOTYPO_EXIT_STATUS NOTYPO_CURRENT_COMMAND'"
                 )
             }
+            // `$?` is read first. The session's own error records for the
+            // history entry stand in for an exit status and output: 127 when
+            // a command wasn't found, a native program's exit code when only
+            // it failed, 1 for other errors. `Get-Command` in the session
+            // reports what each command name of the line resolves to.
             Shell::Powershell => format!(
-                "function {name} {{\n    $history = (Get-History -Count 1).CommandLine;\n    \
+                "function {name} {{\n    \
+                 $notypo_succeeded = $?;\n    \
+                 $notypo_event = Get-History -Count 1;\n    \
+                 $history = $notypo_event.CommandLine;\n    \
                  if (-not [string]::IsNullOrWhiteSpace($history)) {{\n        \
+                 $notypo_errors = @($global:Error | Where-Object {{ $_.InvocationInfo -and $_.InvocationInfo.HistoryId -eq $notypo_event.Id }});\n        \
+                 [array]::Reverse($notypo_errors);\n        \
+                 $notypo_failures = @($notypo_errors | Where-Object {{ $_.FullyQualifiedErrorId -notlike 'NativeCommandError*' }});\n        \
+                 $env:NOTYPO_EXIT_STATUS = if ($notypo_succeeded) {{ 0 }} \
+                 elseif ($notypo_failures | Where-Object {{ $_.FullyQualifiedErrorId -eq 'CommandNotFoundException' }}) {{ 127 }} \
+                 elseif ($notypo_failures.Count -eq 0 -and $LASTEXITCODE) {{ $LASTEXITCODE }} else {{ 1 }};\n        \
+                 $notypo_text = ($notypo_errors | ForEach-Object {{ \"$_\" }}) -join \"`n\";\n        \
+                 $env:NOTYPO_POWERSHELL_ERRORS = $notypo_text.Substring(0, [Math]::Min($notypo_text.Length, 16384));\n        \
+                 $env:NOTYPO_POWERSHELL_COMMANDS = ([System.Management.Automation.Language.Parser]::ParseInput($history, [ref]$null, [ref]$null).FindAll({{ $args[0] -is [System.Management.Automation.Language.CommandAst] }}, $true) | \
+                 ForEach-Object {{ $_.GetCommandName() }} | Where-Object {{ $_ }} | Select-Object -Unique | ForEach-Object {{ \
+                 $notypo_found = Get-Command -Name ([WildcardPattern]::Escape($_)) -ErrorAction Ignore | Select-Object -First 1; \
+                 $notypo_runs = if ($notypo_found -and $notypo_found.CommandType -eq 'Alias') {{ $notypo_found.ResolvedCommand }} else {{ $notypo_found }}; \
+                 \"$_`t$($notypo_found.CommandType)`t$($notypo_runs.CommandType)`t$(if ($notypo_runs.CommandType -eq 'Application') {{ $notypo_runs.Source }} else {{ $notypo_runs.Name }})\" }}) -join \"`n\";\n        \
+                 $env:NOTYPO_CURRENT_COMMAND = $history;\n        \
+                 $env:NOTYPO_POWERSHELL = (Get-Process -Id $PID).Path;\n        \
                  $env:TF_SHELL = 'powershell';\n        \
                  $env:TF_ALIAS = '{name}';\n        \
-                 $fuck = $(& {exe} $args $history);\n        \
+                 $env:NOTYPO_SHELL_FUNCTIONS = (Get-ChildItem alias:, function: -Name) -join ' ';\n        \
+                 $fuck = $(& {exe} $args);\n        \
+                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
                  if (-not [string]::IsNullOrWhiteSpace($fuck)) {{\n            \
                  if ($fuck.StartsWith(\"echo\")) {{ $fuck = $fuck.Substring(5); }}\n            \
                  else {{ iex \"$fuck\"; }}\n        }}\n    }}\n    [Console]::ResetColor() \n}}\n"
@@ -497,12 +559,15 @@ impl Shell {
     pub fn get_functions(self) -> &'static std::collections::HashSet<String> {
         static FUNCTIONS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
         FUNCTIONS.get_or_init(|| match self {
-            Shell::Bash | Shell::Zsh | Shell::Fish => env::var("NOTYPO_SHELL_FUNCTIONS")
-                .unwrap_or_default()
-                .split_whitespace()
-                .filter(|name| !DEFAULT_ALIASES.contains(name))
-                .map(str::to_owned)
-                .collect(),
+            // PowerShell's names are compared without regard to case.
+            Shell::Bash | Shell::Zsh | Shell::Fish | Shell::Powershell => {
+                env::var("NOTYPO_SHELL_FUNCTIONS")
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter(|name| !DEFAULT_ALIASES.contains(name))
+                    .map(str::to_owned)
+                    .collect()
+            }
             _ => Default::default(),
         })
     }
@@ -525,6 +590,19 @@ impl Shell {
                 })
                 .unwrap_or_default(),
             Shell::Generic | Shell::Powershell | Shell::Fish => HashMap::new(),
+        })
+    }
+
+    /// How the parent PowerShell session resolved each command name of the
+    /// failed line (`NOTYPO_POWERSHELL_COMMANDS`), keyed by the lowercased
+    /// name. Memoized for the process.
+    pub fn get_powershell_commands(self) -> &'static HashMap<String, PowerShellCommand> {
+        static COMMANDS: OnceLock<HashMap<String, PowerShellCommand>> = OnceLock::new();
+        COMMANDS.get_or_init(|| match self {
+            Shell::Powershell => parse_powershell_commands(
+                &env::var("NOTYPO_POWERSHELL_COMMANDS").unwrap_or_default(),
+            ),
+            _ => HashMap::new(),
         })
     }
 
@@ -885,6 +963,29 @@ mod powershell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_session_reports_are_read_by_lowercased_name() {
+        let report = parse_powershell_commands(
+            "gci\tAlias\tCmdlet\tGet-ChildItem\r\n\
+             Get-ChildItme\t\t\t\n\
+             git\tApplication\tApplication\t/usr/bin/git\n\
+             GCI\tFunction\tFunction\tother\n\
+             broken line\n\
+             \tCmdlet\tCmdlet\tx\n",
+        );
+        assert_eq!(report.len(), 3);
+        assert_eq!(
+            report["gci"],
+            PowerShellCommand {
+                kind: "Alias".into(),
+                target_kind: "Cmdlet".into(),
+                target: "Get-ChildItem".into(),
+            }
+        );
+        assert!(report["get-childitme"].kind.is_empty());
+        assert_eq!(report["git"].target, "/usr/bin/git");
+    }
 
     #[test]
     fn powershell_preserves_windows_paths_and_quote_rules() {

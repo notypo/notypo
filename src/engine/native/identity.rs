@@ -6,10 +6,14 @@
 //! its name, and a renamed copy keeps it.
 
 use std::fs;
-use std::path::{Component, Path};
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
 /// `github.com/org/app/cmd/app`, `python:awscli`, or `npm:@scope/app`.
 pub fn identify(path: &Path) -> Option<String> {
+    if cargo_installation(path).is_some() {
+        return Some("rust:cargo".into());
+    }
     let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     if let Some(package) = npm_package(&real) {
         return Some(format!("npm:{package}"));
@@ -23,6 +27,102 @@ pub fn identify(path: &Path) -> Option<String> {
     super::go::module(&real).map(|module| module.path)
 }
 
+/// A package manager whose console-script/package metadata establishes its
+/// identity. Used by the safety gate without executing discovery subprocesses
+/// or scanning arbitrary native binaries for their build information.
+pub fn package_manager_name(path: &Path) -> Option<&'static str> {
+    if cargo_installation(path).is_some() {
+        return Some("cargo");
+    }
+    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    if let Some(entry) = npm_entrypoint(&real) {
+        return Some(entry);
+    }
+    let head = super::head(&real, 4096);
+    (python_module(&head)
+        .or_else(|| python_launcher(&head))
+        .as_deref()
+        == Some("pip"))
+    .then_some("pip")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CargoInstallation {
+    /// rustup's cargo proxy and its helper must be the same installed file.
+    pub rustup: Option<PathBuf>,
+}
+
+/// Recognize Cargo through its Rust installer receipt, or the registered
+/// cargo link to rustup. Arbitrary programs called cargo are not probed.
+pub(super) fn cargo_installation(path: &Path) -> Option<CargoInstallation> {
+    let real = fs::canonicalize(path).ok()?;
+    let rustup = path
+        .parent()?
+        .join(format!("rustup{}", std::env::consts::EXE_SUFFIX));
+    if path.file_name()?.to_str()? == format!("cargo{}", std::env::consts::EXE_SUFFIX)
+        && same_installed_file(path, &rustup)
+    {
+        return Some(CargoInstallation {
+            rustup: Some(rustup),
+        });
+    }
+    let bin = real.parent()?;
+    if bin.file_name()?.to_str()? != "bin" {
+        return None;
+    }
+    let root = bin.parent()?;
+    let receipts = fs::read_dir(root.join("lib/rustlib")).ok()?;
+    for receipt in receipts.filter_map(Result::ok).take(128) {
+        let name = receipt.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name != "manifest-cargo" && !name.starts_with("manifest-cargo-") {
+            continue;
+        }
+        let mut data = Vec::new();
+        let Ok(file) = fs::File::open(receipt.path()) else {
+            continue;
+        };
+        if file.take(64 * 1024 + 1).read_to_end(&mut data).is_err() {
+            continue;
+        }
+        if data.len() > 64 * 1024 {
+            continue;
+        }
+        let Ok(data) = std::str::from_utf8(&data) else {
+            continue;
+        };
+        for line in data.lines() {
+            let Some(entry) = line.strip_prefix("file:") else {
+                continue;
+            };
+            if matches!(entry, "bin/cargo" | "bin/cargo.exe")
+                && fs::canonicalize(root.join(entry)).ok().as_ref() == Some(&real)
+            {
+                return Some(CargoInstallation { rustup: None });
+            }
+        }
+    }
+    None
+}
+
+fn same_installed_file(left: &Path, right: &Path) -> bool {
+    if let (Ok(left), Ok(right)) = (fs::canonicalize(left), fs::canonicalize(right))
+        && left == right
+    {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+    false
+}
+
 /// Whether `trusted` lets notypo probe the app named `name`: every app
 /// (`*`), any app invoked by that name, or the app with that identity.
 pub fn is_trusted(trusted: &[String], name: &str, identity: Option<&str>) -> bool {
@@ -33,20 +133,48 @@ pub fn is_trusted(trusted: &[String], name: &str, identity: Option<&str>) -> boo
 
 /// The package a file inside `node_modules` belongs to, by its manifest.
 fn npm_package(real: &Path) -> Option<String> {
+    let (_, manifest) = npm_manifest(real)?;
+    let name = manifest.get("name")?.as_str()?;
+    is_package_name(name).then(|| name.to_owned())
+}
+
+/// npm and npx belong to the same package. Only npm's declared bin may be
+/// invoked as `completion`; probing npx could instead execute a package.
+pub(super) fn npm_entrypoint(path: &Path) -> Option<&'static str> {
+    let real = fs::canonicalize(path).ok()?;
+    let (root, manifest) = npm_manifest(&real)?;
+    if manifest.get("name")?.as_str()? != "npm" {
+        return None;
+    }
+    ["npm", "npx"].into_iter().find(|name| {
+        manifest
+            .get("bin")
+            .and_then(|bins| bins.get(name))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|bin| fs::canonicalize(root.join(bin)).ok())
+            .is_some_and(|entry| entry == real)
+    })
+}
+
+fn npm_manifest(real: &Path) -> Option<(PathBuf, serde_json::Value)> {
     let parts: Vec<Component> = real.components().collect();
     let at = parts
         .iter()
         .rposition(|c| c.as_os_str() == "node_modules")?;
     let first = parts.get(at + 1)?.as_os_str().to_str()?;
     let depth = if first.starts_with('@') { 2 } else { 1 };
-    let root: std::path::PathBuf = parts.get(..=at + depth)?.iter().collect();
-    let manifest = fs::read(root.join("package.json")).ok()?;
+    let root: PathBuf = parts.get(..=at + depth)?.iter().collect();
+    let mut manifest = Vec::new();
+    fs::File::open(root.join("package.json"))
+        .ok()?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut manifest)
+        .ok()?;
     if manifest.len() > 1024 * 1024 {
         return None;
     }
     let manifest: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
-    let name = manifest.get("name")?.as_str()?;
-    is_package_name(name).then(|| name.to_owned())
+    Some((root, manifest))
 }
 
 /// A shell wrapper that runs `python -m <module>`, as Homebrew's az does

@@ -124,7 +124,13 @@ pub fn is_trusted_location(path: &Path) -> bool {
 }
 
 pub fn run(probe: &Probe, budget: &mut Budget) -> Result<ProbeOutput, ProbeError> {
-    run_inner(probe, budget, false)
+    run_inner(probe, budget, false, None)
+}
+
+/// [`run`] in `dir`, for apps whose argument parsing can create files
+/// relative to the working directory.
+pub fn run_in(probe: &Probe, dir: &Path, budget: &mut Budget) -> Result<ProbeOutput, ProbeError> {
+    run_inner(probe, budget, false, Some(dir))
 }
 
 /// A private controlling terminal for native ZLE widgets. No input is sent
@@ -137,7 +143,7 @@ pub(crate) fn run_completion_terminal(
 ) -> Result<ProbeOutput, ProbeError> {
     #[cfg(unix)]
     {
-        run_inner(probe, budget, true)
+        run_inner(probe, budget, true, None)
     }
     #[cfg(not(unix))]
     {
@@ -152,6 +158,7 @@ fn run_inner(
     probe: &Probe,
     budget: &mut Budget,
     completion_terminal: bool,
+    dir: Option<&Path>,
 ) -> Result<ProbeOutput, ProbeError> {
     #[cfg(windows)]
     if matches!(probe.capture, Capture::Descriptor(_)) {
@@ -163,6 +170,9 @@ fn run_inner(
     let (mut reader, writer) = io::pipe().map_err(ProbeError::Spawn)?;
     let mut process = Process::new(probe.program);
     process.args(&probe.args).stdin(Stdio::null());
+    if let Some(dir) = dir {
+        process.current_dir(dir);
+    }
     for (key, value) in &probe.env {
         match value {
             Some(value) => process.env(key, value),

@@ -8,9 +8,17 @@ Status: first and second slices implemented in src/engine/ on branch
         tcsh parsing/quoting, POSIX compound commands and fish blocks, upgrade
         coverage for implemented native protocols, parent-shell function
         names, nested help with option values, role-aware ranking, and
-        pre-execution revalidation. The PowerShell dialect and completion
-        adapter, broader app coverage, and rollout validation remain
+        pre-execution revalidation. The PowerShell dialect now parses,
+        quotes, and gates argument-mode lines (section 3), and its function
+        passes status, error records, and the session's command resolution
+        (section 2), so cmdlet names and parameters are repaired from
+        PowerShell's own metadata (section 5). PowerShell's TabExpansion2
+        completers, broader app coverage, and rollout validation remain
         unfinished.
+        Fourth slice in progress: npm, pip, clap, Cargo, urfave/cli, click,
+        and kingpin protocol bridges are implemented (section 5B
+        shared-protocol record);
+        the other shared protocols and per-tool verification remain.
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.
         [ ] NOT DONE = work required to deliver this plan.
@@ -146,6 +154,29 @@ source, and a provider can return structured edits with recorded provenance.
     history, skipping its own line (tested in ksh93; dash has no fc).
     PowerShell doesn't. The cwd is the process cwd. A status counts only when
     nothing but the correction call ran after the command.
+    PowerShell (2026-10-05): the function now also passes the session's
+    alias and function names; $LASTEXITCODE is not passed, because it stays
+    stale after cmdlets and could vouch for the wrong command.
+    PARTIAL (2026-10-05): the PowerShell function reads `$?` first, takes
+    the last history entry, and collects the $Error records whose
+    InvocationInfo.HistoryId is that entry's (verified: other entries'
+    records are left out). NOTYPO_EXIT_STATUS is 0 when the line
+    succeeded, 127 when a CommandNotFoundException was recorded, the
+    native exit code ($LASTEXITCODE) when the line failed without a cmdlet
+    error (so the native program set it in that line; Windows PowerShell's
+    NativeCommandError records for redirected stderr don't count), and 1
+    otherwise. The records' messages (capped at 16 KiB) become output with
+    the new OutputOrigin::ShellErrors; diagnosis reads "A parameter cannot
+    be found that matches parameter name" and "the parameter name ... is
+    ambiguous". The entry travels in NOTYPO_CURRENT_COMMAND rather than as
+    an argument, and the function removes these variables after the call.
+    The function also reports how the session resolves every command name
+    of the line (`Get-Command` per CommandAst name: type, the alias's
+    resolved type, and the name or application path), in
+    NOTYPO_POWERSHELL_COMMANDS, and its own executable in
+    NOTYPO_POWERSHELL. Verified through real pwsh 7.6.6 reading lines as
+    interactive input (tests/cli.rs). Windows PowerShell 5.1 is unverified;
+    the function uses only PowerShell 3+ APIs.
 [x] DONE: Associate captured output with the correct history event;
     retain the existing zsh pasted-command regression behavior.
     Instant-mode/PTY logs: output comes only from the last prompt group
@@ -215,6 +246,31 @@ does not create that marker during context capture or candidate discovery.
     selected dialect; literal quotes round-trip through real fish 4.9.3, and
     block fixtures agree with fish -n. Fish { } blocks, PowerShell, and tcsh
     remain unsupported. Other fish versions are unverified.
+    PARTIAL (2026-10-05): Dialect::PowerShell (src/engine/parser/
+    powershell.rs) reads PowerShell 7 argument-mode lines: words, `|`, `;`,
+    `&&`, `||`, background `&`, newlines and backtick continuations,
+    `>`/`>>`/`N>`/`*>`/`N>&M` redirections (at a token's start only), `#` and
+    `<# #>` comments. Rules were taken from PowerShell 7.6.6's AST and from
+    what a native program receives: single quotes (and Unicode variants)
+    double to escape; double quotes process backtick escapes and expand
+    `$`; a token starting with a quote ends there, while quotes inside a
+    bareword join it; barewords process backtick escapes; mid-word `>` and
+    `#` are literal; `a&b` is two commands; numeric literals stay as typed;
+    a bare leading `~` expands; a single-dash parameter token ends at `.`
+    or `[` until a colon or quote, so `-Dprop.name=1` and `-o./out` reach a
+    program as two arguments; and a `--%` argument, even quoted, stops
+    parsing for native commands. Unsupported (reported, not edited):
+    statements and keywords, expressions in command position (quoted or
+    numeric command names, `$`, `[`, `-`), `(...)`, `{...}`, `,` arrays,
+    `@` splatting and here-strings, the call operator, dot-sourcing, and
+    `--%`. Quoting is bare for plain characters and otherwise single quotes
+    with quote characters doubled; values PowerShell would split or glob
+    are quoted. An oracle test compares accepted lines with PowerShell's
+    own parser, and a round trip passes every quoted value through pwsh to
+    a native program (both skip without pwsh; NOTYPO_TEST_PWSH names one).
+    Verified with portable PowerShell 7.6.6 for macOS arm64 run from a
+    scratch directory, not installed. Windows PowerShell 5.1 and other
+    7.x releases are unverified.
 [x] DONE: Apply nonoverlapping span edits, then reparse the result and
     validate the intended structural change before accepting a candidate.
 
@@ -240,9 +296,40 @@ Unsupported syntax produces an explicit outcome and cannot execute silently.
     Bash/zsh/fish shell-function names are supplied by the parent and tested.
     Fish discovery no longer starts an interactive shell or loads user config.
     Function bodies and arbitrary wrapper metadata are not supplied; the
-    PowerShell dialect remains unfinished. An alias naming another program
+    PowerShell dialect remains unfinished (2026-10-05: lines parse; cmdlet-
+    shaped names and the session's aliases and functions, passed by the
+    PowerShell function and compared without regard to case, resolve as
+    shell-defined). An alias naming another program
     (ls=eza) doesn't yet select that program's vocabulary (section 5B).
+    PARTIAL (2026-10-05): PowerShell names follow the session's report:
+    a name it couldn't resolve is missing (repaired from PATH, the
+    session's names, and PowerShell's command list); a cmdlet, function,
+    or alias for one is a PowerShell command described by PowerShell
+    (section 5); an application, or an alias for one, takes that
+    program's vocabulary (`g sttus` -> `g status` with g -> git); other
+    kinds stay shell-defined. Without a report, a cmdlet-shaped name not
+    on PATH is asked of PowerShell, and `docker-compose` on PATH is no
+    longer mistaken for a cmdlet. Profile-defined functions remain
+    without vocabulary.
     Corrections invoked directly, outside the alias, see no function names.
+    PARTIAL (2026-10-05): Bash/Zsh/tcsh aliases (TF_SHELL_ALIASES, tcsh's
+    list) now select their target: engine::aliases expands unquoted names
+    in command position as the shells do (recursively, never into an alias
+    already expanded there, and after an expansion ending in a blank), and
+    an alias for one simple command of literal words whose program is
+    installed (not a function, builtin, wrapper, or package runner) starts
+    the walk at that program with the alias's words as context and leading
+    non-option words as its command path. The engine now receives the line
+    as typed rather than thefuck's first-token expansion, so corrections
+    keep the alias (`g sttus` -> `g status`, `gs --shrot` -> `gs --short`
+    with real bash/zsh alias output); legacy rules and replay still use the
+    old expansion. Complex aliases stay shell-defined (no candidates).
+    Fish aliases are functions without supplied bodies. Corrections invoked
+    outside the alias function still see no aliases.
+    Validation: 253 default tests (217 unit, 32 CLI, corpus, three rule
+    fixtures), rustfmt, host Clippy, and all-target/all-feature Clippy for
+    Windows GNU/MSVC, FreeBSD, and Linux musl pass; the four opt-in
+    installed checks pass.
 [x] DONE: Use the app's completion results to understand valid next tokens
     at each command level; do not embed AWS/GCP/Azure command trees in diagnosis.
 [x] DONE: Map error hints to exact token spans, including repeated tokens;
@@ -276,6 +363,42 @@ and ls --colro=auto the option name while preserving its value.
     opt-in via trusted_completers) are bridged with shared probe limits.
     Fish conditions, option arity, and values work; descriptions are dropped.
     User startup configuration is skipped. PowerShell is pending.
+    PARTIAL (2026-10-05): PowerShell commands (src/engine/native/
+    powershell.rs). A profile-free, non-interactive PowerShell (the
+    session's own executable, else pwsh on PATH) runs a fixed script passed
+    with -Command and given its query in the environment (no
+    -EncodedCommand, which endpoint security tools flag; no double quotes,
+    so Windows argument quoting can't alter it). The list query names the
+    cmdlets, functions, and aliases from module manifests without
+    importing anything. The describe query finds a command with a wildcard
+    lookup (which doesn't import), follows aliases, and imports its module
+    only when the module is built in, under $PSHOME, or trusted
+    (`powershell:<Module>`, the command name, or `*`); otherwise it reports
+    the module (verified with a fake module whose import writes a marker).
+    It returns parameters with switch, common, dynamic, alias, enumeration,
+    [Flags], and ValidateSet (and case-sensitivity) records, and marks a
+    simple function or a remaining-arguments parameter as open. Telemetry
+    and update checks are off, proxies point at the closed port, and the
+    module analysis cache is notypo's own. Parameter names bind as
+    PowerShell's binder does: exact name or alias, else a unique prefix,
+    else the one declared parameter among several matches (`-In` is
+    -Include, `-Inf` is ambiguous); an oracle compares 49 typed names on
+    four commands with PowerShell's StaticParameterBinder. The engine walks
+    a PowerShell command with its own syntax: `:` attaches values, only `-`
+    before a letter starts a parameter (`-5` is a value), and parameters
+    don't cluster. The new resolve_option backend hook accepts other
+    spellings of a listed option. Values ignore case unless the set is
+    case-sensitive, [Flags] values combine with commas, and numbers are
+    left to PowerShell. A closed command's list is authoritative; an open
+    one gets no parameter checks. Revalidation doesn't stat PowerShell
+    commands. Each probe takes about 0.4 s; descriptions are not cached on
+    disk. TabExpansion2 argument completers (which run module script
+    blocks), positional values, and dynamic parameters of other providers
+    (`Get-ChildItem HKLM:\`) are not consulted.
+    Validation: 280 default tests (243 unit, 33 CLI, corpus, three rule
+    fixtures) pass with and without pwsh (NOTYPO_TEST_PWSH names portable
+    PowerShell 7.6.6); rustfmt, host Clippy, and Windows GNU/MSVC, FreeBSD,
+    and Linux musl Clippy pass; the six opt-in installed checks pass.
 [x] DONE: Bridge installed Zsh #compdef autoload handlers on Unix with a
     private controlling terminal and real completion widgets. vared accepts
     a variable without executing the failed command. Parent fpath discovery,
@@ -296,6 +419,28 @@ and ls --colro=auto the option name while preserving its value.
     cursor units. Installed Bash/fish/Zsh handlers are located; fish and Zsh
     supply their completion search paths from the parent. Embedded fish handlers,
     handlers registered only in memory, and PowerShell registrations are pending.
+    (2026-10-05: PowerShell's own commands are described by PowerShell, as
+    recorded under shell completion adapters; argument completers that
+    modules register with Register-ArgumentCompleter remain pending.)
+    Bash compatibility files (etc/bash_completion.d) that register several
+    commands are found by their `complete -F` lines (2026-10-05, bq/gsutil).
+    PARTIAL (2026-10-05): fish 4 embeds about a thousand completion scripts
+    in its binary (fish 4.9.3 lists 1070; none exist on disk). For fish users
+    with a trusted app, fish is asked once for the embedded script
+    (`fish --no-config --private -c 'status get-file completions/$argv[1].fish'
+    <name>`, names limited to safe characters) and the text is kept under
+    notypo's cache per fish-binary fingerprint (missing scripts are
+    remembered too), so the existing fish driver loads it. It is preferred
+    over another shell's handler for fish users and used when nothing else
+    answers, after app-declared generators; other shells never probe for
+    it. Older fish without `status get-file` contribute nothing. Verified:
+    jq, curl, tar, and rsync (approval) are repaired as fish users from
+    embedded scripts (opt-in installed check), fish's make script lists only
+    short options, so `make --dyr-run` gets no guess. Its target listing
+    runs `make -pRrq` in the working directory (the workspace-trust gap
+    recorded for make; closed 2026-10-05 by trusted_workspaces, recorded
+    under build and task runners). Unit fixtures cover name validation, reuse, and
+    remembered misses. In-memory registrations and PowerShell remain.
 [ ] NOT DONE: Make app-native completion the primary command/argument provider.
     Normalize plain/rich results, replacement ranges, descriptions, enum values,
     and quoting hints. A new operation must work when the app exposes it even
@@ -438,6 +583,21 @@ GENERAL-PURPOSE CLOUDS AND PROVIDER DEVELOPMENT TOOLS
 [ ] NOT DONE: Google Cloud: gcloud, bq, gsutil, firebase; app-provided release
     tracks and installed components use their actual completion registrations.
     PARTIAL: gcloud is bridged and verified (release tracks work); the others are pending.
+    PARTIAL (2026-10-05): bq and gsutil (Google Cloud SDK 586.0.0 via
+    Homebrew) have no handler file of their own: the SDK's single
+    etc/bash_completion.d/google-cloud-sdk file registers gcloud, bq, and
+    gsutil. Bash handler lookup now scans bash_completion.d text for a
+    `complete ... -F <function> <name>` line (never sourcing during the
+    search). Under trusted_completers, `bq qeury` -> `bq query` (the SDK's
+    helper lists `bq help` commands) and `gsutil lss` -> `gsutil ls`
+    (argcomplete through its handler) are asked as partial lists. In a
+    sandboxed HOME, gsutil's credential bootstrap probed the GCE metadata
+    server (no proxy) and cached the result; handler probes now set
+    CLOUDSDK_AUTH_DISABLE_CREDENTIALS, CLOUDSDK_CORE_CHECK_GCE_METADATA=false,
+    disabled prompts and update checks, after which no metadata probe ran.
+    The SDK still writes its default configuration on a first run, and
+    gsutil creates an empty ~/.gsutil/tab-completion directory. firebase is
+    not installed.
     Sources: https://cloud.google.com/cli
     https://docs.cloud.google.com/sdk/gcloud/reference/topic/cli-trees
     https://firebase.google.com/docs/cli
@@ -507,6 +667,12 @@ REGIONAL CLOUDS, HOSTING, AND BARE METAL
     Source: https://cli.scaleway.com/autocomplete/
 [ ] NOT DONE: UpCloud: upctl.
     Source: https://upcloud.com/docs/tooling/cli/
+    PARTIAL (2026-10-05): upctl 3.33.0 (Homebrew) answers cobra completion
+    offline; `upctl servr list` -> `upctl server list` is decided by the
+    opt-in installed check. Its build records only `command-line-arguments`
+    as the main module, an identity shared by any program built from a
+    bare main.go, so it is trusted by name, not identity. Values that need
+    the UpCloud API were not exercised (no network_completion).
 [ ] NOT DONE: IONOS Cloud: ionosctl.
     Source: https://docs.ionos.com/cli-ionosctl
 [ ] NOT DONE: Exoscale: exo; distinguish other unrelated executables named exo.
@@ -536,6 +702,14 @@ EDGE, CDN, AND OBJECT STORAGE
     Sources: https://developers.cloudflare.com/cf/
     https://developers.cloudflare.com/workers/wrangler/
     https://github.com/cloudflare/cloudflared
+    Source inspection (2026-10-05, not installed here): cloudflared links
+    urfave/cli/v2 v2.3.0 through a replace directive and never sets
+    EnableBashCompletion, while its root action starts a tunnel. The urfave
+    bridge asks only `cloudflared --generate-bash-completion` first, which
+    v2 rejects as an undefined flag before Before hooks or actions run, and
+    treats the replaced module as hook-running for nested queries. Runtime
+    behavior is unverified; expect "completion not enabled" and the
+    help/man fallback.
 [ ] NOT DONE: Fastly: fastly.
     Source: https://www.fastly.com/documentation/reference/tools/cli/
 [ ] NOT DONE: bunny.net: bunny / npx @bunny.net/cli; resolve actual package
@@ -668,7 +842,13 @@ command catalogs. They use the same app-native discovery/correction mechanism.
     PARTIAL: kubectl, helm, and kind are audited cobra apps (verified); the rest use cobra via trusted_completers.
 [ ] NOT DONE: Infrastructure/deployment tools: terraform, tofu, pulumi, packer,
     vagrant, ansible, ansible-playbook, serverless / sls, sst, s (Serverless Devs).
-    PARTIAL: terraform, tofu, and packer are audited posener apps (verified); ansible uses argcomplete via trusted_completers.
+    PARTIAL: terraform, tofu, and packer are audited posener apps (verified);
+    ansible is reached through zsh's `_ansible` with python:ansible in
+    trusted_completers (corrected 2026-10-05: its console scripts don't
+    declare argcomplete, so that protocol isn't used).
+    The installed tofu also links urfave/cli/v3 v3.10.1; its audit keeps the
+    posener protocol (installed check still passes). Unaudited apps linking
+    urfave/cli with cobra or posener are refused as ambiguous.
 [ ] NOT DONE: Container tools: docker, podman, nerdctl and their installed
     extensions; preserve project/context/remote-host selection.
     PARTIAL: docker is an audited cobra app (verified; it asks its CLI plugins for metadata).
@@ -685,6 +865,8 @@ SHARED IMPLEMENTATION AND COVERAGE TASKS
     PARTIAL: completion subprocess protocols (aws_completer, git, cobra, posener),
     argcomplete, Bash/Zsh completion functions, and installed fish scripts are
     implemented; app-generated scripts and PowerShell remain pending.
+    Section 5B adds clap, pip, npm, Cargo, urfave/cli, click, and kingpin
+    bridges.
 [x] DONE: Detect package-runner invocations (npx, npm exec, pnpm exec,
     yarn, uvx, pipx run) and obtain the target app's installed identity without
     downloading a package or executing its failed operation during discovery.
@@ -711,12 +893,17 @@ SHARED IMPLEMENTATION AND COVERAGE TASKS
     descriptions, the query line's quoting dialect (none for argv protocols),
     and the trust policy (built-in bridge, audited module, trusted_completers),
     which --explain reports with the app's identity.
+    Position-specific capabilities now distinguish pip/npm's full root command
+    list from its partial nested/option lists. Known local resource answers
+    are tagged independently of network permission and require approval.
 [ ] NOT DONE: Test upgrades, installed plugins, provider endpoints, and renamed
     executables. Fresh native results must expose new command surfaces without
     a notypo release or cloud-specific Rust command-table change.
     PARTIAL: fake aws/gcloud/az completers gain operations, groups, and extensions
     between requests; renamed Go/Python apps keep identity-pinned trust
     (fixture-tested). Provider endpoints are untested.
+    urfave/cli apps answer new commands on the next request (fixture);
+    trust follows a renamed binary's Go module path.
 [x] DONE: Discover unlisted CLIs using supported native completion protocols
     and registrations; inventory updates must not be required for their routing.
     argcomplete markers and Go module dependencies route by protocol; trust
@@ -741,12 +928,17 @@ unverified until their entry is done.
 Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
   native and verified: kubectl, helm, kind, docker, gh, git, terraform,
     tofu, packer (tests/installed_clis.rs);
-  cobra apps awaiting trust or an audit: velero, k9s;
+  cobra apps awaiting trust or an audit: velero, k9s (verified with
+    trusted_completers on 2026-10-05, see the Kubernetes entry);
   clap dynamic completion under the app's own variable: sofka
     (SOFKA_COMPLETE; answered offline, see the Kubernetes entry);
   installed zsh/bash handler (opt-in via trusted_completers): sqlite3, svn,
     npm, deno, pipx, gem, brew, make, cmake, just, ansible,
-    ansible-playbook, jq, curl, wget, ssh, rsync;
+    ansible-playbook, jq, curl, wget, ssh, rsync (deno, pipx, gem, brew,
+    make, jq, curl, and rsync verified through zsh handlers on 2026-10-05,
+    asked as partial lists; just moved to clap, see the Rust rewrites entry;
+    wget, ansible-playbook, and ansible-vault verified the same way later
+    that day);
   no completer found: node, pip3, cargo, rustup, go, bundle, openssl
     (cargo still lists its commands offline with `cargo --list`).
 
@@ -776,6 +968,24 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     `sofka`, or a guessed protocol such as COMPLETE=bash, starts the TUI and
     tries to connect to a cluster: only its declared entry point may run.
     PARTIAL: kubectl, helm, and kind are audited cobra apps (verified).
+    On 2026-10-05, the generic clap bridge repaired `sofka --readoly` and
+    `sofka plugin instlal example` with Sofka 0.29.7 installed at
+    /opt/homebrew/bin/sofka (Cellar/sofka/0.29.7/bin/sofka). Discovery reads
+    its documented `completion zsh` script; protocol=clap,
+    trust=trusted_completers plus trusted_help for generator discovery,
+    application identity=unknown (no supported Rust package metadata).
+    The plugin correction requires package-change approval. These checks
+    queried completion only with blocked HTTP proxies and KUBECONFIG=/dev/null;
+    no TUI, plugin installation, or cluster command was executed.
+    PARTIAL (2026-10-05): velero v1.18.4 (`velero backp get`), k9s 0.51.0
+    (`k9s --readoly`), and talosctl v1.14.2 (`talosctl helth`) use the
+    cobra bridge under trusted_completers identities; popeye 0.22.1
+    (`popeye --sav`, a cluster linter) too. All are decided by the opt-in
+    installed check with KUBECONFIG=/dev/null and blocked proxies. In a
+    sandboxed HOME, k9s created its empty config directory
+    (~/Library/Application Support/k9s) while answering completion; the
+    others wrote nothing, so k9s is not audited. Cluster resources need
+    network_completion and were not exercised.
 [ ] NOT DONE: Containers, images, and registries: docker (with compose,
     buildx, and other CLI plugins), podman and podman compose, buildah,
     skopeo, nerdctl, colima, limactl, crane, cosign, trivy, dive, and an
@@ -785,6 +995,9 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     --context/--host/remote connection choices are preserved.
     PARTIAL: docker is an audited cobra app (verified; plugin commands come
     from each plugin's own metadata).
+    PARTIAL (2026-10-05): trivy 0.74.0 (`trivy imgae alpine`) uses the cobra
+    bridge under trusted_completers; completion wrote no cache or database
+    files in a sandboxed HOME. Image and registry values were not looked up.
 [ ] NOT DONE: Version control and code hosting: git, gh, glab, hub, git-lfs,
     svn, hg, pre-commit. glab is expected to be cobra; svn and hg rely on
     installed shell handlers or help output. Remotes, branches on remote
@@ -792,6 +1005,9 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     handler.
     PARTIAL: git (built-in bridge, aliases included) and gh (audited cobra)
     are verified.
+    PARTIAL (2026-10-05): svn (Homebrew subversion) is repaired through its
+    bash handler, found in the `subversion` file by its `complete -F`
+    registration (`svn stauts` -> `svn status`, asked).
 [ ] NOT DONE: JavaScript and TypeScript: node, npm, npx, yarn, pnpm, bun,
     deno, and package-runner targets (section 5A's runner support). npm has
     its own completion protocol (`npm completion` with COMP_CWORD, COMP_LINE,
@@ -800,12 +1016,28 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     package.json: reading it is allowed, running lifecycle scripts is not.
     Observed: npm (identified as npm:npm) and deno have zsh handlers; node
     has no completer.
+    PARTIAL (2026-10-05): npm 11.19.1 now uses its native completion command
+    through npm:npm identity trust and manifest bin verification. Root/nested
+    commands and project script names (including literal quotes/spaces and
+    --prefix scope) are verified offline without executing scripts. npm's
+    option lists are partial and omit global flags on this installed version;
+    enum values, workspace selectors, Windows runtime, and other JS tools
+    remain unverified or unsupported. See the shared-protocol record.
 [ ] NOT DONE: Python: python/python3, pip/pip3, pipx, uv/uvx, poetry, conda,
     tox, nox, pytest, ruff, black. pip answers its own protocol
     (PIP_AUTO_COMPLETE with COMP_WORDS/COMP_CWORD); pipx and pytest are
     expected to support argcomplete; uv and ruff (clap) and poetry generate
     scripts. Observed: pipx (python:pipx) has a zsh handler; pip3 has no
-    completer found.
+    completer found in the 2026-10-04 handler inventory.
+    PARTIAL (2026-10-05): pip 26.2.1 now uses the native pip protocol through
+    python:pip identity trust; nested command and option corrections are
+    verified offline (see shared-protocol and installed-client records).
+    The remaining Python tools and version/platform coverage stay open.
+    PARTIAL (2026-10-05): click apps use the click bridge (shared-protocol
+    record). black 26.10.0 was verified in a scratch virtualenv (click
+    8.5.0): `--chek`, `--line-lenght`, and an enum value of
+    --target-version. No click app is installed system-wide here, so the
+    opt-in installed checks have no click case yet.
 [ ] NOT DONE: Rust toolchain and cargo ecosystem: cargo, rustup, rustc,
     rustdoc, rustfmt, cargo clippy, rust-analyzer, cargo miri, cross, and
     installed cargo-* subcommands (cargo-nextest, cargo-watch, cargo-audit,
@@ -832,6 +1064,14 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     cargo's current hint ("help: a command with a similar name exists:
     `build`"). Observed: cargo 1.98.1 and rustup 1.29.1, with 15 external
     subcommands in `cargo --list` and no shell handler installed.
+    PARTIAL (2026-10-05): cargo uses a native command-list bridge (see the
+    shared-protocol record) under rust:cargo identity: commands, aliases,
+    external subcommands, +toolchain selectors, nested commands, options,
+    enum values, and offline package/target/feature values are verified.
+    The stderr provider reads cargo's "a command with a similar name exists"
+    and clap's "a similar argument exists" hints (unit fixture). rustc,
+    rustdoc, rustfmt, rust-analyzer, cross, the listed cargo-* extensions,
+    and the other Rust tools in this entry remain unverified.
 [ ] NOT DONE: Rust rewrites of classic tools, by the tool they replace:
     grep -> rg (ripgrep) and rga (ripgrep-all); find -> fd; cat/less -> bat;
     ls -> eza, lsd; du -> dust; ps -> procs; top -> btm (bottom);
@@ -858,9 +1098,24 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     run outside the alias, with no function names passed, a function `rg`
     looked missing and `rm` ranked first (offered for a choice and flagged
     for approval), so function names must reach every entry point.
+    PARTIAL (2026-10-05): rule (1) is implemented for Bash/Zsh/tcsh aliases
+    passed by the shell integration (section 4 record): `ls --colro=auto`
+    with `ls='eza --icons'` is checked against eza's own answers with
+    `--icons` as context and becomes `ls --color=auto` (engine fixture with
+    a completer; tests/cli.rs with trusted help through real alias text).
+    The BSD-ls repair above came from a run without alias information.
+    eza itself is not installed here, so its real vocabulary is unverified.
     Observed here: tokei (no completer found), just (zsh handler), and
     fish 4.9.3 are installed; ripgrep 14.1.1 was only available as an agent
     shell function, so rg stays unverified until it is on PATH.
+    PARTIAL (2026-10-05): just 1.58.0 (Homebrew) installs clap's
+    recommended registrations, `source <(JUST_COMPLETE=zsh just)` and
+    `eval "$(JUST_COMPLETE=bash just)"`. The clap bridge now recognizes
+    these shims and runs only that generator, so just answers through its
+    own dynamic completion: `just --lsit` -> `--list`, `just --dry-rnu` ->
+    `--dry-run`, and recipe typos (`just biuld` in a project) are decided;
+    no recipe ran. Through the zsh handler, the incomplete option list had
+    offered `--set`/`--init` for `--lsit`.
 [ ] NOT DONE: Other Rust-built developer CLIs: starship, typst, jj
     (jujutsu), gitui, watchexec. Most use clap: some generate static
     scripts, others answer clap's dynamic completion under a variable they
@@ -874,6 +1129,10 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     (gradle, mvn, rake, and mix tasks; artisan commands) run project code
     when listed, so they follow the workspace trust policy. Observed: go and
     bundle have no completer found; gem has a zsh handler.
+    (2026-10-05) The workspace trust policy exists (recorded under build and
+    task runners); gradle/gradlew, rake, mix, sbt, lein, and composer are
+    among the programs it covers. The legacy gradle rule no longer runs
+    `gradle tasks` or `./gradlew tasks` in an untrusted project.
 [ ] NOT DONE: Build and task runners: make, cmake, ninja, bazel/bazelisk,
     just, task (go-task), mage, earthly. Targets and recipes come from
     project files (Makefile, justfile, Taskfile.yml, BUILD); listing them
@@ -881,11 +1140,46 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     probes follow the workspace trust policy and never run automatically in
     an untrusted directory. Observed: make and just have zsh handlers; cmake
     has a bash handler.
+    PARTIAL (2026-10-05): workspace trust policy (src/workspace.rs, setting
+    trusted_workspaces / NOTYPO_TRUSTED_WORKSPACES as a path list or JSON
+    array; an entry trusts that directory and everything below it; `*`
+    trusts all; relative entries trust nothing). A table names programs
+    whose listings evaluate project files and the files that make a
+    directory their project: make/gmake/bmake/remake (Makefile family,
+    working directory only), rake, gradle/gradlew, sbt, lein, mix,
+    fastlane, mage, bazel/bazelisk, go-task (`sh:` variables), gulp, grunt,
+    react-native, nx, nox, invoke/inv, fab, vagrant, composer (vendor
+    plugins), and flask (.flaskenv, app.py, wsgi.py, or FLASK_APP); tools
+    that search upward are checked in parent directories too. Where such a
+    file exists and the directory isn't trusted, native discovery for the
+    program is skipped (no probe; the note names the file and the
+    setting), its `--help` isn't read, and the legacy gulp, grunt, gradle,
+    and react-native rules don't list tasks. A program named by a path
+    inside the directory (`./gradlew`) counts as the project's own code.
+    Verified: `make -pRrq` and `make -nsp` run a Makefile's `$(shell ...)`;
+    `just --summary`, `--list`, and `--dump` (just 1.58.0) don't run
+    backticks, so just is not covered. Opt-in installed check: fish's
+    embedded make handler in a directory whose Makefile touches a marker
+    lists nothing and leaves no marker without trust, and repairs
+    `make biuld` to `make build` with the directory trusted. flask 3.1.3:
+    `flask rutes` is not probed (no import) until the project is trusted,
+    then becomes `flask routes`. Fixtures cover the table, upward search,
+    Windows launcher names, program paths, trusted parents, `*`, siblings,
+    relative entries, provider refusal without spawning, and settings.
+    Validation: 282 default tests (245 unit, 33 CLI, corpus, three rule
+    fixtures) pass with and without pwsh; rustfmt, host Clippy, and Windows
+    GNU/MSVC, FreeBSD, and Linux musl Clippy pass; the seven opt-in
+    installed checks pass.
 [ ] NOT DONE: Infrastructure and configuration management, extending
     section 5A: pulumi, terragrunt, vagrant, ansible, ansible-playbook,
     ansible-galaxy, ansible-vault, chef/knife, puppet, salt. Observed:
     ansible and ansible-playbook are identified as python:ansible with zsh
     handlers.
+    PARTIAL (2026-10-05): ansible 14.4.0 (Homebrew): ansible-vault,
+    ansible-playbook, and ansible-galaxy are repaired through zsh 5.9's
+    `_ansible` with python:ansible trusted (opt-in check, asked). Their
+    console-script wrappers lack the PYTHON_ARGCOMPLETE_OK marker that
+    ansible's CLI modules carry, so the argcomplete protocol isn't used.
     PARTIAL: terraform, tofu, and packer are audited posener apps (verified).
 [ ] NOT DONE: HashiCorp runtime tools: vault, consul, nomad, boundary,
     waypoint, expected to answer posener/complete like terraform. Audit each
@@ -912,6 +1206,9 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     tmux, screen. Unit and service names are local resources: listing them
     must not start or stop anything, and stop/restart verbs already need
     approval in the safety gate.
+    PARTIAL (2026-10-05): k6 v2.3.0 (`k6 rnu script.js` -> `k6 run`) uses the
+    cobra bridge under trusted_completers (go.k6.io/k6/v2); completion ran
+    no test and wrote nothing in a sandboxed HOME.
 [ ] NOT DONE: System and application package managers: apt, apt-get,
     apt-cache, aptitude, dpkg (Debian/Ubuntu); dnf, dnf5, yum, microdnf, rpm
     (Fedora/RHEL); zypper (SUSE); pacman, makepkg, yay, paru (Arch); apk
@@ -1110,6 +1407,17 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     and oclif's autocomplete plugin. thefuck (ported):
     react_native_command_unrecognized, grunt_task_not_found, gulp_not_task,
     django_south_ghost, django_south_merge, and rails_migrations_pending.
+    PARTIAL (2026-10-05): flask 3.1.3 (click 8.5.0, scratch virtualenv)
+    repairs `flask rutes`, a project-defined `flask seed-bd`, and
+    `flask run --prot` through the click bridge. Listing commands imports
+    the project's application (its module-level code ran; no command ran),
+    so flask completion is not side-effect free in a project directory;
+    a workspace trust policy for such apps is still missing.
+    (2026-10-05) flask now follows the workspace trust policy: in a
+    directory with .flaskenv, app.py, or wsgi.py (or with FLASK_APP set),
+    its completion and help run only when trusted_workspaces covers it.
+    nx is covered too; the legacy react-native rule no longer runs
+    `react-native --help` in an untrusted project.
 [ ] NOT DONE: Mobile and device tools: adb, fastboot, emulator, avdmanager,
     sdkmanager, xcodebuild, xcrun (simctl, notarytool, altool),
     xcode-select, xcodes, pod (CocoaPods), carthage, fastlane, ios-deploy,
@@ -1166,6 +1474,19 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     execute code (jest --listTests does); npx/pnpm runners resolve to the
     installed package. golangci-lint is expected to be cobra. Observed: ab
     has no completer.
+    PARTIAL (2026-10-05): lefthook 2.1.15 (Homebrew,
+    github.com/evilmartians/lefthook/v2, urfave/cli/v3 v3.10.1) uses the
+    urfave/cli bridge with trusted_completers for its module path plus
+    trusted_help (v3.10+ runs Before hooks; lefthook defines none). Its
+    source was audited: run/add completion loads lefthook.yml (remote
+    configs only from already-synced local folders) and runs git
+    rev-parse; nothing is fetched or installed. Installed checks repair
+    `lefthook instal`, `lefthook valdate`, `lefthook run pre-comit`
+    (configured hook, a resource needing approval), and `--forse` after a
+    hook (approval for --force) in an isolated repository; no hook ran and
+    no git hook was installed. Without trusted_help nothing is probed.
+    `lefthook install` itself (writes .git/hooks) has no extra safety
+    policy yet. The other tools in this entry remain unverified.
 [ ] NOT DONE: Database migrations and ORMs: flyway, liquibase, alembic,
     prisma, goose, migrate (golang-migrate), dbmate, knex, sequelize-cli,
     typeorm, dotnet ef, and the Rust/Ruby/Django tools in their entries.
@@ -1223,6 +1544,76 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     firewall flushes, server stops, certificate deletion, migration resets,
     backup pruning, tunnel and intercept changes), each with a fixture
     showing that it needs approval and that -y can't bypass it.
+    PARTIAL (2026-10-05): safety::operations covers the nine named risk
+    categories for known executable names, including diskutil/APFS, LVM
+    removal, userdel, systemctl, iptables/ip6tables/nft/ufw/firewall-cmd/
+    pfctl, nginx/Apache/caddy/container stops, certbot/acme.sh/mkcert,
+    flyway/liquibase/prisma/alembic/dbmate/knex/typeorm/Sequelize/Rails,
+    restic/borg/borgmatic/duplicity/kopia/tmutil/tarsnap/rsnapshot,
+    telepresence, WireGuard, tailscale/netbird/ZeroTier/nmcli/ip.
+    Changed openvpn/openconnect/
+    sshuttle/autossh arguments use the remote-target gate. Policy separates
+    known option values from operations; Docker -f is no longer mistaken
+    for force. Quoted/multi-statement nft scripts require approval.
+    Unit fixtures cover corrections and replay in POSIX/fish/tcsh, read-only
+    counterexamples, attached/clustered flags, optional iptables waits,
+    malformed Unicode options, and privilege/package-runner wrappers.
+    Backup checks include borgmatic's default/multiple actions, Tarsnap's
+    deletion/pruning flags, and rsnapshot's configurable rotation intervals;
+    these never open a repository or read backup configuration.
+    tests/cli.rs verifies nineteen decisive executable repairs: JSON says
+    confirm, -y without a terminal prints no command, and no fake operation
+    runs; a read-only nginx repair succeeds with the same evidence.
+    Validation (2026-10-05, including clap/pip/npm): cargo test --locked --all-targets
+    passes 215 tests and the
+    benchmark fixture checks (the installed-client tests remain opt-in);
+    rustfmt and all-feature host Clippy pass. All-target/all-feature checks
+    compile for Windows GNU/MSVC, FreeBSD, and Linux musl; these are compilation
+    checks, not runtime platform verification.
+    Remaining: audit every inventory entry's less common destructive forms,
+    including migration launchers and target changes for other
+    device/user/pool writers; propagate resolved
+    app identity into risk policy for renamed executables and aliases.
+    PARTIAL: resolved Python/pip and npm package identities now retain
+    package-change policy under renamed/versioned executable names, through
+    wrappers, in native corrections, legacy choices, and diagnostic replay.
+    Global pip option values are skipped before classifying operations;
+    unrelated packages do not inherit identity-specific policy. The other
+    tool identities and shell alias expansion remain unfinished.
+    PARTIAL (2026-10-05): the gate (assess_with_context, also used for
+    replay and legacy choices) judges a candidate's alias expansion against
+    the original expanded the same way and adds any new reasons "(through
+    an alias)": `rmf ./buidl` -> `rmf ./build` with rmf='rm -rf', and a
+    misspelled name corrected to that alias, need approval; -y prints
+    nothing (tests/cli.rs). An alias whose expansion notypo can't analyze
+    (operators, redirections, expansions, tcsh history references) needs
+    approval when a candidate runs it. Other tool identities remain.
+    PARTIAL (2026-10-05): PowerShell lines are gated with PowerShell's
+    rules: program names compare in lowercase and without module prefixes;
+    destructive cmdlets and aliases (Remove-Item, ri, del, erase, rd,
+    Clear-Content, Stop-Process, spps, Restart-Computer, Format-Volume,
+    Set-ExecutionPolicy, ...), cmdlets whose verb is Remove-, Clear-, Stop-,
+    Uninstall-, Unregister-, Disable-, Reset-, Restart-, Dismount-, Revoke-,
+    Suspend-, or Block-, cmdlets that run code or reach other machines (iex,
+    Invoke-Command, Enter-PSSession, Start-Process, Invoke-WebRequest, ...),
+    `-Force`/`-Recurse`, and changed targets of writing cmdlets (Set-Content,
+    Out-File, Copy-Item, Move-Item, Rename-Item, New-Item, ...) need approval;
+    `$(...)`/`@(...)` count as substitutions while backticks are escapes.
+    (2026-10-05) `-Force`/`-Recurse` no longer need approval on reading
+    cmdlets (Get-, Find-, Search-, Select-, Show-, Test-, Measure-,
+    Compare-, Resolve-, Read-, Group-, Sort-, ConvertTo-, ConvertFrom-, and
+    aliases such as gci, dir, gc, gi), where they only widen what is read.
+    Validation: 270 default tests (233 unit, 33 CLI, corpus, three rule
+    fixtures) pass with and without pwsh; rustfmt, host Clippy, and Windows
+    GNU/MSVC, FreeBSD, and Linux musl Clippy pass; the six opt-in installed
+    checks pass.
+    Pip --log also requires approval for its file write, including replay;
+    a read-only verb does not hide the logging side effect.
+    npm policy now gates project scripts, lifecycle aliases, publication,
+    configuration/project writes, and unknown/new operations; known read-only
+    forms remain allowed. Known global option values are skipped when finding
+    the operation. Metadata distinguishes npm and npx's declared bins, so
+    renamed npx requires approval and cannot be probed as npm completion.
 [ ] NOT DONE: Add the shared protocol bridges these entries need, each once
     for every app that speaks it: npm's completion protocol, pip's
     PIP_AUTO_COMPLETE, clap's dynamic completion, Symfony Console's
@@ -1240,10 +1631,387 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     `SOFKA_COMPLETE=zsh _CLAP_COMPLETE_INDEX=<n> _CLAP_IFS=<sep> sofka --
     <words>`, answering `value:description`); an app without that script is
     never probed this way, since an unknown variable just runs the app.
+    PARTIAL (2026-10-05): generic clap dynamic bridge implemented. Installed
+    Bash/Zsh registrations are inspected without sourcing; alternatively,
+    trusted_help and trusted_completers permit bounded --help discovery and
+    a documented generator invocation. The bridge accepts declared Bash/Zsh
+    activation/index/argument layouts, decodes values/descriptions, passes
+    words as literal argv, and rejects changed applications and unsupported
+    layouts without guessing activation variables. Option/value queries
+    reuse answers only within the request; generic callbacks have no proven
+    persistent metadata boundary. Offline probes block HTTP proxies and
+    common cluster/daemon access, but trusted callbacks are not sandboxed.
+    Regression fixtures cover both wire formats, custom variables, shell
+    selectors, missing trust, malformed/static scripts, upgrades, memoization,
+    descriptions, literal shell syntax, unsuccessful/UTF-8/truncated answers,
+    budgets, and timeout process-tree cleanup. CLI checks cover installed
+    scripts without help, generated scripts without sourcing, nested repairs,
+    simultaneous attached option-name/value repairs, and plugin approval.
+    Validation: all 200 default tests and benchmark fixture checks pass;
+    rustfmt, all-feature host Clippy, and all-target/all-feature compilation
+    checks for Windows GNU/MSVC, FreeBSD, and Linux musl pass. These cross
+    checks compile code; runtime protocol checks were performed on macOS.
+    Remaining: other shared protocols above; additional generated
+    layouts or helper executables require explicit parsing and verification.
+    PARTIAL (2026-10-05): installed registrations in clap's recommended
+    shim form (`source <(VAR=zsh app)`, `. <(...)`, Homebrew's
+    `eval "$(VAR=bash app)"`, plus Homebrew's zsh funcstack wrapper) name
+    the variable; only files consisting of one such line and that wrapper
+    qualify. The bridge runs that generator without arguments (what loading
+    the file does) and accepts its output only if it is a supported layout
+    for the same variable, shell, and unchanged app. clap lists a flag's
+    short form for `-` and omits its long form (`-n`, not `--dry-run`), so
+    a `-` query is merged with a `--` query. Fixtures cover both shim forms,
+    rejected shims (extra commands, other programs, unsafe variables, extra
+    arguments, duplicates, unsupported generator output), and dash merging.
+    PARTIAL (2026-10-05): pip's PIP_AUTO_COMPLETE bridge implemented. Discovery
+    requires python:pip console-script identity plus trusted_completers,
+    including renamed and versioned launchers. Every query passes no operation
+    arguments, sets COMP_WORDS/COMP_CWORD and PIP_AUTO_COMPLETE, and handles
+    pip's normal completion exit status 1. Root command lists come from pip;
+    nested commands and long/short options use its own parser answers.
+    Root commands are authoritative; deeper lists are partial (used options
+    and hidden flags can be omitted). Long valued options expose '='; short
+    option arity remains unknown. The protocol does not enumerate enum values,
+    so pending option-value lists are not treated as valid enum vocabulary.
+    COMP_WORDS loses embedded whitespace/empty arguments: those contexts are
+    rejected before spawning. Multiword local resource answers retain their
+    line boundary; path/installed-package corrections require approval.
+    Queries are always offline, including when network_completion is on:
+    config is disabled, indexes/version checks/prompts are disabled, and HTTP
+    proxies are blocked. Only request-local memoization is used; results may
+    depend on cwd and the installed Python environment. Fixtures cover trust,
+    identity/renaming, formats/arity, literal input, local resources, upgrades,
+    bounds, UTF-8, expected statuses, timeouts/tree cleanup, -y and replay.
+    A legacy-choice regression verifies that identity-specific package policy
+    also applies when all native discovery and correction sources are off.
+    trusted_completers environment values accept JSON arrays for identities
+    containing colons, preserving existing colon-separated bare-name lists.
+    Reference protocol: pip.pypa.io/en/stable/user_guide/#command-completion
+    and pypa/pip's src/pip/_internal/cli/autocompletion.py.
+    Verified pip 26.2.1 (Python 3.14.8) via /opt/homebrew/bin/pip3,
+    identity=python:pip, protocol=pip, trust=trusted_completers. Installed
+    fixtures repaired `pip3 config lsit` and `pip3 install --dry-rnu example`
+    with completion only; no package operation or network lookup ran.
+    Windows binary launchers and other pip versions remain runtime-unverified.
+    Validation: 208 default tests and benchmark fixture checks, rustfmt,
+    all-feature host Clippy, and all-target/all-feature Windows GNU/MSVC,
+    FreeBSD, and Linux musl compilation checks pass. Installed runtime checks
+    remain macOS-specific.
+    PARTIAL (2026-10-05): native npm bridge implemented. Discovery requires
+    npm:npm identity, explicit trusted_completers, and the manifest's npm bin
+    binding; npx/other files in the same package never inherit this protocol.
+    The binding is checked again before queries. Invokes only npm's completion
+    command with COMP_CWORD/COMP_LINE/COMP_POINT and separately encoded argv;
+    literal outer quotes preserve empty words, whitespace, embedded quotes,
+    backslashes, and metacharacters through npm's unescape; cursor offsets are
+    UTF-16. npm receives --prefix as a literal metadata option after completion
+    and before --, preserving initialization scope and original context.
+    npm_config_offline and ignore_scripts are forced, user/global configs use
+    distinct missing private paths, proxies are blocked, update/audit/fund
+    checks and log/timing writes are disabled, and startup cache creation is
+    confined to notypo's cache. Inherited case/hyphen config duplicates are
+    removed. Unknown/abbreviated policy-changing flags and workspace selectors
+    abstain before spawning; metadata refusal is reported, not treated as
+    evidence that the original command is valid. Registry/resource network
+    completion is not enabled even with network_completion.
+    Root commands/aliases are authoritative and obtained from npm; deeper
+    lists and options are partial. No short-option, arity, description, or enum
+    claims are made. npm 11.19.1 omits global option completion; only its
+    command-specific definitions are exposed. Local script/package/other
+    callback answers are conservatively resources (except config's first
+    subcommand level), requiring approval. Cache is request-only because
+    responses depend on cwd/project/install state; no answers reach disk.
+    Fixtures cover trust/renaming/npx exclusion, entry-point changes, literal
+    encoding/UTF-16, resources, changed metadata across requests, invalid UTF-8,
+    bounds/status/timeout/tree cleanup, offline overrides, -y and replay gates.
+    Verified npm 11.19.1 via /opt/homebrew/bin/npm, identity=npm:npm,
+    protocol=npm, trust=trusted_completers. Installed checks repair
+    `npm config lsit`, `npm pbulish`, `npm trust list --jsno`, and two
+    project-script typos in an isolated
+    --prefix project with spaces, quotes, Unicode, and literal $(...) in its
+    path; no scripts, installs, publications, or network operations run.
+    Reference: docs.npmjs.com/cli/v11/commands/npm-completion/ and npm/cli's
+    lib/commands/completion.js and lib/commands/run.js. Windows is explicitly
+    unsupported for this bridge; other npm versions and workspace resolution
+    remain runtime-unverified. Other shared protocols remain unfinished.
+    Validation: 215 default tests and benchmark fixtures, rustfmt, all-feature
+    host Clippy, and all-target/all-feature Windows GNU/MSVC, FreeBSD, and
+    Linux musl compilation checks pass. Installed runtime coverage is macOS.
+    PARTIAL (2026-10-05): cargo's command list bridge implemented.
+    Discovery requires rust:cargo identity, established without executing
+    anything: a Rust installer receipt (lib/rustlib/manifest-cargo*) naming
+    this bin/cargo, or a cargo link/hard link to the rustup beside it.
+    Renamed receipt-bound launchers keep the identity; lookalikes named
+    cargo are never probed. The binding and executable fingerprint are
+    checked again before every query. trusted_completers alone permits
+    `cargo [+toolchain] [--config=...] --offline --color=never --list
+    --verbose` (commands, aliases, external subcommands, descriptions) and,
+    through rustup, `rustup toolchain list`/`rustup show` for +toolchain
+    selectors (resources). Aliases are listed but never executed or asked
+    for help. trusted_help additionally permits `cargo <path> --help` for
+    nested commands, options, arity, and [possible values] enums; nested
+    paths extend only through names the parent's help lists, and failed
+    arguments/option values are never forwarded. A builtin shadowing an
+    installed cargo-<name> needs cargo-<name>'s own help trust, since Cargo
+    may delegate. External subcommands delegate to their own discovered
+    protocol under their own trust (cargo-<name>), with the command name as
+    the first word; delegation is refused under +toolchain/--config scope.
+    -p/--package, --bin, --example, --test, --bench, and -F/--features values
+    come from `cargo metadata --offline --locked --no-deps
+    --format-version=1` (only when metadata is an unshadowed builtin),
+    honoring --manifest-path, -p, --workspace, and default members; feature
+    lists repair exactly one unknown comma/space-separated component and
+    keep package/feature forms. These values are resources: changing one
+    requires approval. -C, -Z, --explain, --exclude, unknown global flags,
+    and control characters abstain before spawning. Probes set
+    CARGO_NET_OFFLINE, RUSTUP_AUTO_INSTALL=0, blocked HTTP proxies, PAGER=cat,
+    and clear CARGO_COMPLETE. Answers are memoized per request, keyed by
+    cwd/ancestor .cargo/config(.toml), CARGO_HOME config/bin, PATH, and
+    --config files; nothing reaches the disk cache because aliases and
+    extensions change without a Cargo upgrade. The safety gate treats
+    builds/tests/runs, installs, publishing, cleaning, aliases, extensions,
+    help for extensions, metadata without --no-deps, and toolchain
+    selection as approval-requiring, including through renamed launchers;
+    version/--list/help/locate-project and offline --no-deps metadata are
+    allowed. Fixtures cover identity/receipt/proxy/hard-link/renaming and
+    lookalikes, alias non-execution, help trust, nested help, config
+    changes turning a builtin into an alias, offline metadata selection,
+    feature lists, extension trust and delegation scope, revalidation,
+    malformed/duplicate/oversized/non-UTF-8/failed/timeout answers, and -y
+    and replay gates (tests/cli.rs, through a renamed launcher).
+    Verified cargo 1.98.1 via the rustup 1.29.1 proxy at
+    ~/.cargo/bin/cargo, identity=rust:cargo, protocol=cargo,
+    trust=trusted_completers plus trusted_help. Installed checks repair
+    `cargo biuld`, `cargo +stable biuld`, `cargo +stabel version`,
+    `cargo build --releae`, and `cargo report future-incompatibilites`, plus
+    package/bin/example/test/bench/feature/--color typos and a workspace
+    member in an isolated project, and list an alias and an extension
+    without running them; no build, build script, alias, or extension ran.
+    CARGO_COMPLETE (nightly-only native completion) is not used.
+    Remaining: other Cargo versions, Windows runtime, and offline
+    resolution of --exclude, -C, and -Z.
+    Validation: 227 default tests (193 unit, 30 CLI, corpus, three rule
+    fixtures) and benchmark fixture checks, rustfmt, host Clippy, and
+    all-target/all-feature Clippy for Windows GNU/MSVC, FreeBSD, and Linux
+    musl pass (Backend now boxes its clap protocol, which exceeded the
+    enum-size lint on Windows). Cross-target checks compile code only.
+    PARTIAL (2026-10-05): urfave/cli's completion protocol implemented for
+    v1, v2, and v3 (src/engine/native/urfave.rs). Behavior was taken from
+    the library sources and checked against small apps built with the real
+    v1.22.16, v2.27.7, and v3.14.0 libraries, then against lefthook.
+    Discovery: Go build information names the linked urfave/cli major
+    (github.com/urfave/cli, /v2, /v3) and release; the go-modules cache moved
+    to v2 to record versions, and a replace directive clears the version.
+    Several majors, or urfave/cli together with cobra or posener, are
+    refused as ambiguous unless the module is audited (another protocol's
+    request runs an app that does not speak it). trusted_completers names
+    the module path or executable; renamed binaries keep the identity.
+    Protocol: `app <command path> [-] --generate-bash-completion` (v1/v2)
+    or `--generate-shell-completion` (v3) as separate argv words; one word
+    per line, v3 as word:usage split at the first colon like its own
+    scripts. The root is always asked first: an app that does not enable
+    completion rejects the flag as undefined before hooks or actions (exit
+    1, usage text, both rejected). Queries never contain options, option
+    values, or `--`: verified on v2.27.7, a context flag's Action runs
+    during completion, and any `--` makes the command's action run. The
+    command path is walked from the app's own lists; an option without
+    =value takes the next word as its value unless that word is a listed
+    command (such contexts are partial). v3 omits aliases and hidden
+    commands: a word whose answer differs from its parent's is a command,
+    and a new engine hook (NativeCompletionBackend::confirms) lets the
+    engine ask before calling a word missing from a partial list invalid.
+    v3 lines whose name held a colon (db:migrate:usage) are dropped rather
+    than offered as `db`. v1 nested flag lists include the running parent
+    app's flags, which are not accepted there; the parent level's list is
+    subtracted. Hooks: completion runs ancestor Before hooks for nested
+    queries before v1.22.10 and v2.13.0, and the whole chain for every
+    query from v3.10.0 (checked across releases); replaced modules are
+    assumed to. Such queries also require trusted_help for the app.
+    Capabilities: commands/options; no arity, values, or resources. Root
+    command lists are authoritative for v1/v2 (aliases listed; hidden
+    commands omitted as in cobra). Below the root a command can also take
+    arguments urfave never lists, so lists are partial; a level listing
+    only the help command is a leaf whose slot holds arguments, and words
+    after an unlisted argument are positional. Option lists are complete
+    for v2 and the v1 root, partial for v1 nested and v3 (primary names
+    only; no short options). v3 descriptions are kept. A command answer
+    that mixes flags and words comes from the app's own callback (lefthook
+    hook names): its words are resources needing approval. Probes run
+    offline (blocked proxies, KUBECONFIG/DOCKER_HOST disabled, no git
+    prompts) with `0` and _CLI_ZSH_AUTOCOMPLETE_HACK removed so plain
+    lines are printed. Answers stay in request memory: callbacks can read
+    the working directory's project. Fixtures cover discovery/trust/
+    ambiguity/audit, version thresholds, the v1/v2/v3 formats, partial
+    lists and leaves, unlisted aliases, callback resources, hook gating,
+    disabled completion, usage text, invalid UTF-8, limits, timeouts with
+    tree cleanup, upgrades, and the engine's suggestions and approvals.
+    End-to-end runs against the real-library builds repaired root, nested,
+    alias, global-flag, and post-argument flag typos; no action marker was
+    created (v3 Before markers appeared only with trusted_help). Remaining:
+    custom callbacks printing only words are indistinguishable from
+    subcommands; flags placed after arguments are listed although v1/v2 do
+    not parse them; a root that skips flag parsing would receive the
+    completion flag as an argument if completion is disabled (v3 only).
+    Reference: github.com/urfave/cli help.go, command(_run).go, and the
+    v3 autocomplete scripts.
+    Validation: 238 default tests (204 unit, 30 CLI, corpus, three rule
+    fixtures), rustfmt, host Clippy, and all-target/all-feature Clippy for
+    Windows GNU/MSVC, FreeBSD, and Linux musl pass; four opt-in installed
+    checks pass on macOS.
+    PARTIAL (2026-10-05): click 8's completion protocol implemented
+    (src/engine/native/click.rs), from click 8.5.0's shell_completion.py
+    and core.py and the templates of click 8.0.0-8.5.0, then checked
+    against a fixture app built on the real library and against black
+    and flask. Protocol: `<VAR>=bash_complete` with COMP_WORDS (each word
+    shlex-quoted, so empty words, spaces, quotes, and shell syntax survive
+    click's split) and COMP_CWORD; no process arguments. Answers are
+    `type,value` lines: plain items are words, file/dir items (path
+    completion) contribute none, unknown types fail closed; words with
+    whitespace are skipped. An unknown instruction exits 1 without running
+    the app (verified). The variable is derived from the program name the
+    app runs as, and an app ignoring it simply runs, so it is never guessed:
+    (a) an installed click 8 bash/zsh/fish script (Homebrew generates them)
+    is read without sourcing; its single query line must name the variable
+    and program, and its registration (`complete -o nosort -F`, `#compdef`
+    plus `compdef`, or `complete --no-files --command`) must bind this
+    application. click 7's instructions are not accepted. trusted_completers
+    suffices; the app is never asked for help. (b) Otherwise a Python
+    console-script identity listed in trusted_completers and trusted_help
+    (now also matched by identity) runs only `--help`; click's "Show this
+    message and exit." marks the library, and the usage line names the
+    program click derives the variable from (custom prog_name included;
+    Typer's boxed help too). Clap generators are not tried for Python apps.
+    The app's fingerprint is rechecked before each query. Resolution
+    follows the full context (click parses it with resilient parsing: no
+    prompts, no command callbacks, but parameter type conversions and
+    callbacks run, verified with a marker; lazy groups import plugins,
+    and flask imports the project's application). Capabilities: commands,
+    options (short ones included; hidden ones omitted), and values; no
+    arity or descriptions (bash format). Root lists are authoritative;
+    below the root the slot may be an argument with or without declared
+    choices, so lists are partial. Option values are used only when the
+    option changes the slot's answer (a flag yields its parent's). Probes
+    run offline with PYTHONDONTWRITEBYTECODE, NO_COLOR, TERM=dumb, and no
+    PYTHONINSPECT/PYTHONSTARTUP; answers stay in request memory. Fixtures
+    cover the three script layouts and click 8.0's fish loop, unbound/
+    mismatched/duplicated/unsafe/click 7 scripts, help fingerprints, query
+    encoding without arguments, plain/file items, values and flags,
+    unknown types, failures, invalid UTF-8, timeouts with tree cleanup,
+    limits, replaced apps, trust/help gating, renaming, the engine, and
+    upgrades; tests/cli.rs selects the bridge from an installed bash
+    script through the real binary without sourcing it, and -y prints an
+    allowed repair. Real-library runs: root, nested, choice-argument,
+    option, and option-value repairs, with only the parameter callback's
+    marker. Remaining: custom completion callbacks (resources) are not
+    distinguished from choices; a fish script needs fish installed to be
+    found; zsh/fish descriptions are not read; click apps installed
+    system-wide here: none.
+    Reference: click.palletsprojects.com/en/stable/shell-completion/ and
+    pallets/click src/click/shell_completion.py.
+    Validation: 247 default tests (212 unit, 31 CLI, corpus, three rule
+    fixtures), rustfmt, host Clippy, and all-target/all-feature Clippy for
+    Windows GNU/MSVC, FreeBSD, and Linux musl pass; the four opt-in
+    installed checks still pass.
+    PARTIAL (2026-10-05): kingpin's completion flag implemented for
+    gopkg.in/alecthomas/kingpin.v2, github.com/alecthomas/kingpin/v2, and the
+    choria-io/fisk fork (src/engine/native/kingpin.rs), from the 2.4.0,
+    2.2.6, and fisk 0.9.1 sources, then checked against a fixture built on
+    real kingpin 2.4.0. Protocol: `app --completion-bash <words> [--]`
+    with the flag first (kingpin drops the first raw argument when it
+    computes the current word); one word per line: a command's
+    subcommands, or a leaf's argument hints (kingpin forbids mixing args
+    and commands), or every non-hidden long flag (app flags included at
+    nested levels) after `--`. Verified quirks: `help` at the root, hidden
+    items and aliases unlisted (aliases still descend), an unknown word
+    answers like its parent, Enum arguments give no hints. Every query ran
+    the app's PreAction and set flag defaults: a `--log-file` default
+    opened with OpenFile created a file in the working directory. So
+    kingpin needs trusted_help as well (discovery reports NotTrusted
+    otherwise, without probing), probes run in a private directory under
+    notypo's cache (the file landed there), and queries carry only verified
+    command words plus `--`: no options, values, or `@file` words (kingpin
+    reads the named file). Unlisted aliases are found when the answer
+    changes, through the walk and the engine's confirms hook. Lists are
+    partial (no aliases, short flags, `--no-` forms, or values), so
+    corrections are asked; no descriptions or values; request memory only.
+    Discovery now refuses, unless audited, any Go app linking more than one
+    of posener, cobra, urfave/cli, and kingpin (posener with cobra keeps
+    its earlier posener choice); the go-modules cache moved to v3. Fixtures
+    cover levels, flags, aliases, the private directory, positional words,
+    `@file` words, help trust by name and identity, usage text, failures,
+    and discovery/ambiguity. Real-library runs repaired root, nested,
+    alias, nested-flag, and global-flag typos. No kingpin app (promtool,
+    amtool, kopia, trufflehog, logcli, nats) is installed here.
+    Validation: 260 default tests (224 unit, 32 CLI, corpus, three rule
+    fixtures), rustfmt, host Clippy, and Windows GNU/MSVC, FreeBSD, and
+    Linux musl Clippy pass; the five opt-in installed checks pass.
 [ ] NOT DONE: Extend tests/installed_clis.rs (--ignored) with one typo per
     installed 5B tool, and keep a per-tool record of discovery, protocol,
     trust policy, and verified version. Tools missing locally are reported
     as unverified, never as passed.
+    PARTIAL (2026-10-05): added Sofka option/plugin, pip nested/option, and npm
+    command/nested-option/project-script fixtures. The opt-in installed-client
+    tests passed twenty-two corrections across all sixteen installed apps
+    (the existing thirteen plus Sofka, pip, and npm); nothing was skipped on
+    this machine. This does not verify the remaining 5B inventory.
+    PARTIAL (2026-10-05): added five cargo command/option/toolchain
+    fixtures and an isolated-workspace check of project values, a workspace
+    member, an alias, and an extension. All three opt-in tests pass:
+    twenty-five shared-case corrections across seventeen installed apps,
+    plus the npm-script and cargo-project checks; nothing was skipped.
+    PARTIAL (2026-10-05): added two lefthook root fixtures and an isolated
+    lefthook repository check (configured hooks, a flag after a hook, and
+    the missing-trusted_help refusal). All four opt-in tests pass:
+    twenty-seven shared-case corrections across eighteen installed apps
+    plus the npm-script, cargo-project, and lefthook-hook checks; nothing
+    skipped.
+    PARTIAL (2026-10-05): added eight user-trusted cobra apps (upctl, velero,
+    k9s, trivy, k6, talosctl, popeye, gdu-go 5.37.0), each decided; all four
+    opt-in tests pass with thirty-five shared-case corrections across
+    twenty-six installed apps plus the npm-script, cargo-project, and
+    lefthook-hook checks; nothing skipped.
+    PARTIAL (2026-10-05): added just (two decided clap corrections) and a
+    fifth opt-in test running the binary under zsh with the real fpath for
+    deno, jq, curl, make, gem, pipx, brew, and rsync (partial lists, so
+    asked; brew and rsync need approval). All five pass: thirty-seven
+    shared-case corrections across twenty-seven apps, the eight zsh-handler
+    corrections, and the npm-script, cargo-project, and lefthook checks.
+    The brew case exposed silent truncation: its formula list (about
+    sixteen thousand formulae and casks) was cut at the candidate limit,
+    so `jq` looked invalid and `brew install j` was offered. Native answers
+    past the limit now fail instead (section 6), leaving the word unjudged.
+    Validation: 256 default tests (220 unit, 32 CLI, corpus, three rule
+    fixtures), rustfmt, host Clippy, and all-target/all-feature Clippy for
+    Windows GNU/MSVC, FreeBSD, and Linux musl pass.
+    PARTIAL (2026-10-05): added bq and gsutil (asked, bash handlers); all
+    five opt-in tests pass: thirty-nine shared-case corrections across
+    twenty-nine apps, eight zsh-handler corrections, and the npm-script,
+    cargo-project, and lefthook checks. Validation: 257 default tests
+    (221 unit, 32 CLI, corpus, three rule fixtures), rustfmt, and host plus
+    Windows GNU/MSVC, FreeBSD, and Linux musl Clippy pass.
+    PARTIAL (2026-10-05): a sixth opt-in test repairs jq, curl, tar, and
+    rsync for fish users from fish's embedded scripts (asked; rsync needs
+    approval). All six pass. Validation: 261 default tests (225 unit, 32
+    CLI, corpus, three rule fixtures), rustfmt, and host plus Windows
+    GNU/MSVC, FreeBSD, and Linux musl Clippy pass.
+    PARTIAL (2026-10-05): added five bash-handler tools: yt-dlp
+    (`--list-formts`), wg (`shwo`), asciinema (`recrod`), elan (Lean's
+    toolchain manager, `toolchian list`), and svn (`stauts`), all asked.
+    The shared case list now holds forty-four corrections across thirty-four
+    apps; all six opt-in tests pass. cmake's bash handler offered nothing
+    for `--biuld`; dua and btop have no completer (help fallback only).
+    PARTIAL (2026-10-05): gsettings (`lsit-schemas`, GLib's bash handler)
+    joins the shared list (forty-five corrections across thirty-five apps).
+    The zsh-handler check adds zsh 5.9's own handlers: ansible-vault
+    (`encrpyt`) and ansible-playbook (`--chekc`) through the shared
+    `_ansible` (identity python:ansible), wget (`--quite`), and xz
+    (`--decompres`), all asked. A seventh opt-in test covers make under
+    workspace trust (section 5B build tools). Not repaired: zig, zstd,
+    node, openssl, magick, and tokei have no handler here (node's
+    `--completion-bash` script isn't bridged); ffmpeg's zsh handler offers
+    nothing for `-hide_baner`; `nmap --top-port` is left alone, since
+    getopt accepts that unambiguous prefix.
 
 6. CONTROL PROBES, CACHES, AND LATENCY
 
@@ -1286,6 +2054,12 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     dynamic-result cache keys; give resource data a short lifetime and never
     share resource results across unrelated contexts.
     Value and resource answers are never written to disk.
+    Native protocol answers with more distinct words than max_candidates
+    (default 5000) now fail rather than being cut (cobra, posener,
+    argcomplete, aws, gcloud, az, Bash/fish/Zsh handlers, clap; the newer
+    bridges already failed): a cut list made every word past the cut look
+    invalid (regression test with a cobra double; brew in the installed
+    zsh check). The --help provider still keeps a bounded partial list.
 [x] DONE: Keep discovery offline by default and avoid storing captured
     secrets, environment dumps, or full shell history in metadata caches.
     Live cloud resource discovery follows the explicitly enabled read-only
@@ -1299,6 +2073,10 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     options are cached; values, credentials, and full help output are not
     written to disk. Arbitrary opt-in scripts have blocked HTTP proxies but
     retain the user's environment; they are not sandboxed or audited offline.
+    Shell-handler probes (Bash/fish/Zsh) now also get KUBECONFIG=/dev/null, an
+    unreachable DOCKER_HOST, no gh prompts, and the Cloud SDK's switches
+    for credentials, GCE metadata, prompts, and update checks (2026-10-05):
+    gsutil's handler had probed the metadata server without a proxy.
 [x] DONE: Ensure a chosen candidate's ranking is settled before allowing
     automatic acceptance. Later provider results cannot silently change a
     command already presented for execution.
@@ -1415,6 +2193,25 @@ executes it once. Aborting or a denied safety decision executes nothing.
     shells; tests/cli.rs repairs a loop body through real bash/zsh/fish
     aliases and a quoted tcsh event through the real tcsh alias.
     PowerShell remains pending.
+    PARTIAL (2026-10-05): PowerShell parser fixtures (words, operators,
+    redirections, comments, unsupported constructs, quoting), the pwsh AST
+    oracle and native round trip, gate fixtures, an engine fixture, and a
+    tests/cli.rs run through real pwsh: the generated function repairs
+    `git sttus` and runs `git status` once through iex, and a cmdlet typo
+    runs nothing. The obsolete "unsupported dialect" CLI check became a
+    check that unsupported PowerShell syntax never runs under -y.
+    PARTIAL (2026-10-05): the tests/cli.rs PowerShell check now types its
+    lines into an interactive pwsh (`-Command -` on stdin), so each failure
+    is a real history entry with PowerShell's own status and records:
+    `Get-ChildItme -Name -Path one` runs `Get-ChildItem -Name -Path one`,
+    `Get-ChildItem -Path two -Recrse -Name` runs the `-Recurse` form, and
+    `git sttus` runs `git status` once (the Add-History version faked
+    entries without failures). Engine fixtures cover injected PowerShell
+    descriptions (aliases, prefixes, case, `-Name:value`, enum values, an
+    open function, an alias for an application) and, with pwsh, a misspelled
+    cmdlet repaired from PowerShell's command list; module fixtures cover
+    strict record parsing, binding, values, trust entries, and real pwsh
+    descriptions and module refusal.
 [x] DONE: Add meaningful provider fixtures with isolated directories,
     history, fake executables, help/man text, unavailable tools, and timeouts.
 [x] DONE: Add fake native completers for aws/gcloud/az that introduce
@@ -1426,7 +2223,8 @@ executes it once. Aborting or a denied safety decision executes nothing.
     PARTIAL: every protocol family (aws_completer, argcomplete, git, cobra,
     posener, Bash/Zsh functions, fish scripts) has an upgrade fixture; shell handler
     cache identities change on app/registration upgrades. Most 5A clients have
-    no check.
+    no check. The clap, pip, npm, Cargo, urfave/cli, and click bridges have
+    upgrade fixtures too; none of them writes answers to the disk cache.
 [ ] NOT DONE: Test mid-command token replacement, empty-prefix enumeration,
     multiple typos, nested groups, global flags, enum/resource values, quoting,
     and shell-specific native completion responses.
@@ -1437,6 +2235,8 @@ executes it once. Aborting or a denied safety decision executes nothing.
     up; with network_completion they are, and an edit picking a different
     resource needs approval while fixed values stay ordinary. PowerShell
     responses are pending.
+    (2026-10-05: PowerShell parameter descriptions are covered by the engine
+    and module fixtures recorded above; TabExpansion2 responses are not.)
 [x] DONE: Verify context separation and graceful outcomes for absent CLIs,
     absent completers, expired credentials, offline mode, denied API reads,
     extension changes, and slow or malformed completion output.
@@ -1475,6 +2275,18 @@ executes it once. Aborting or a denied safety decision executes nothing.
     benchmarks/compare.py/results.md compare the default pipeline
     with Python thefuck 3.32 (6-33x faster, 6.8 MiB vs 40.5 MiB). Remaining
     shell/protocol paths and provider-stage measurements are still pending.
+    PARTIAL (2026-10-05): benchmarks/structured.py --protocols measures the
+    newer bridges against installed apps (11 processes per mode, median ms
+    cold/warm, macOS): pip 230/230, npm 181/181, cargo 74/74, clap sofka
+    63/57, clap just shim 20/17, urfave/cli lefthook 18/15, user-trusted
+    cobra k9s 64/47 (disk-cached), and bq's bash handler 1108/1106 (Python
+    startup for `bq help`); results in benchmarks/protocol-results.md.
+    Request-local bridges repeat their probes when warm. click and kingpin
+    have no installed app here; Linux/Windows timings remain unmeasured.
+    PARTIAL (2026-10-05): PowerShell cases (pwsh on PATH or
+    NOTYPO_BENCH_PWSH): `Get-ChildItem -Recrse` 447/398 ms with one probe,
+    and `Get-ChildItme -Name` 829/790 ms with two (the command list and the
+    description); peak RSS 167 MiB is the child PowerShell's.
 [x] DONE: Set latency/memory budgets from measurements; preserve the
     inexpensive common-command path and report quality/performance tradeoffs.
     Engine work stays under ~2 ms per correction; probes are bounded by
@@ -1500,6 +2312,9 @@ executes it once. Aborting or a denied safety decision executes nothing.
     Verified on macOS with --allow-dirty for the implementation worktree;
     the 72-file archive includes the fish/Zsh handlers and shared Unix terminal
     support, and excludes /plan/. No crate was uploaded.
+    Rechecked 2026-10-05 with `cargo package --allow-dirty --locked`: 85
+    files, including the new protocol, alias, and PowerShell modules, still
+    without /plan/ or the benchmarks; the packaged sources build.
 [ ] NOT DONE: Complete default-engine rollout validation against corpus,
     execution policy, platform checks, and performance criteria. Retire migrated
     legacy paths gradually with documented compatibility behavior.

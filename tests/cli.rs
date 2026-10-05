@@ -49,7 +49,11 @@ impl Workspace {
             .env("NOTYPO_NO_CACHE", "1")
             .env_remove("TF_HISTORY")
             .env_remove("NOTYPO_CURRENT_COMMAND")
+            .env_remove("NOTYPO_EXIT_STATUS")
             .env_remove("NOTYPO_SHELL_FUNCTIONS")
+            .env_remove("NOTYPO_POWERSHELL")
+            .env_remove("NOTYPO_POWERSHELL_COMMANDS")
+            .env_remove("NOTYPO_POWERSHELL_ERRORS")
             .env_remove("NOTYPO_FISH_COMPLETE_PATH")
             .env_remove("NOTYPO_ZSH_FPATH")
             .env_remove("NOTYPO_FISH_HISTORY_SESSION")
@@ -71,8 +75,12 @@ impl Drop for Workspace {
     }
 }
 
-fn finish(mut child: Child) -> Output {
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn finish(child: Child) -> Output {
+    finish_within(child, Duration::from_secs(10))
+}
+
+fn finish_within(mut child: Child, limit: Duration) -> Output {
+    let deadline = Instant::now() + limit;
     loop {
         if child.try_wait().unwrap().is_some() {
             return child.wait_with_output().unwrap();
@@ -80,7 +88,7 @@ fn finish(mut child: Child) -> Output {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("CLI did not exit within 10 seconds");
+            panic!("CLI did not exit within {limit:?}");
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -408,6 +416,905 @@ fn native_engine_needs_a_person_for_risky_corrections() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Not running"), "{stderr}");
     assert!(stderr.contains("destructive"), "{stderr}");
+}
+
+#[test]
+fn pip_completion_uses_package_identity_and_never_installs_or_replays_packages() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let interpreter = bin.join("python3");
+    fs::write(
+        &interpreter,
+        r#"#!/bin/sh
+root=$(dirname "$0")
+[ "$1" = -m ] && [ "$2" = pip ] || exit 9
+shift 2
+[ "$#" = 0 ] && [ "$PIP_AUTO_COMPLETE" = 1 ] || { touch "$root/operation-marker"; exit 9; }
+printf '%s|%s\n' "$COMP_CWORD" "$COMP_WORDS" >> "$root/queries"
+[ "$PIP_CONFIG_FILE" = /dev/null ] && [ "$PIP_NO_INDEX" = 1 ] || exit 9
+case "$COMP_WORDS" in
+  *' config '*) printf 'get\nlist\n';;
+  *' install -') printf '%s\n' '--dry-run' '--target=';;
+  *' show '*) printf 'example-package\n';;
+  *' install '*|*' list '*) ;;
+  *) printf 'config install list show\n';;
+esac
+exit 1
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o755)).unwrap();
+    for name in ["pip3.14", "package-tool"] {
+        let executable = bin.join(name);
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\nexec {} -m pip \"$@\"\n", interpreter.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let command = |trust: bool| {
+        let mut command = workspace.command("");
+        command
+            .env("PATH", system_path(&bin))
+            .env(
+                "NOTYPO_TRUSTED_COMPLETERS",
+                if trust { r#"["python:pip"]"# } else { "" },
+            )
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy");
+        command
+    };
+    let output = finish(
+        command(false)
+            .args(["--json", "--force-command", "package-tool instlal example"])
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["probes"], 0, "{report}");
+    assert!(!bin.join("queries").exists());
+    for (source, expected, risky) in [
+        (
+            "package-tool instlal example",
+            "package-tool install example",
+            true,
+        ),
+        ("pip3.14 instlal example", "pip3.14 install example", true),
+        (
+            "package-tool --cache-dir /tmp instlal example",
+            "package-tool --cache-dir /tmp install example",
+            true,
+        ),
+        (
+            "package-tool install --dry-rnu example",
+            "package-tool install --dry-run example",
+            true,
+        ),
+        (
+            "package-tool config lsit",
+            "package-tool config list",
+            false,
+        ),
+        ("package-tool lits", "package-tool list", false),
+        (
+            "package-tool --log command.log lits",
+            "package-tool --log command.log list",
+            true,
+        ),
+        (
+            "package-tool show exampel-package",
+            "package-tool show example-package",
+            true,
+        ),
+    ] {
+        let output = finish(
+            command(true)
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["candidates"][0]["command"], expected,
+            "{source}: {report}"
+        );
+        assert_eq!(
+            report["candidates"][0]["edits"][0]["via"], "pip completion",
+            "{report}"
+        );
+        assert!(
+            report["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("python:pip")),
+            "{report}"
+        );
+        if source.contains(" show ") {
+            assert!(
+                report["candidates"][0]["safety"]["reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason.as_str().unwrap().contains("acts on the resource")),
+                "local package names require resource approval: {report}"
+            );
+        }
+        if risky {
+            assert_eq!(
+                report["candidates"][0]["safety"]["decision"], "confirm",
+                "{report}"
+            );
+            let output = finish(
+                command(true)
+                    .args(["-y", "--force-command", source])
+                    .spawn()
+                    .unwrap(),
+            );
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+        }
+    }
+    // Replay uses the same resolved identity even with completion disabled.
+    let output = finish(
+        command(false)
+            .env("NOTYPO_DISABLED_SOURCES", "native:help:man:history:legacy")
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "true")
+            .args(["-y", "--force-command", "package-tool install example"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!bin.join("operation-marker").exists());
+    let queries = fs::read_to_string(bin.join("queries")).unwrap();
+    assert!(
+        queries.contains("pip3.14 ") && queries.contains("package-tool "),
+        "{queries}"
+    );
+}
+
+#[test]
+fn npm_completion_preserves_package_identity_and_requires_approval_for_scripts_and_publication() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    let package = workspace.0.join("node_modules/npm");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir_all(package.join("bin")).unwrap();
+    fs::write(
+        package.join("package.json"),
+        r#"{"name":"npm","version":"11.19.1","bin":{"npm":"bin/npm-cli.js","npx":"bin/npx-cli.js"}}"#,
+    ).unwrap();
+    let executable = package.join("bin/npm-cli.js");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+root=$(dirname "$0")
+[ "$1" = completion ] || { touch "$root/operation-marker"; exit 9; }
+shift
+while [ "${1#--prefix=}" != "$1" ]; do shift; done
+[ "$1" = -- ] || { touch "$root/operation-marker"; exit 9; }
+shift
+[ "$npm_config_offline" = true ] && [ "$npm_config_ignore_scripts" = true ] || exit 9
+[ "$npm_config_logs_max" = 0 ] && [ "$npm_config_timing" = false ] || exit 9
+[ -z "$NPM_CONFIG_OFFLINE" ] && [ -z "$Npm_Config_OffLine" ] && [ -z "$COMP_FISH" ] || exit 9
+for arg in "$@"; do printf '<%s>' "$arg" >> "$root/queries"; done
+printf '\n' >> "$root/queries"
+for arg in "$@"; do
+  case "$arg" in
+    "'config'") printf 'get\nlist\nset\n'; exit;;
+    "'run'") printf 'build\nreport package\n'; exit;;
+  esac
+done
+printf 'config\ninstall\npublish\nrun\nstart\nview\n'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&executable, bin.join("package-tool")).unwrap();
+    let npx = package.join("bin/npx-cli.js");
+    fs::write(&npx, "#!/bin/sh\ntouch operation-marker\n").unwrap();
+    fs::set_permissions(&npx, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&npx, bin.join("package-runner")).unwrap();
+    let command = |trust: bool| {
+        let mut command = workspace.command("");
+        command
+            .env("PATH", system_path(&bin))
+            .env(
+                "NOTYPO_TRUSTED_COMPLETERS",
+                if trust { r#"["npm:npm"]"# } else { "" },
+            )
+            .env("NOTYPO_TRUSTED_HELP", "")
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy")
+            .env("NPM_CONFIG_OFFLINE", "false")
+            .env("Npm_Config_OffLine", "false")
+            .env("COMP_FISH", "true");
+        command
+    };
+    let output = finish(
+        command(false)
+            .args(["--json", "--force-command", "package-tool pbulish"])
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["probes"], 0, "{report}");
+    assert!(!bin.join("queries").exists());
+    for (source, expected, resource, risky) in [
+        (
+            "package-tool config lsit",
+            "package-tool config list",
+            false,
+            false,
+        ),
+        ("package-tool pbulish", "package-tool publish", false, true),
+        (
+            "package-tool isntall example",
+            "package-tool install example",
+            false,
+            true,
+        ),
+        (
+            "package-tool run biuld",
+            "package-tool run build",
+            true,
+            true,
+        ),
+        (
+            "package-tool --prefix 'a b😀' run 'report pakcage'",
+            "package-tool --prefix 'a b😀' run 'report package'",
+            true,
+            true,
+        ),
+        (
+            "package-tool run biuld -- '$(touch operation-marker)'",
+            "package-tool run build -- '$(touch operation-marker)'",
+            true,
+            true,
+        ),
+        ("package-tool strta", "package-tool start", false, true),
+        (
+            "package-tool config ste key value",
+            "package-tool config set key value",
+            false,
+            true,
+        ),
+    ] {
+        let output = finish(
+            command(true)
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["candidates"][0]["command"], expected,
+            "{source}: {report}"
+        );
+        assert!(
+            report["candidates"][0]["edits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|edit| edit["via"] == "npm completion"),
+            "{report}"
+        );
+        if resource {
+            assert!(
+                report["candidates"][0]["safety"]["reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason.as_str().unwrap().contains("acts on the resource")),
+                "{report}"
+            );
+        }
+        if risky {
+            assert_eq!(
+                report["candidates"][0]["safety"]["decision"], "confirm",
+                "{report}"
+            );
+            let output = finish(
+                command(true)
+                    .args(["-y", "--force-command", source])
+                    .spawn()
+                    .unwrap(),
+            );
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+        }
+    }
+    let output = finish(
+        command(true)
+            .args([
+                "--json",
+                "--force-command",
+                "package-tool --offline=false run biuld",
+            ])
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["candidates"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+    assert!(
+        report["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|note| note.as_str().unwrap().contains("offline input policy")),
+        "{report}"
+    );
+    let output = finish(
+        command(true)
+            .args(["--json", "--force-command", "package-runner pbulish"])
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["probes"], 0,
+        "npx must not be used as npm completion: {report}"
+    );
+    let output = finish(
+        command(false)
+            .env("NOTYPO_DISABLED_SOURCES", "native:help:man:history:legacy")
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "true")
+            .args(["-y", "--force-command", "package-tool run build"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!bin.join("operation-marker").exists());
+    assert!(!workspace.0.join("operation-marker").exists());
+    let queries = fs::read_to_string(bin.join("queries")).unwrap();
+    assert!(
+        queries.contains("<'a b😀'>") && queries.contains("<'package-tool'>"),
+        "{queries}"
+    );
+}
+
+#[test]
+fn cargo_completion_reads_offline_metadata_and_blocks_build_alias_and_replay_execution() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir_all(workspace.0.join("lib/rustlib")).unwrap();
+    fs::write(
+        workspace.0.join("lib/rustlib/manifest-cargo-fixture"),
+        "file:bin/cargo\n",
+    )
+    .unwrap();
+    let cargo = bin.join("cargo");
+    fs::write(&cargo, r#"#!/bin/sh
+root=$(dirname "$(dirname "$0")")
+[ "$CARGO_NET_OFFLINE" = true ] && [ "$RUSTUP_AUTO_INSTALL" = 0 ] || exit 8
+[ "$CARGO_HTTP_PROXY" = http://127.0.0.1:9 ] && [ -z "$CARGO_COMPLETE" ] || exit 8
+for arg in "$@"; do printf '<%s>' "$arg" >> "$root/queries"; done
+printf '\n' >> "$root/queries"
+while [ "$#" -gt 0 ]; do
+  case "$1" in --offline|--color=never|--config=*) shift;; *) break;; esac
+done
+case "$*" in
+  '--list --verbose') printf 'Installed Commands:\n    build  Compile project\n    metadata  Read metadata\n    report  Report\n    version  Version\n    danger  alias: !touch operation-marker\n';;
+  --help) printf 'Options:\n  --color <WHEN>  Color [possible values: auto, always, never]\n';;
+  'build --help') printf 'Options:\n  --release  Release\n  --color <WHEN>  Color [possible values: auto, always, never]\n  -p, --package [<SPEC>]  Package\n  --bin [<NAME>]  Binary\n  --manifest-path <PATH>  Manifest\n  -F, --features <FEATURES>  Features\n';;
+  'report --help') printf 'Commands:\n  future-incompatibilities  Show future reports\n';;
+  'metadata --offline --locked --no-deps --format-version=1'*) printf '%s' '{"workspace_members":["demo-id"],"packages":[{"id":"demo-id","name":"demo","features":{"default":[],"quiet-mode":[]},"targets":[{"kind":["bin"],"name":"demo-bin"}]}]}';;
+  *) touch "$root/operation-marker"; exit 9;;
+esac
+"#).unwrap();
+    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&cargo, bin.join("rust-packages")).unwrap();
+    let command = |trust: bool, help: bool| {
+        let mut command = workspace.command("");
+        command
+            .env("PATH", system_path(&bin))
+            .env(
+                "NOTYPO_TRUSTED_COMPLETERS",
+                if trust { r#"["rust:cargo"]"# } else { "" },
+            )
+            .env(
+                "NOTYPO_TRUSTED_HELP",
+                if help { r#"["rust:cargo"]"# } else { "" },
+            )
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy")
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false")
+            .env("CARGO_COMPLETE", "bash");
+        command
+    };
+    let output = finish(
+        command(false, false)
+            .args(["--json", "--force-command", "rust-packages biuld"])
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["probes"], 0, "{report}");
+    assert!(!workspace.0.join("queries").exists());
+    for (source, expected, resource) in [
+        ("rust-packages biuld", "rust-packages build", false),
+        (
+            "rust-packages build --releae",
+            "rust-packages build --release",
+            false,
+        ),
+        (
+            "rust-packages report future-incompatibilites",
+            "rust-packages report future-incompatibilities",
+            false,
+        ),
+        (
+            "rust-packages build --color nveer",
+            "rust-packages build --color never",
+            false,
+        ),
+        (
+            "rust-packages build --bin demo-bni",
+            "rust-packages build --bin demo-bin",
+            true,
+        ),
+        (
+            "rust-packages build -p dmeo",
+            "rust-packages build -p demo",
+            true,
+        ),
+        (
+            "rust-packages build --features quiet-mdoe",
+            "rust-packages build --features quiet-mode",
+            true,
+        ),
+        (
+            "rust-packages build --features=default,quiet-mdoe",
+            "rust-packages build --features=default,quiet-mode",
+            true,
+        ),
+        (
+            "rust-packages build --features demo/quiet-mdoe",
+            "rust-packages build --features demo/quiet-mode",
+            true,
+        ),
+        (
+            "rust-packages build --features 'default demo/quiet-mdoe'",
+            "rust-packages build --features 'default demo/quiet-mode'",
+            true,
+        ),
+        ("rust-packages dagner", "rust-packages danger", false),
+        (
+            "env X=1 rust-packages biuld",
+            "env X=1 rust-packages build",
+            false,
+        ),
+        (
+            "rust-packages build --manifest-path 'project 😀/Cargo.toml' --bin demo-bni",
+            "rust-packages build --manifest-path 'project 😀/Cargo.toml' --bin demo-bin",
+            true,
+        ),
+        (
+            "rust-packages build --bin demo-bni -- '$(touch operation-marker)'",
+            "rust-packages build --bin demo-bin -- '$(touch operation-marker)'",
+            true,
+        ),
+    ] {
+        let output = finish(
+            command(true, true)
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["candidates"][0]["command"], expected,
+            "{source}: {report}"
+        );
+        assert_eq!(
+            report["candidates"][0]["safety"]["decision"], "confirm",
+            "{report}"
+        );
+        assert!(
+            report["candidates"][0]["edits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|edit| edit["via"] == "cargo completion"),
+            "{report}"
+        );
+        if resource {
+            assert!(
+                report["candidates"][0]["safety"]["reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|reason| reason.as_str().unwrap().contains("acts on the resource")),
+                "{report}"
+            );
+        }
+        let output = finish(
+            command(true, true)
+                .args(["-y", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(!output.status.success(), "{source}");
+        assert!(output.stdout.is_empty(), "{source}");
+        assert!(!workspace.0.join("operation-marker").exists());
+    }
+    let output = finish(
+        command(true, false)
+            .args(["--json", "--force-command", "rust-packages build --releae"])
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["candidates"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+    let output = finish(
+        command(false, false)
+            .env("NOTYPO_DISABLED_SOURCES", "native:help:man:history:legacy")
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "true")
+            .args(["-y", "--force-command", "rust-packages build"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!workspace.0.join("operation-marker").exists());
+    let queries = fs::read_to_string(workspace.0.join("queries")).unwrap();
+    assert!(
+        queries.contains("<--manifest-path=project 😀/Cargo.toml>"),
+        "{queries}"
+    );
+    assert!(
+        !queries.contains("<$(touch operation-marker)>"),
+        "{queries}"
+    );
+    assert!(!queries.contains("<danger><--help>"), "{queries}");
+    assert!(!workspace.0.join("Cargo.lock").exists());
+}
+
+#[test]
+fn clap_dynamic_completion_repairs_commands_options_and_values_without_running_operations() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let executable = bin.join("clapcli");
+    fs::write(&executable, r#"#!/bin/sh
+root=$(dirname "$0")
+printf '[%s]' "$@" >> "$root/queries"
+printf '\n' >> "$root/queries"
+case "$*" in
+  '--help') printf 'Commands:\n  completion  Print completion registration\n'; exit;;
+  'completion --help') printf 'Usage: clapcli completion <SHELL>\nArguments:\n  <SHELL>  [possible values: zsh]\n'; exit;;
+  'completion zsh') cat "$root/registration"; exit;;
+esac
+case "$CLAP_FIXTURE_MODE" in
+  zsh|bash) ;;
+  *) touch "$root/operation-marker"; exit 3;;
+esac
+[ "$1" = -- ] || exit 4
+shift
+[ "$1" = clapcli ] || exit 5
+shift
+[ "$_CLAP_COMPLETE_INDEX" = "$#" ] || exit 6
+context=
+while [ "$#" -gt 1 ]; do
+  context="$context $1"
+  shift
+done
+while IFS='|' read -r pattern value description; do
+  case "$context" in
+    $pattern) case "$value" in "$1"*)
+      if [ "$CLAP_FIXTURE_MODE" = bash ]; then
+        printf '%s\013' "$value"
+      else
+        printf '%s:%s\n' "$value" "$description"
+      fi;; esac;;
+  esac
+done < "$root/tree"
+"#).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        bin.join("registration"),
+        r#"#compdef clapcli
+function _clap_dynamic_completer_fixture() {
+  local _CLAP_COMPLETE_INDEX=$(expr $CURRENT - 1)
+  local _CLAP_IFS=$'\n'
+  local replies=$( \
+    _CLAP_IFS="$_CLAP_IFS" \
+    _CLAP_COMPLETE_INDEX="$_CLAP_COMPLETE_INDEX" \
+    CLAP_FIXTURE_MODE="zsh" \
+    clapcli -- "${words[@]}" 2>/dev/null \
+  )
+}
+compdef _clap_dynamic_completer_fixture clapcli
+touch registration-marker
+"#,
+    )
+    .unwrap();
+    fs::write(bin.join("tree"), "|nodes|Manage nodes\n|plugin|Manage plugins\n nodes|list|List nodes\n nodes list*|--format|Output format\n nodes list*|--target|A target\n nodes list --format|json|JSON\n nodes list --format|yaml|YAML\n plugin|install|Install a plugin\n").unwrap();
+    let command = |help: bool| {
+        let mut command = workspace.command("");
+        command
+            .env("PATH", system_path(&bin))
+            .env("NOTYPO_TRUSTED_COMPLETERS", "clapcli")
+            .env("NOTYPO_TRUSTED_HELP", if help { "clapcli" } else { "" })
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy");
+        command
+    };
+    let output = finish(
+        command(false)
+            .args(["--json", "--force-command", "clapcli nodse"])
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["probes"], 0,
+        "help is a separate trust permission: {report}"
+    );
+    assert!(!bin.join("queries").exists());
+    for (source, expected) in [
+        ("clapcli nodse lsit", "clapcli nodes list"),
+        (
+            "clapcli nodes list --formta=jsno",
+            "clapcli nodes list --format=json",
+        ),
+        (
+            "clapcli nodes lsit --target '$(touch operation-marker)' --formta=json",
+            "clapcli nodes list --target '$(touch operation-marker)' --format=json",
+        ),
+        (
+            "clapcli plugin isntall example",
+            "clapcli plugin install example",
+        ),
+    ] {
+        let output = finish(
+            command(true)
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(
+            output.status.success(),
+            "{source}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["candidates"][0]["command"], expected,
+            "{source}: {report}"
+        );
+        assert!(
+            report["candidates"][0]["edits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|edit| edit["via"] == "clap completion"),
+            "{report}"
+        );
+        assert!(
+            report["candidates"][0]["edits"][0]["description"].is_string(),
+            "{report}"
+        );
+        if source.contains("plugin") {
+            assert_eq!(
+                report["candidates"][0]["safety"]["decision"], "confirm",
+                "{report}"
+            );
+            let output = finish(
+                command(true)
+                    .args(["-y", "--force-command", source])
+                    .spawn()
+                    .unwrap(),
+            );
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("changes installed packages"));
+        }
+    }
+    let queries = fs::read_to_string(bin.join("queries")).unwrap();
+    assert!(queries.contains("[$(touch operation-marker)]"), "{queries}");
+    // An installed registration supplies the proof without --help or sourcing.
+    let completion_dir = bin.join("completions");
+    fs::create_dir(&completion_dir).unwrap();
+    fs::write(
+        completion_dir.join("clapcli"),
+        r#"_clap_complete_fixture() {
+  local IFS=$'\013'
+  local _CLAP_COMPLETE_INDEX=${COMP_CWORD}
+  local replies=$( \
+    _CLAP_IFS="$IFS" \
+    _CLAP_COMPLETE_INDEX="$_CLAP_COMPLETE_INDEX" \
+    _CLAP_COMPLETE_COMP_TYPE="$_CLAP_COMPLETE_COMP_TYPE" \
+    _CLAP_COMPLETE_SPACE="$_CLAP_COMPLETE_SPACE" \
+    CLAP_FIXTURE_MODE="bash" \
+    clapcli -- "${words[@]}" \
+  )
+}
+complete -F _clap_complete_fixture clapcli
+touch registration-marker
+"#,
+    )
+    .unwrap();
+    fs::write(bin.join("queries"), "").unwrap();
+    let output = finish(
+        command(false)
+            .env("BASH_COMPLETION_USER_DIR", &bin)
+            .args(["--json", "--force-command", "clapcli nodse"])
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["candidates"][0]["command"], "clapcli nodes",
+        "{report}"
+    );
+    assert_eq!(
+        report["candidates"][0]["edits"][0]["via"],
+        "clap completion"
+    );
+    assert_eq!(report["probes"], 1, "{report}");
+    let queries = fs::read_to_string(bin.join("queries")).unwrap();
+    assert_eq!(queries, "[--][clapcli][]\n");
+    for marker in [
+        bin.join("operation-marker"),
+        workspace.0.join("operation-marker"),
+        workspace.0.join("registration-marker"),
+    ] {
+        assert!(!marker.exists(), "unexpected {}", marker.display());
+    }
+}
+
+#[test]
+fn developer_operations_require_approval_and_y_emits_nothing_to_execute() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    for (typo, program, arguments, reason) in [
+        (
+            "diskutl",
+            "diskutil",
+            "eraseDisk APFS Example /dev/example",
+            "wipe disks",
+        ),
+        ("userdl", "userdel", "example", "removes users"),
+        ("shutdwn", "shutdown", "-h now", "stops things"),
+        ("iptablse", "iptables", "-tfilter -F", "firewall rules"),
+        ("nginxx", "nginx", "-s quit", "restart a service"),
+        (
+            "certbto",
+            "certbot",
+            "delete --cert-name example",
+            "revokes certificates",
+        ),
+        ("flyawy", "flyway", "clean", "database data"),
+        ("liquibsae", "liquibase", "dropAll", "database data"),
+        ("primsa", "prisma", "migrate reset", "database data"),
+        ("alembci", "alembic", "downgrade base", "database data"),
+        ("dbmtae", "dbmate", "drop", "database data"),
+        (
+            "retsic",
+            "restic",
+            "-r example forget snapshot",
+            "backup snapshots",
+        ),
+        ("brog", "borg", "prune example", "backup snapshots"),
+        (
+            "borgmtaic",
+            "borgmatic",
+            "--config example.yaml",
+            "backup snapshots",
+        ),
+        ("tarsnpa", "tarsnap", "-dfexample", "backup snapshots"),
+        (
+            "rsnaphsot",
+            "rsnapshot",
+            "custom-interval",
+            "backup snapshots",
+        ),
+        (
+            "telepresnce",
+            "telepresence",
+            "intercept example",
+            "intercepted traffic",
+        ),
+        ("wg-quik", "wg-quick", "down example", "tunnels"),
+        (
+            "opnevpn",
+            "openvpn",
+            "--config example.ovpn",
+            "another host",
+        ),
+    ] {
+        let executable = bin.join(program);
+        fs::write(&executable, "#!/bin/sh\nprintf ran > operation-marker\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let source = format!("{typo} {arguments}");
+        let expected = format!("{program} {arguments}");
+        let command = || {
+            let mut command = workspace.command("");
+            command
+                .env("PATH", system_path(&bin))
+                .env("NOTYPO_DISABLED_SOURCES", "native:help:man:history:legacy")
+                .env("TF_HISTORY", &source)
+                .env("NOTYPO_EXIT_STATUS", "127");
+            command
+        };
+        let output = finish(command().arg("--json").spawn().unwrap());
+        assert!(
+            output.status.success(),
+            "{source}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["outcome"]["kind"], "suggestion",
+            "{source}: {report}"
+        );
+        assert_eq!(
+            report["candidates"][0]["command"], expected,
+            "{source}: {report}"
+        );
+        let candidate = report["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["command"] == expected)
+            .unwrap_or_else(|| panic!("{source}: {report}"));
+        assert_eq!(
+            candidate["safety"]["decision"], "confirm",
+            "{source}: {report}"
+        );
+        assert!(
+            candidate["safety"]["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.as_str().unwrap().contains(reason)),
+            "{source}: {report}"
+        );
+        let output = finish(command().arg("-y").spawn().unwrap());
+        assert!(
+            !output.status.success(),
+            "{source}: approval needs a terminal"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{source}: nothing for the alias to execute"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Not running") && stderr.contains(reason),
+            "{source}: {stderr}"
+        );
+        assert!(
+            !workspace.0.join("operation-marker").exists(),
+            "discovery ran {program}"
+        );
+    }
+    // The same executable correction, evidence, and providers accept a
+    // read-only command. The risky cases above are refused by the gate.
+    let output = finish(
+        workspace
+            .command("")
+            .env("PATH", system_path(&bin))
+            .env("NOTYPO_DISABLED_SOURCES", "native:help:man:history:legacy")
+            .env("TF_HISTORY", "nginxx -t")
+            .env("NOTYPO_EXIT_STATUS", "127")
+            .arg("-y")
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"nginx -t");
+    assert!(!workspace.0.join("operation-marker").exists());
 }
 
 #[test]
@@ -1306,26 +2213,342 @@ fn fish_history_uses_the_selected_data_session_and_decodes_multiline_commands() 
 }
 
 #[test]
-fn unsupported_dialects_cannot_bypass_the_gate_with_a_legacy_rule() {
+fn powershell_syntax_notypo_cannot_analyze_never_runs_under_yes() {
     let workspace = Workspace::new();
-    for shell in ["powershell"] {
-        for replay in ["false", "true"] {
-            let output = finish(
-                workspace
-                    .command("cd_parent")
-                    .env("TF_SHELL", shell)
-                    .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", replay)
-                    .args(["-y", "--force-command", "cd.."])
-                    .spawn()
-                    .unwrap(),
-            );
-            assert!(!output.status.success(), "{shell}: replay={replay}");
-            assert!(output.stdout.is_empty());
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("unsupported syntax"),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
+    for replay in ["false", "true"] {
+        // Statements and expressions are PowerShell's, not notypo's to edit.
+        let output = finish(
+            workspace
+                .command("cd_parent")
+                .env("TF_SHELL", "powershell")
+                .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", replay)
+                .args(["-y", "--force-command", "foreach ($d in $dirs) { cd.. }"])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(!output.status.success(), "replay={replay}");
+        assert!(output.stdout.is_empty(), "replay={replay}");
     }
+    // An analyzable PowerShell line is offered and gated like any other:
+    // without a reported failure, -y still declines to run it.
+    let output = finish(
+        workspace
+            .command("cd_parent")
+            .env("TF_SHELL", "powershell")
+            .args(["-y", "--force-command", "cd.."])
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.stdout.is_empty());
+    assert!(stderr.contains("Not running `cd ..`"), "{stderr}");
+    assert!(!stderr.contains("unsupported syntax"), "{stderr}");
+}
+
+#[test]
+fn installed_click_script_selects_click_completion_without_sourcing_it() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let Some(bash) = notypo::utils::which("bash") else {
+        eprintln!("skipped: bash is not installed");
+        return;
+    };
+    std::os::unix::fs::symlink(bash, bin.join("bash")).unwrap();
+    // A shell stand-in for Python running a click 8 console script.
+    let python = bin.join("python3");
+    fs::write(
+        &python,
+        r#"#!/bin/sh
+root=$(dirname "$(dirname "$0")")
+[ "$1" = -m ] && [ "$2" = clickfix ] || exit 8
+shift 2
+printf '[%s]%s|%s|%s\n' "$*" "$_CLICKFIX_COMPLETE" "$COMP_CWORD" "$COMP_WORDS" >> "$root/calls"
+[ "$#" = 0 ] && [ "$_CLICKFIX_COMPLETE" = bash_complete ] || { touch "$root/operation-marker"; exit 2; }
+[ "$HTTPS_PROXY" = http://127.0.0.1:9 ] && [ "$PYTHONDONTWRITEBYTECODE" = 1 ] || exit 8
+case "$COMP_CWORD|$COMP_WORDS" in
+  '2|clickfix deploy') printf 'plain,status\n';;
+  *) printf 'plain,db:migrate\nplain,deploy\n';;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).unwrap();
+    let app = bin.join("clickfix");
+    fs::write(
+        &app,
+        format!("#!/bin/sh\nexec {} -m clickfix \"$@\"\n", python.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&app, fs::Permissions::from_mode(0o755)).unwrap();
+    // As click 8 generates it, plus a line that would run if sourced.
+    let completions = workspace.0.join("bash-completion/completions");
+    fs::create_dir_all(&completions).unwrap();
+    fs::write(
+        completions.join("clickfix"),
+        r#"touch sourced-marker
+_clickfix_completion() {
+    local IFS=$'\n'
+    local response
+
+    response=$(env COMP_WORDS="${COMP_WORDS[*]}" COMP_CWORD=$COMP_CWORD _CLICKFIX_COMPLETE=bash_complete $1)
+}
+
+_clickfix_completion_setup() {
+    complete -o nosort -F _clickfix_completion clickfix
+}
+
+_clickfix_completion_setup;
+"#,
+    )
+    .unwrap();
+    let command = |trusted: &str| {
+        let mut command = workspace.command("");
+        command
+            .env("PATH", system_path(&bin))
+            .env(
+                "BASH_COMPLETION_USER_DIR",
+                workspace.0.join("bash-completion"),
+            )
+            .env("NOTYPO_TRUSTED_COMPLETERS", trusted)
+            .env("NOTYPO_TRUSTED_HELP", "")
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy")
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false")
+            .env("_CLICKFIX_COMPLETE", "bash_source");
+        command
+    };
+    let report = |trusted: &str, source: &str| {
+        let output = finish(
+            command(trusted)
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let untrusted = report("", "clickfix deplyo");
+    assert_eq!(untrusted["probes"], 0, "{untrusted}");
+    assert!(!workspace.0.join("calls").exists());
+    for (source, expected, decision) in [
+        ("clickfix deplyo", "clickfix deploy", "allow"),
+        ("clickfix deploy statsu", "clickfix deploy status", "allow"),
+    ] {
+        let report = report(r#"["python:clickfix"]"#, source);
+        let candidate = &report["candidates"][0];
+        assert_eq!(candidate["command"], expected, "{report}");
+        assert_eq!(candidate["safety"]["decision"], decision, "{report}");
+        assert!(
+            candidate["edits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|edit| edit["via"] == "click completion"),
+            "{report}"
+        );
+    }
+    let output = finish(
+        command(r#"["python:clickfix"]"#)
+            .args(["-y", "--force-command", "clickfix deplyo"])
+            .spawn()
+            .unwrap(),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "clickfix deploy"
+    );
+    let calls = fs::read_to_string(workspace.0.join("calls")).unwrap();
+    assert!(
+        calls
+            .lines()
+            .all(|line| line.starts_with("[]bash_complete|")),
+        "only completion requests, without arguments: {calls}"
+    );
+    assert!(!workspace.0.join("operation-marker").exists());
+    assert!(!workspace.0.join("sourced-marker").exists());
+}
+
+#[test]
+fn aliases_use_their_target_programs_vocabulary_and_safety_policy() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    for (name, help) in [
+        (
+            "eza",
+            "Usage: eza [options] [files...]\n\nOPTIONS\n  --color WHEN    when to use terminal colours\n  --icons         display icons\n",
+        ),
+        (
+            "ls",
+            "usage: ls [-l]\n  --classify      append indicators\n",
+        ),
+    ] {
+        let path = bin.join(name);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s:%s\\n' {name} \"$*\" >> \"$(dirname \"$0\")/calls\"\n[ \"$*\" = --help ] && {{ printf '%s' '{help}'; exit 0; }}\ntouch \"$(dirname \"$0\")/operation-marker\"\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let rm = bin.join("rm");
+    fs::write(
+        &rm,
+        "#!/bin/sh\ntouch \"$(dirname \"$0\")/operation-marker\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&rm, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::create_dir(workspace.0.join("build")).unwrap();
+    let command = |aliases: &str| {
+        let mut command = workspace.command("");
+        command
+            .env("PATH", system_path(&bin))
+            .env("TF_SHELL_ALIASES", aliases)
+            .env("NOTYPO_TRUSTED_COMPLETERS", "")
+            .env("NOTYPO_TRUSTED_HELP", "eza:ls")
+            .env("NOTYPO_DISABLED_SOURCES", "man:history:legacy")
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false")
+            .env("NOTYPO_EXIT_STATUS", "1");
+        command
+    };
+    let json = |aliases: &str, source: &str| {
+        let output = finish(
+            command(aliases)
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let report = json("alias ls='eza --icons'", "ls --colro=auto");
+    assert_eq!(
+        report["candidates"][0]["command"], "ls --color=auto",
+        "{report}"
+    );
+    let calls = fs::read_to_string(bin.join("calls")).unwrap();
+    assert!(calls.contains("eza:--help"), "{calls}");
+    assert!(
+        !calls.contains("ls:"),
+        "the alias's own name is never asked: {calls}"
+    );
+    // Without the alias, ls answers for itself and has no --color.
+    let report = json("", "ls --colro=auto");
+    assert_ne!(
+        report["candidates"][0]["command"], "ls --color=auto",
+        "{report}"
+    );
+    // `rmf` runs `rm -rf`: a changed target needs approval, -y or not.
+    // As the shell function passes it: the history and the failed status.
+    let output = finish(
+        command("alias rmf='rm -rf'")
+            .env("TF_HISTORY", "rmf ./buidl\nfuck")
+            .arg("--json")
+            .spawn()
+            .unwrap(),
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let candidate = &report["candidates"][0];
+    assert_eq!(candidate["command"], "rmf ./build", "{report}");
+    assert_eq!(candidate["safety"]["decision"], "confirm", "{report}");
+    assert!(
+        candidate["safety"]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|why| why.as_str().unwrap().contains("through an alias")),
+        "{report}"
+    );
+    let output = finish(
+        command("alias rmf='rm -rf'")
+            .env("TF_HISTORY", "rmf ./buidl\nfuck -y")
+            .arg("-y")
+            .spawn()
+            .unwrap(),
+    );
+    assert!(output.stdout.is_empty());
+    assert!(!bin.join("operation-marker").exists());
+    assert!(workspace.0.join("build").exists());
+}
+
+#[test]
+fn powershell_function_repairs_programs_cmdlets_and_parameters() {
+    let Some(pwsh) = std::env::var_os("NOTYPO_TEST_PWSH")
+        .map(PathBuf::from)
+        .or_else(|| notypo::utils::which("pwsh"))
+    else {
+        eprintln!("skipped: PowerShell is not installed");
+        return;
+    };
+    let Some(git) = notypo::utils::which("git") else {
+        eprintln!("skipped: git is not installed");
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir_all(workspace.0.join("one")).unwrap();
+    fs::write(workspace.0.join("one/first.txt"), "").unwrap();
+    fs::create_dir_all(workspace.0.join("two/deep")).unwrap();
+    fs::write(workspace.0.join("two/deep/second.txt"), "").unwrap();
+    // notypo's metadata queries reach git; anything else is recorded.
+    let wrapper = bin.join("git");
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\ncase \"$*\" in --list-cmds=*|-h|'-C '*|'init -q --template= '*) exec {} \"$@\";; esac\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\nexit 1\n",
+            git.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    // Lines typed at an interactive prompt: each failure is a real history
+    // entry, with PowerShell's own status and error records.
+    let input = format!(
+        "$env:TF_SHELL = 'powershell'\n\
+         Invoke-Expression ((& '{}' --alias) -join \"`n\")\n\
+         Get-ChildItme -Name -Path one\n\
+         fuck -y\n\
+         Get-ChildItem -Path two -Recrse -Name\n\
+         fuck -y\n\
+         git sttus\n\
+         fuck -y\n\
+         exit\n",
+        env!("CARGO_BIN_EXE_notypo")
+    );
+    let mut child = workspace
+        .program(&pwsh, "")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("NOTYPO_DISABLED_SOURCES", "history:legacy")
+        .args(["-NoProfile", "-NoLogo", "-Command", "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = finish_within(child, Duration::from_secs(60));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The corrected cmdlet and parameter ran and listed the files.
+    assert!(stdout.contains("first.txt"), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!("deep{}second.txt", std::path::MAIN_SEPARATOR)),
+        "{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(bin.join("calls")).unwrap_or_default(),
+        "sttus\nstatus\n",
+        "{stdout}\n{stderr}"
+    );
 }

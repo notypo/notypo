@@ -99,7 +99,7 @@ fn names_path(report: &str, path: &str) -> bool {
 
 pub fn diagnose_output(output: &str) -> OutputDiagnosis {
     let mut diagnosis = OutputDiagnosis::default();
-    let patterns: [(ProblemKind, &regex::Regex); 20] = [
+    let patterns: [(ProblemKind, &regex::Regex); 23] = [
         (
             ProblemKind::CommandNotFound,
             regex!(r"(?m)(?:^|: )(?:line \d+: |\d+: )?([^\s:'`]+): (?:command )?not found\s*$"),
@@ -175,6 +175,19 @@ pub fn diagnose_output(output: &str) -> OutputDiagnosis {
             regex!(r"flag provided but not defined: (-[^\s=]+)"),
         ),
         (
+            ProblemKind::UnknownOption,
+            regex!(r"bad option: (-[^\s=]+)"),
+        ),
+        // PowerShell names parameters without their dash.
+        (
+            ProblemKind::UnknownOption,
+            regex!(r"A parameter cannot be found that matches parameter name '([^'\s]+)'"),
+        ),
+        (
+            ProblemKind::UnknownOption,
+            regex!(r"the parameter name '([^'\s]+)' is ambiguous"),
+        ),
+        (
             ProblemKind::MissingPath,
             regex!(r"(?m)([^\s:'`]+): No such file or directory"),
         ),
@@ -213,7 +226,7 @@ fn suggestions(output: &str) -> Vec<String> {
         }
     };
     let header = regex!(
-        r"(?i)(did you mean|most similar (?:command|choice)|maybe you meant|similar (?:sub)?(?:commands?|arguments?|options?|names?|values?) (?:exists?|are|is)|possible alternatives?)"
+        r"(?i)(did you mean|most similar (?:command|choice)|maybe you meant|(?:sub)?commands? with a similar name exists?|similar (?:sub)?(?:commands?|arguments?|options?|names?|values?) (?:exists?|are|is)|possible alternatives?)"
     );
     let mut in_list = false;
     for line in output.lines() {
@@ -592,6 +605,28 @@ mod tests {
                 ProblemKind::MissingPath,
                 "fiel.txt",
             ),
+            (
+                "The term 'Get-ChildItme' is not recognized as a name of a cmdlet, function, \
+                 script file, or executable program.",
+                ProblemKind::CommandNotFound,
+                "Get-ChildItme",
+            ),
+            (
+                "node: bad option: --inpsect",
+                ProblemKind::UnknownOption,
+                "--inpsect",
+            ),
+            (
+                "A parameter cannot be found that matches parameter name 'Recrse'.",
+                ProblemKind::UnknownOption,
+                "-Recrse",
+            ),
+            (
+                "Parameter cannot be processed because the parameter name 'Re' is ambiguous. \
+                 Possible matches include: -Recurse -ReadOnly.",
+                ProblemKind::UnknownOption,
+                "-Re",
+            ),
         ];
         for (output, kind, token) in cases {
             let diagnosis = diagnose_output(output);
@@ -618,7 +653,7 @@ mod tests {
         assert_eq!(diagnose_output(az).suggestions, ["account"]);
         let clap = "  tip: a similar subcommand exists: 'build'\n";
         assert_eq!(diagnose_output(clap).suggestions, ["build"]);
-        let cargo = "Did you mean `build`?";
+        let cargo = "error: no such command: `biuld`\n\nhelp: a command with a similar name exists: `build`\n\nhelp: view all installed commands with `cargo --list`";
         assert_eq!(diagnose_output(cargo).suggestions, ["build"]);
     }
 

@@ -1,100 +1,82 @@
 # notypo
 
-notypo fixes failed shell commands. It began as a Rust port of thefuck; it now asks the installed app what is valid and repairs only the wrong words, with thefuck's rules as a fallback.
-Mac/Linux/Windows/FreeBSD supported. x64 and ARM
+`notypo` suggests corrections for failed shell commands. It began as a Rust port of [thefuck](https://github.com/nvbn/thefuck) and adds completion-driven diagnosis, safer execution, and structured reports. Supports macOS, Linux, Windows, and FreeBSD.
 
-## Shell setup
+## Setup
 
-Install the binary, then add this line to your shell startup file (`~/.zshrc`, `~/.bashrc`, or equivalent):
-
-```sh
-eval "$(notypo --alias)"
-```
-
-Restart your shell or source the startup file. This installs both `fuck` and `typo`; after a command fails, use either to see suggested corrections. To install only a custom name, use `notypo --alias <name>` instead.
-
-In fish, add `notypo --alias | source` to `~/.config/fish/config.fish`. The alias preserves multiline commands, exit and pipeline statuses, and runs the selected command in the parent shell. On fish 4 and newer it updates history through the [shell's history API](https://fishshell.com/docs/current/cmds/history.html); older fish keeps the original history entry. Private sessions write no correction history.
-
-To try a local build in your current Bash or zsh session:
+Build and add the shell integration to `~/.bashrc` or `~/.zshrc`:
 
 ```sh
 cargo build --release
 eval "$(./target/release/notypo --alias)"
-git sttus
-typo
 ```
 
-Press Enter to run the suggested `git status` command. The generated shell function passes your previous command to `notypo` and executes the correction after confirmation.
+In fish, add `notypo --alias | source` to `~/.config/fish/config.fish`. Then run a failed command and enter `fuck` or `typo` to review its correction. Press Enter to run the selected command.
 
-Running `./target/release/notypo` directly without arguments prints usage: the binary cannot read your shell's in-memory history. To correct an explicit command without shell setup, run:
+To correct an explicit command without shell integration:
 
 ```sh
-./target/release/notypo -y 'git sttus'
+notypo -y 'git sttus'
 ```
 
-This prints `git status`; the standalone binary does not execute the printed correction. An explicit command carries no exit status, so corrections the evidence doesn't settle are refused under `-y` instead of guessed.
+This prints `git status`; it does not execute it. Use `--explain` for a readable diagnosis or `--json` for a machine-readable report.
 
-## How it corrects
+## Features beyond thefuck
 
-```sh
-notypo --explain 'aws ec2 describ-instances --regoin eu-west-1'
-```
+- **Native completion:** asks installed CLIs and shell completion handlers for valid commands, options, and values. Supports built-in bridges (including Node.js's own option list) and argcomplete, Cobra, Posener, urfave/cli, kingpin, click, generated clap, pip, npm, and Cargo protocols. Installed handlers and generic protocols require `trusted_completers`. For fish users, the completion scripts that fish 4 embeds in its binary count as installed handlers.
+- **More evidence:** checks help pages, man pages, executable names, paths, shell history, and captured error hints. It can repair nested commands, option values, attached values, and commands inside supported compound shell syntax.
+- **Safer corrections:** preserves shell syntax while editing only mistaken words; never reruns the failed command by default. Risky operations, including destructive commands, package changes, disk operations, database resets, and changed write targets, require confirmation even with `-y`.
+- **Inspection and automation:** `--explain` and `--json` report evidence and safety decisions without running a command.
+- **Shell integration:** passes failure and pipeline statuses, supports multiline commands, and handles history across supported shells.
 
-`--explain` prints the diagnosis, candidates, evidence, and safety decision without running anything, including each app's identity, protocol, trust policy, and its own description of a suggested word when its completion gives one (cobra and fish do); `--json` prints the same report as JSON on stdout. With the shell alias, `typo` offers `aws ec2 describe-instances --region eu-west-1`.
+Bash, Zsh, and tcsh aliases reported by the shell integration are resolved. When an alias runs one simple command, such as `ls='eza --icons'`, notypo checks the line with that program's completion, help, and man pages, using the alias's own arguments as context, and keeps the alias in the correction. The safety gate judges what an alias runs, so a correction through `rmf='rm -rf'` needs confirmation. Aliases whose expansion uses shell operators or expansions are not corrected through, and running one in a correction needs confirmation. Fish aliases are functions whose bodies are not read. Legacy rules still see thefuck's alias expansion.
 
-Where the corrections come from:
+PowerShell 7 command lines are parsed with PowerShell's own rules: native and cmdlet invocations joined by `|`, `;`, `&&`, `||`, and `&`, with redirections and comments. Corrections keep PowerShell quoting. PowerShell splits some arguments before a program sees them (`-Dprop.name=1` arrives as `-Dprop` and `.name=1`), and notypo checks the words a program actually receives. Statements, expressions, script blocks, splatting, the call operator `&`, and `--%` are reported as unsupported. Cmdlets that delete, stop, or run code, such as `Remove-Item`, `Stop-Process`, and `iex`, need confirmation, as do `-Force` and `-Recurse` outside reading cmdlets such as `Get-ChildItem`.
 
-- **The app itself.** notypo asks the installed app's own completer what is valid at each level and only proposes words it lists, so new commands and installed extensions work without a notypo update. Built-in bridges cover `aws` (`aws_completer`), `gcloud` and `az` (argcomplete), and `git` (`--list-cmds` and `--git-completion-helper`, run in an empty repository). Go apps are recognized from the module information in their binaries: kubectl, helm, gh, Hetzner's hcloud, kind, and docker speak cobra; terraform, tofu, and packer speak posener/complete. Other argcomplete, cobra, or posener apps, and installed Bash/fish/Zsh completion handlers, are probed only when listed in `trusted_completers`. Apps are identified by their package metadata (a Go binary's main module, a Python console script's entry module, a Node bin's npm package), so trust given to an identity follows the app when it is renamed and never reaches an unrelated program with the same name (two different `atlas` or `cf` CLIs); a bare name trusts whatever is installed under it. Fish scripts use native `complete --do-complete` with their conditions, option arity, and value lists. On Unix, Zsh autoload handlers declared by `#compdef` run in a [real completion widget](https://zsh.sourceforge.io/Doc/Release/Completion-Widgets.html) on a private terminal; the command buffer is never executed. Handwritten shell handlers supply partial evidence and require confirmation. Fresh shells skip user startup configuration; loading handlers and their callbacks still executes trusted code.
-- **Option values** such as regions or output formats are checked against the app's offline value lists. Resource names (instances, buckets) are looked up only with `network_completion`, using your credentials, read-only; a correction that picks a different resource by name always asks first.
-- **Without a completer**, commands and options are checked against the man page (formatted by the system `man`; the program never runs), `--help` output for programs in `trusted_help`, and your shell history. Help probes follow only subcommands listed by each parent help page, using `<program> <subcommands> --help` without forwarding positional arguments or option values. Short option clusters (`tar -xvzf`, `ls -la`) and attached values (`make -j4`, `kubectl -owide`) are kept intact rather than shortened. Nested options, short option aliases, and explicit value lists (`{json,yaml}`, `[possible values: json, yaml]`, or `[choices: json, yaml]`) are supported. These lists can be incomplete, so a close match is offered for confirmation rather than run.
-- **Programs and paths:** misspelled programs are matched against `$PATH`, aliases, and builtins, and a missing space is inserted (`cd..` → `cd ..`, `gitstatus` → `git status`). A program whose own completer accepts the rest of the line ranks first. Missing paths, including `cd` targets, are repaired from the filesystem. Commands run through `npx`, `uvx`, `pipx run`, `bundle exec`, and similar are repaired as the installed program they run; nothing is downloaded.
-- **Error output**, when the shell logger or instant mode captured it, confirms the diagnosis, and "did you mean" hints raise matching candidates. Printed hints are untrusted text: they only ever become a quoted word.
-- **thefuck's rules** still run, through the same safety gate: a matching rule leads when the engine isn't sure, and is offered as an alternative otherwise. Most rules need the failed command's output, which notypo has only when the shell logger or instant mode captured it, or when `replay_for_diagnosis` allows a rerun.
+The PowerShell function passes `$?` and the error records PowerShell logged for the last history entry. They stand in for an exit status (127 when a command wasn't found, a native program's exit code when only it failed, 1 otherwise) and for output. It also passes what each command name in the line resolves to in the session. notypo asks PowerShell itself about cmdlets and functions: a profile-free, non-interactive copy of the session's PowerShell lists command names from module manifests without importing anything, and describes one command's parameters, aliases, switches, and enumeration and `ValidateSet` values. `Get-ChildItme` becomes `Get-ChildItem`, `gci -Dpth 2` becomes `gci -Depth 2`, and `-ExecutionPolicy RemoteSignd` becomes `RemoteSigned`. Parameters are matched as PowerShell's binder matches them: case is ignored, aliases and unambiguous prefixes are valid, and `-Name:value` attaches a value. Describing a command imports its module, which runs the module's code, so only commands built into PowerShell or shipped under `$PSHOME` are described automatically. List other modules in `trusted_completers` as `powershell:<Module>` (for example, `powershell:Az.Accounts`). Simple functions that take undeclared arguments get no parameter checks. PowerShell's `TabExpansion2` completers and the session's profile-defined functions are not consulted. Some shell constructs are reported as unsupported; see the diagnosis for details. Completion probing runs installed programs or trusted handlers, so only trust programs you control. Network resource completion and diagnostic replay are off by default.
 
-How it stays safe:
+Thefuck's correction rules are included. Rules that need the failed command's output require captured output (shell logger or instant mode) unless safe diagnostic replay is enabled.
 
-- Simple sh/Bash/zsh and fish commands are parsed losslessly: edits replace the affected word or option value, while other quotes, pipelines, redirections, and comments keep their exact bytes. Fish uses its own escaping, substitutions, descriptor pipes, and `; and`/`; or` operators. Expansions remain opaque. Commands inside compound commands are repaired in place: `{ ...; }` groups, subshells, `if`, `while`/`until`, `for`/`select`, `case`, function definitions, and `!`; in fish, `begin`, `if`/`else if`, `while`, `for`, `switch`, `function`, and `not`. A correction must leave the reserved words, loop items, case patterns, and compound redirections exactly as typed. tcsh lines (simple commands, pipelines, lists, and redirections, including the spaced `> &` and `| &` forms tcsh's history prints) use tcsh's quoting: no comments or `NAME=value` prefixes, `\!` for a literal `!`, and no descriptor numbers. tcsh records events after history substitution without the backslashes that stopped it, so a recorded line whose `!` would be substituted again is not rerun; neither are tcsh's control words, `( )`, or ambiguous redirects. Arithmetic commands, `[[ ... ]]`, `coproc`, zsh-only short forms (`for x (a b)`, `{ ls }`, `then;`, `always`), fish's `{ ...; }` blocks, here-documents, and PowerShell lines get an explicit "unsupported" result.
-- The failed command is never rerun, unless `replay_for_diagnosis` is on and the command is low-risk. Compound commands (loops, conditions, groups, functions) never qualify.
-- Audited completer protocols use offline settings by default: credentials or live lookups are disabled, HTTP is routed to a closed local port, and cluster/daemon access is disabled. Arbitrary trusted shell scripts inherit the user's environment with blocked HTTP proxies; this is not a sandbox. Each probe is time-limited, its output is capped, and its whole process tree is killed when time runs out. Failed, truncated, or invalid UTF-8 answers are discarded. Answers are cached by the app and handler fingerprints, but a cached list can only confirm a word: the app is asked again before anything is called invalid.
-- Every candidate passes a safety gate. These all need explicit approval, even with `-y`: added `sudo`, deletions, force or auto-approve flags, destructive git or cloud operations, package changes, changed write targets, new redirections/operators, and command substitutions with unknown effects (including existing substitutions and redirection targets). Close or weakly supported candidates also need a choice. Without a terminal to ask on, nothing runs. The gate is a heuristic, not a proof that a command is harmless.
-- Right before a chosen correction runs, notypo rechecks what its edits relied on: programs it introduced still resolve to executable files, and repaired paths still exist (as directories for `cd`, as executables when they name the program). This narrows the window between discovery and execution but can't close it; a file can still change after the check and before the shell runs the command.
-- The shell functions pass the failed command's exit status (and pipeline statuses) to notypo, which strengthens the diagnosis. tcsh reports a missing command with status 1 rather than 127; since tcsh has no functions and its aliases and builtins are known, a failed name that resolves to none of them counts as missing.
+Clap dynamic completion reads its activation variable and argument layout from an installed Bash/Zsh script or a documented script generator. An installed registration in clap's recommended form, `source <(VAR=zsh app)` or Homebrew's `eval "$(VAR=bash app)"`, names the variable; notypo runs that generator directly instead of sourcing the file. Generator discovery requires both `trusted_completers` and `trusted_help`; for example, list `sofka` in both. Unknown layouts are skipped. Generated scripts are read without sourcing, and their completion answers are reused only within the current request.
 
-Disk completion caches contain only command-only contexts from protocols with complete command/option lists. Queries with preceding option values or positional arguments, and handwritten Bash/fish/Zsh handlers, reuse answers only within the current request. This keeps argument values and partial handler resource lists out of persistent metadata at the cost of more probes for those paths.
+Pip launchers are recognized from their Python entry module, including versioned or renamed executables. Trust `python:pip` to use its offline command and option completion. Pip's protocol cannot preserve context words containing whitespace or empty arguments, and it does not enumerate option enum values. Nested and option lists can be incomplete, so their corrections need confirmation.
 
-Settings (`settings.py` name, then environment variable), besides thefuck's:
+Trust `npm:npm` for npm's offline command and project-script completion. Discovery verifies the package's declared npm executable, including renamed symlinks; npx is excluded. Script names come from npm without running scripts. Spaces, quotes, and explicit `--prefix` scopes are preserved. Workspace selection and flags outside the offline input policy are skipped. Option lists can be incomplete, and enum values are unavailable. Script, lifecycle, package, and publication changes require confirmation.
 
-| Setting | Default | Meaning |
-|---|---|---|
-| `disabled_sources` / `NOTYPO_DISABLED_SOURCES` | `[]` | any of `native`, `executables`, `stderr`, `history`, `filesystem`, `man`, `help`, `legacy` |
-| `trusted_completers` / `NOTYPO_TRUSTED_COMPLETERS` | `[]` | extra argcomplete/cobra/posener apps and installed Bash/fish/Zsh completion handlers to use, by name or by identity (a Go module path such as `ariga.io/atlas/cmd/atlas`, `python:<module>`, or `npm:<package>`); `*` for all |
-| `trusted_help` / `NOTYPO_TRUSTED_HELP` | `[]` | programs that may be run with `--help`, including documented nested subcommands; `*` for all |
-| `network_completion` / `NOTYPO_NETWORK_COMPLETION` | `False` | let completers look up resource names with your credentials |
-| `probe_timeout` / `NOTYPO_PROBE_TIMEOUT` | `3` | seconds per probe (three times that in total) |
-| `replay_for_diagnosis` / `NOTYPO_REPLAY_FOR_DIAGNOSIS` | `False` | rerun low-risk commands to read their output |
+Trust `rust:cargo` for Cargo's command list and installed toolchain names. Also list it in `trusted_help` for nested commands, options, enums, and offline workspace package, target, and feature values. Discovery requires a Rust installer receipt or verified rustup proxy link. Aliases are listed without executing them; extensions need their own trust entries. Probes disable toolchain auto-installation. Builds, aliases, extensions, and changed project values require confirmation.
 
-Accuracy: on a corpus of 934 typos in real aws, gcloud, az, git, kubectl, docker, helm, and system command names and long option names (`tests/corpus.rs`), the first suggestion is right 99.0% of the time and one of the first three 100%. notypo decides alone in 96.5% of cases with no wrong decisions, and asks otherwise. Option names are compared without their leading dashes. To check the CLIs installed on your machine: `cargo test --test installed_clis -- --ignored --nocapture`.
+Go apps built with urfave/cli are recognized from the module information in their binaries. Trust the app's module path, such as `github.com/evilmartians/lefthook/v2`, or its name. Queries contain only command names the app listed, plus `-` for flags; options, their values, and `--` are never sent. Apps that link urfave/cli together with Cobra or Posener are skipped unless audited. Some urfave/cli releases run the app's `Before` hooks while completing: every query from v3.10, and subcommand queries before v1.22.10 and v2.13. Those apps also need `trusted_help`. Lists below the root, and all v3 lists, can be incomplete, so their corrections need confirmation. Words that an app's own completion callback mixes with flags are treated as local resources. v3 does not list aliases, so notypo asks the app whether an unlisted word is a command.
 
-Differences from thefuck:
+Go apps built with kingpin or its fisk fork answer `--completion-bash`. Answering still runs the app's pre-actions and sets every flag's default value, which can create files, so these apps need both `trusted_completers` and `trusted_help`, and their probes run in a private empty directory. Only command names the app listed are sent. kingpin lists no aliases, short flags, or `--no-` forms, so its corrections need confirmation. Go apps that link more than one completion library are skipped unless audited.
 
-- The failed command is never rerun to read its output, so output-based rules (for example `git push` without an upstream) need the shell logger, instant mode, or `replay_for_diagnosis = True`.
-- `-y` never runs risky or uncertain corrections: added `sudo`, package changes, close alternatives, and corrections without failure evidence all ask first, and are refused without a terminal.
-- Rule suggestions with side effects (`dirty_untar`, `dirty_unzip`, `ssh_known_hosts`) always ask first.
-- The tcsh alias passes the previous event through the environment, so its quotes and glob patterns are no longer expanded before notypo reads them, and it forwards the alias's own arguments (`fuck -y`).
-- For other POSIX shells (ksh and the like), `--alias` prints a shell function rather than an alias: it passes the exit status and recent history, and forwards its arguments to notypo instead of appending them to the corrected command. It needs the shell's `fc` history; dash has none.
+Node.js lists its options with `node --completion-bash` and their arity in `node --help`; both print without running a script, and `NODE_OPTIONS` is cleared. V8 accepts flags the list omits, so node corrections need confirmation unless node's error names the option. The first word that isn't an option is the script, and the words after it are the script's, so notypo doesn't check them.
 
-Not yet supported: PowerShell command lines; tcsh's control words and `( )`; arithmetic, `[[ ... ]]`, coprocesses, zsh-only compound forms, and fish brace blocks; PowerShell completion functions, fish's embedded completers or handlers registered only in memory; other completion protocols (click, oclif, yargs). Zsh supports installed autoload handlers from the parent shell's `fpath` or standard locations; rich replacement ranges and nonempty completion affixes are skipped, and option arity/descriptions are unavailable. Zsh, fish, and tcsh runtime regressions were checked with Zsh 5.9, fish 4.9.3, and tcsh 6.21 on macOS; other versions and platforms still need runtime validation.
+Click 8 apps (including Typer apps) answer completion through an environment variable named after the program, such as `_BLACK_COMPLETE`. notypo learns the variable from an installed bash, zsh, or fish script that click generated, without sourcing it; Homebrew installs such scripts for many click tools. Without a script, a Python console script listed in both `trusted_completers` and `trusted_help` is asked for `--help`, and the variable is used only if the help shows click's signature. Trust the identity, for example `python:black`. Completion never passes arguments to the app and runs no command callbacks, but click runs parameter callbacks, and apps that load commands lazily can import code while listing them: `flask` imports the project's application, so it follows the workspace trust below. Lists below the root can be incomplete, so their corrections need confirmation.
 
-After checking documented app protocols, discovery prefers the parent shell's installed handler and falls back to other installed Bash/fish/Zsh handlers. These handlers all require `trusted_completers`; choosing a different shell for the completion probe preserves the original command's editing dialect.
+Some programs evaluate project files just to list their tasks or commands: make runs a Makefile's `$(shell ...)`, rake and fastlane load Ruby, gradle, sbt, and lein run build scripts, gulp and grunt load JavaScript, and flask imports the application. In a directory containing such a project file (`Makefile`, `Rakefile`, `build.gradle`, `gulpfile.js`, `app.py`, ...), notypo doesn't run these listings unless `trusted_workspaces` names that directory or one above it. This covers completion handlers, `--help` probes, and the legacy rules that list gulp, grunt, gradle, and react-native tasks. Programs inside the directory, such as `./gradlew`, are never run there to list anything without that trust. `just` lists recipes without evaluating backticks, so it needs no workspace trust.
+
+## Settings
+
+Settings use thefuck's compatible location, `~/.config/thefuck/settings.py` (or legacy `~/.thefuck/settings.py`), and can also be set with `NOTYPO_*` environment variables.
+
+| Setting | Default | Purpose |
+|---|---:|---|
+| `trusted_completers` | `[]` | Allow generic CLI protocols and installed completion handlers. |
+| `trusted_help` | `[]` | Allow selected programs to be run with `--help`. |
+| `trusted_workspaces` | `[]` | Directories where programs may evaluate project files to list their commands; `*` trusts every directory. |
+| `disabled_sources` | `[]` | Disable evidence sources such as `native`, `help`, or `history`. |
+| `probe_timeout` | `3` seconds | Limit each completion or help probe. |
+| `network_completion` | `False` | Allow read-only resource lookups using your credentials. |
+| `replay_for_diagnosis` | `False` | Allow safe, selected commands to be rerun to capture output. |
+
+See `notypo --help` for command-line options.
+
+`NOTYPO_TRUSTED_COMPLETERS` and `NOTYPO_TRUSTED_HELP` accept colon-separated names or a JSON array. `NOTYPO_TRUSTED_WORKSPACES` takes directories in your platform's path-list form (`:`-separated, or `;` on Windows) or a JSON array. Use JSON for identities containing colons, for example `NOTYPO_TRUSTED_COMPLETERS='["python:pip", "npm:npm", "rust:cargo"]'`. Completion bridges that need `trusted_help` (Cargo, urfave/cli, click, and generated clap scripts) also accept the app's identity there; the `--help` fallback source matches program names. Package and operation checks also recognize pip, npm, and receipt-bound Cargo when invoked through renamed executables.
 
 ## Performance
 
-Against the original Python thefuck 3.32 on the same commands, notypo is **6–33× faster** end to end and uses about **6× less memory** (6.8 MiB against 40.5 MiB; `benchmarks/results.md`). Asking an app's own completer adds the app's startup: git and Go CLIs answer in 20–70 ms; the Python cloud CLIs take 200–450 ms warm (`benchmarks/structured-results.md`). The engine itself takes about a millisecond.
+In local macOS benchmarks, notypo was 6–33× faster end to end than Python thefuck 3.32 and used about 6× less memory. Native CLI completion adds the startup time of the installed app. Details: [benchmark results](benchmarks/results.md) and [completion measurements](benchmarks/structured-results.md).
 
 ## License
 
-Licensed under either MIT or APACHE 2.0, at your option.
-
-## Attribution
-
-The original app was created by Vladimir Iakovlev. See [NOTICE](NOTICE)
+MIT or Apache-2.0. The original app was created by Vladimir Iakovlev; see [NOTICE](NOTICE).

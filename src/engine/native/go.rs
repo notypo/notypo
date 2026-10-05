@@ -6,6 +6,7 @@
 
 use super::super::cache::{CompletionCache, fingerprint};
 use super::CompletionItem;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -17,7 +18,16 @@ const MAX_INFO: usize = 512 * 1024;
 const MAX_FILE: u64 = 512 * 1024 * 1024;
 
 /// The completion libraries notypo can talk to.
-const LIBRARIES: &[&str] = &["github.com/spf13/cobra", "github.com/posener/complete"];
+const LIBRARIES: &[&str] = &[
+    "github.com/spf13/cobra",
+    "github.com/posener/complete",
+    "github.com/urfave/cli",
+    "github.com/urfave/cli/v2",
+    "github.com/urfave/cli/v3",
+    "gopkg.in/alecthomas/kingpin.v2",
+    "github.com/alecthomas/kingpin/v2",
+    "github.com/choria-io/fisk",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GoModule {
@@ -25,11 +35,18 @@ pub struct GoModule {
     pub path: String,
     /// Dependencies among [`LIBRARIES`].
     pub libraries: Vec<String>,
+    /// Each library's linked release. A replaced module has none: the
+    /// substitute's behavior is not that release's.
+    pub versions: BTreeMap<String, String>,
 }
 
 impl GoModule {
     pub fn uses(&self, library: &str) -> bool {
         self.libraries.iter().any(|l| l == library)
+    }
+
+    pub fn version(&self, library: &str) -> Option<&str> {
+        self.versions.get(library).map(String::as_str)
     }
 }
 
@@ -37,7 +54,9 @@ impl GoModule {
 /// (binaries are large; the scan runs once per installed version).
 pub fn module(binary: &Path) -> Option<GoModule> {
     let key = fingerprint(&[binary.to_owned()], &["go-module"]);
-    let mut cache = CompletionCache::open("go-modules", "v1");
+    // Bump with LIBRARIES: older entries omit libraries added since (v2
+    // added urfave/cli and versions, v3 kingpin and fisk).
+    let mut cache = CompletionCache::open("go-modules", "v3");
     if let Some(hit) = cache.as_ref().and_then(|c| c.get(&key)) {
         return decode(hit);
     }
@@ -54,6 +73,7 @@ fn encode(module: Option<&GoModule>) -> Vec<CompletionItem> {
         .map(|m| {
             std::iter::once(format!("path\t{}", m.path))
                 .chain(m.libraries.iter().map(|l| format!("dep\t{l}")))
+                .chain(m.versions.iter().map(|(l, v)| format!("ver\t{l}\t{v}")))
                 .map(|value| CompletionItem {
                     value,
                     takes_value: None,
@@ -74,7 +94,16 @@ fn decode(items: &[CompletionItem]) -> Option<GoModule> {
         .filter_map(|i| i.value.strip_prefix("dep\t"))
         .map(str::to_owned)
         .collect();
-    Some(GoModule { path, libraries })
+    let versions = items
+        .iter()
+        .filter_map(|i| i.value.strip_prefix("ver\t")?.split_once('\t'))
+        .map(|(l, v)| (l.to_owned(), v.to_owned()))
+        .collect();
+    Some(GoModule {
+        path,
+        libraries,
+        versions,
+    })
 }
 
 /// Reads `binary` in chunks until the module information is found.
@@ -126,29 +155,53 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn parse(info: &str) -> Option<GoModule> {
     let mut path = None;
     let mut libraries = Vec::new();
+    let mut versions = BTreeMap::new();
+    let mut previous: Option<&str> = None;
     for line in info.lines() {
         let mut fields = line.split('\t');
-        match (fields.next(), fields.next()) {
-            (Some("path"), Some(p)) => path = Some(p.to_owned()),
-            (Some("dep"), Some(d)) if LIBRARIES.contains(&d) => libraries.push(d.to_owned()),
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some("path"), Some(p), _) => path = Some(p.to_owned()),
+            (Some("dep"), Some(d), version) if LIBRARIES.contains(&d) => {
+                libraries.push(d.to_owned());
+                if let Some(version) = version.filter(|v| !v.is_empty()) {
+                    versions.insert(d.to_owned(), version.to_owned());
+                }
+                previous = Some(d);
+                continue;
+            }
+            // `=>` follows a dependency that a replace directive substituted.
+            (Some("=>"), ..) => {
+                if let Some(replaced) = previous {
+                    versions.remove(replaced);
+                }
+            }
             _ => {}
         }
+        previous = None;
     }
     Some(GoModule {
         path: path?,
         libraries,
+        versions,
     })
 }
 
 /// A file carrying Go module information, for tests of identification.
 #[cfg(all(test, unix))]
 pub(crate) fn fake_binary(path: &str, dependencies: &[&str]) -> Vec<u8> {
+    let lines: String = dependencies
+        .iter()
+        .map(|dependency| format!("dep\t{dependency}\tv1.0.0\th1:x\n"))
+        .collect();
+    fake_binary_info(path, &lines)
+}
+
+/// Module information with raw `dep`/`=>` lines after the main module.
+#[cfg(all(test, unix))]
+pub(crate) fn fake_binary_info(path: &str, lines: &str) -> Vec<u8> {
     let mut data = vec![0u8; 64];
     data.extend_from_slice(START);
-    data.extend_from_slice(format!("path\t{path}\nmod\t{path}\t(devel)\t\n").as_bytes());
-    for dependency in dependencies {
-        data.extend_from_slice(format!("dep\t{dependency}\tv1.0.0\th1:x\n").as_bytes());
-    }
+    data.extend_from_slice(format!("path\t{path}\nmod\t{path}\t(devel)\t\n{lines}").as_bytes());
     data.extend_from_slice(END);
     data
 }
@@ -177,9 +230,25 @@ mod tests {
             !module.uses("golang.org/x/net"),
             "only completion libraries are kept"
         );
+        assert_eq!(module.version("github.com/spf13/cobra"), Some("v1.9.1"));
         assert_eq!(decode(&encode(Some(&module))), Some(module));
         std::fs::write(&binary, b"#!/bin/sh\necho not go\n").unwrap();
         assert_eq!(scan(&binary), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replaced_libraries_keep_their_path_but_lose_the_release_version() {
+        let module = parse(
+            "path\tgithub.com/cloudflare/cloudflared/cmd/cloudflared\n\
+             dep\tgithub.com/urfave/cli/v2\tv2.3.0\n\
+             =>\tgithub.com/ipostelnik/cli/v2\tv2.3.1-0.20210324024421-b6ea8234fe3d\th1:x\n\
+             dep\tgithub.com/urfave/cli/v3\tv3.14.0\th1:y\n",
+        )
+        .unwrap();
+        assert!(module.uses("github.com/urfave/cli/v2"));
+        assert_eq!(module.version("github.com/urfave/cli/v2"), None);
+        assert_eq!(module.version("github.com/urfave/cli/v3"), Some("v3.14.0"));
+        assert_eq!(decode(&encode(Some(&module))), Some(module));
     }
 }

@@ -44,3 +44,18 @@ python3 benchmarks/structured.py --shell-fixtures --case shell --samples 11 --ou
 [shell-results.md](shell-results.md) records cold/warm latency, native probe
 counts, and RSS. Partial shell handlers keep answers within one request, so
 reusing a disk cache directory does not reduce their probe count.
+
+The newer protocol bridges (pip, npm, Cargo, clap, urfave/cli, user-trusted
+cobra, and a bash handler) are measured against the apps installed on this
+machine, each with the trust it needs. Missing apps are skipped, and every
+suggestion is checked without being run. PowerShell cases run when `pwsh` is
+on `PATH` or `NOTYPO_BENCH_PWSH` names a PowerShell executable; they measure
+a misspelled parameter and a misspelled cmdlet name.
+
+```sh
+cargo build --locked --release
+python3 benchmarks/structured.py --protocols --case protocol --samples 11 --output benchmarks/protocol-results.md
+```
+
+[protocol-results.md](protocol-results.md) records the results. These bridges
+keep answers within one request, so warm runs repeat their probes.

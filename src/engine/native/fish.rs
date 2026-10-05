@@ -60,6 +60,69 @@ pub(super) fn script_for(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// fish 4 embeds its own completion scripts instead of installing them.
+/// Ask the installed fish for one (`status get-file`, without user
+/// configuration) and keep it beside notypo's cache, per fish binary, so the
+/// driver can load it like an installed script. Returns fish and the file.
+pub(super) fn embedded(name: &str, budget: &mut Budget) -> Option<(PathBuf, PathBuf)> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._+-".contains(&c))
+        || name.starts_with(['.', '-'])
+    {
+        return None;
+    }
+    let fish =
+        crate::utils::which("fish").filter(|f| crate::engine::probe::is_trusted_location(f))?;
+    let mut files = vec![fish.clone()];
+    files.extend(std::fs::canonicalize(&fish).ok());
+    let dir =
+        crate::utils::cache_dir()
+            .join("fish-embedded")
+            .join(crate::engine::cache::fingerprint(
+                &files,
+                &["fish-embedded"],
+            ));
+    let script = dir.join(format!("{name}.fish"));
+    let missing = dir.join(format!("{name}.missing"));
+    if script.is_file() {
+        return Some((fish, script));
+    }
+    if missing.is_file() {
+        return None;
+    }
+    // Older fish releases have no embedded files and reject the subcommand.
+    let text = run_stdout(
+        &fish,
+        vec![
+            "--no-config".into(),
+            "--private".into(),
+            "-c".into(),
+            "status get-file completions/$argv[1].fish".into(),
+            name.into(),
+        ],
+        super::offline_env(super::Flavor::FishScript),
+        budget,
+        true,
+    );
+    std::fs::create_dir_all(&dir).ok()?;
+    match text {
+        Ok(text) if !text.trim().is_empty() => {
+            let partial = dir.join(format!("{name}.fish.partial"));
+            std::fs::write(&partial, text).ok()?;
+            std::fs::rename(&partial, &script).ok()?;
+            Some((fish, script))
+        }
+        Ok(_) | Err(CompletionError::Failed(_)) => {
+            let _ = std::fs::write(&missing, "");
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 pub(super) fn complete(
     fish: &Path,
     script: &Path,
@@ -164,8 +227,8 @@ pub(super) fn complete(
             takes_value,
             description: super::clean_description(description),
         });
-        if items.len() >= budget.max_candidates {
-            break;
+        if items.len() > budget.max_candidates {
+            return Err(super::over_limit());
         }
     }
     Ok(items)
@@ -176,6 +239,42 @@ mod tests {
     use super::super::{Backend, Flavor, NativeCompletionBackend, tests::Dir};
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn embedded_scripts_are_materialized_once_per_fish_binary() {
+        let mut budget = Budget::new(Duration::from_secs(20), Duration::from_secs(5), 8);
+        for name in ["", "../jq", "-x", ".hidden", "a b", "jq;touch"] {
+            assert_eq!(embedded(name, &mut budget), None, "{name:?}");
+        }
+        assert_eq!(budget.spawned(), 0, "invalid names never start fish");
+        let Some(fish) = crate::utils::which("fish") else {
+            eprintln!("skipped: fish is not installed");
+            return;
+        };
+        let supported = std::process::Command::new(&fish)
+            .args(["--no-config", "-c", "status get-file completions/jq.fish"])
+            .output()
+            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty());
+        let missing = "notypo-no-such-tool";
+        assert_eq!(embedded(missing, &mut budget), None);
+        let spawned = budget.spawned();
+        assert_eq!(embedded(missing, &mut budget), None);
+        assert_eq!(budget.spawned(), spawned, "a missing script is remembered");
+        if !supported {
+            eprintln!("skipped: this fish embeds no completion files");
+            return;
+        }
+        let (found, script) = embedded("jq", &mut budget).unwrap();
+        assert_eq!(found, fish);
+        assert!(
+            std::fs::read_to_string(&script)
+                .unwrap()
+                .contains("complete -c jq")
+        );
+        let spawned = budget.spawned();
+        assert_eq!(embedded("jq", &mut budget).unwrap().1, script);
+        assert_eq!(budget.spawned(), spawned, "the file is reused");
+    }
 
     #[test]
     fn queries_native_conditions_options_values_and_quoted_context() {

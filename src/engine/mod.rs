@@ -13,6 +13,7 @@
 //! Discovery never reruns the failed command. Legacy rules stay available
 //! as a fallback in [`crate::app`].
 
+pub mod aliases;
 pub mod cache;
 pub mod diagnosis;
 pub mod docs;
@@ -93,8 +94,8 @@ pub struct TokenEdit {
     pub via: String,
     /// What the app says `to` does, when its completion describes it.
     pub description: Option<String>,
-    /// `to` names a resource (an instance, a bucket) found by a networked
-    /// lookup, so the edit changes what the command acts on.
+    /// `to` names a resource (an instance, bucket, local path, or installed
+    /// package), so the edit changes what the command acts on.
     pub resource: bool,
     pub score: ScoreBreakdown,
 }
@@ -170,6 +171,9 @@ pub enum OutputOrigin {
     InstantModeLog,
     /// The command was rerun because `replay_for_diagnosis` allowed it.
     Replay,
+    /// The shell's own error records for the history entry (PowerShell's
+    /// `$Error`), without the command's other output.
+    ShellErrors,
 }
 
 #[derive(Debug, PartialEq)]
@@ -293,10 +297,23 @@ pub fn revalidate(
             TokenRole::Split if program == Some(edit.word) => edit.to.split(' ').next(),
             _ => None,
         };
+        // PowerShell's commands live in its session and modules; rechecking
+        // one would mean starting PowerShell again.
+        let powershell = |name: &str| {
+            ctx.shell == Shell::Powershell
+                && ctx.which(name).is_none()
+                && (is_cmdlet_name(name)
+                    || ctx
+                        .shell
+                        .get_functions()
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(name)))
+        };
         if let Some(name) = introduced
             && !ctx.shell.get_builtin_commands().contains(&name)
-            && !ctx.shell.get_aliases().contains_key(name)
+            && !ctx.aliases().contains_key(name)
             && !ctx.shell.get_functions().contains(name)
+            && !powershell(name)
         {
             let installed = if name.contains('/') {
                 cwd.as_ref()
@@ -396,6 +413,10 @@ struct Run<'a> {
     unchecked: bool,
     /// Words some source confirmed or rejected.
     checked: usize,
+    /// The PowerShell to ask about PowerShell commands, found once.
+    powershell: Option<Option<PathBuf>>,
+    /// The commands that PowerShell lists, asked once.
+    powershell_names: Option<Vec<String>>,
 }
 
 /// One interpretation of a command being repaired.
@@ -413,6 +434,9 @@ struct State {
     score: f64,
     evidence: Vec<Evidence>,
     weak: bool,
+    /// A PowerShell command: `-Name:value` attaches values, parameters
+    /// don't cluster, and only `-` before a letter starts one.
+    powershell: bool,
 }
 
 impl State {
@@ -427,12 +451,17 @@ impl State {
             score: 1.0,
             evidence: Vec::new(),
             weak: false,
+            powershell: false,
         }
     }
 }
 
 enum Resolution {
     Executable(PathBuf),
+    /// An alias for one simple command running an installed program.
+    Alias(aliases::Target),
+    /// A PowerShell cmdlet or function, by the name PowerShell describes.
+    PowerShell(String),
     /// An alias, builtin, or function: the shell knows it.
     ShellDefined,
     ExplicitPath,
@@ -494,6 +523,10 @@ impl<'a> Run<'a> {
             Some(text) if enabled(Source::Stderr) => diagnosis::diagnose_output(text),
             _ => OutputDiagnosis::default(),
         };
+        let workspace = providers::Workspace {
+            cwd: failure.cwd.clone(),
+            trusted: &settings.trusted_workspaces,
+        };
         Run {
             failure,
             ctx,
@@ -505,8 +538,10 @@ impl<'a> Run<'a> {
                     settings.network_completion,
                 )
                 .with_shell(ctx.shell)
+                .with_trusted_help(&settings.trusted_help)
+                .with_workspace(workspace.clone())
             }),
-            executables: enabled(Source::Executables).then_some(providers::Executables { ctx }),
+            executables: enabled(Source::Executables).then(|| providers::Executables::new(ctx)),
             hints: enabled(Source::Stderr).then(|| providers::ErrorHints {
                 suggestions: diagnosis.suggestions.clone(),
             }),
@@ -525,13 +560,16 @@ impl<'a> Run<'a> {
                 )
             }),
             man: enabled(Source::ManPage).then(|| providers::ManPages::new(ctx.which("man"))),
-            help: (enabled(Source::Help) && !settings.trusted_help.is_empty())
-                .then(|| providers::HelpText::new(&settings.trusted_help)),
+            help: (enabled(Source::Help) && !settings.trusted_help.is_empty()).then(|| {
+                providers::HelpText::new(&settings.trusted_help).with_workspace(workspace.clone())
+            }),
             filesystem: enabled(Source::Filesystem),
             diagnosis,
             suspicions: Vec::new(),
             unchecked: false,
             checked: 0,
+            powershell: None,
+            powershell_names: None,
         }
     }
 
@@ -651,7 +689,7 @@ impl<'a> Run<'a> {
         let (refused, mut allowed): (Vec<_>, Vec<_>) = candidates
             .into_iter()
             .map(|mut c| {
-                c.safety = safety::assess(&script, &c.script, &[]);
+                c.safety = safety::assess_with_context(&script, &c.script, &[], self.ctx);
                 for edit in c.edits.iter().filter(|e| e.resource) {
                     c.safety.flag(
                         Decision::Confirm,
@@ -721,7 +759,28 @@ impl<'a> Run<'a> {
         if name.contains('/') {
             return Resolution::ExplicitPath;
         }
-        if self.ctx.shell.get_aliases().contains_key(name)
+        if self.ctx.shell == Shell::Powershell
+            && let Some(resolution) = self.resolve_powershell(name)
+        {
+            return resolution;
+        }
+        // `ls` aliased to `eza --icons` takes eza's vocabulary, never ls's.
+        if self.ctx.aliases().contains_key(name)
+            && let Some(dialect) = parser::Dialect::for_shell(self.ctx.shell)
+            && let Some(target) = aliases::target(
+                name,
+                dialect,
+                self.ctx.aliases(),
+                |program| self.ctx.which(program),
+                |program| {
+                    self.ctx.shell.get_functions().contains(program)
+                        || self.ctx.shell.get_builtin_commands().contains(&program)
+                },
+            )
+        {
+            return Resolution::Alias(target);
+        }
+        if self.ctx.aliases().contains_key(name)
             || self.ctx.shell.get_functions().contains(name)
             || self.ctx.shell.get_builtin_commands().contains(&name)
         {
@@ -735,6 +794,105 @@ impl<'a> Run<'a> {
             }
             None => Resolution::Missing,
         }
+    }
+
+    /// PowerShell's own resolution of `name`: the session's report when its
+    /// function sent one, else module-qualified and cmdlet-shaped names
+    /// (not on `$PATH`) for PowerShell to describe, and the session's other
+    /// aliases and functions as its own. `None` defers to `$PATH`.
+    fn resolve_powershell(&self, name: &str) -> Option<Resolution> {
+        if name.contains('\\') && !is_cmdlet_name(name) {
+            return Some(Resolution::ExplicitPath);
+        }
+        if let Some(reported) = self.ctx.powershell_commands().get(&name.to_lowercase()) {
+            let application = |target: &str| {
+                let path = PathBuf::from(target);
+                (path.is_absolute() && crate::utils::is_executable_file(&path)).then_some(path)
+            };
+            return Some(
+                match (reported.kind.as_str(), reported.target_kind.as_str()) {
+                    ("", _) => Resolution::Missing,
+                    (_, "Cmdlet" | "Function" | "Filter") if !reported.target.is_empty() => {
+                        Resolution::PowerShell(reported.target.clone())
+                    }
+                    ("Application", _) => match self.ctx.which(name) {
+                        Some(path) => Resolution::Executable(path),
+                        None => application(&reported.target)
+                            .map_or(Resolution::ShellDefined, Resolution::Executable),
+                    },
+                    ("Alias", "Application") => match application(&reported.target) {
+                        Some(path) => Resolution::Alias(aliases::Target {
+                            program: program_name(&path),
+                            path,
+                            args: Vec::new(),
+                        }),
+                        None => Resolution::ShellDefined,
+                    },
+                    _ => Resolution::ShellDefined,
+                },
+            );
+        }
+        if is_cmdlet_name(name) && self.ctx.which(name).is_none() {
+            let unqualified = name.rsplit('\\').next().unwrap_or(name);
+            return Some(Resolution::PowerShell(unqualified.to_owned()));
+        }
+        self.ctx
+            .shell
+            .get_functions()
+            .iter()
+            .any(|function| function.eq_ignore_ascii_case(name))
+            .then_some(Resolution::ShellDefined)
+    }
+
+    /// The PowerShell that answers for PowerShell commands.
+    fn powershell_executable(&mut self) -> Option<PathBuf> {
+        if self.powershell.is_none() {
+            let found = native::powershell::executable(|name| self.ctx.which(name));
+            if found.is_none() {
+                self.note("no PowerShell executable to describe PowerShell commands".into());
+            }
+            self.powershell = Some(found);
+        }
+        self.powershell.clone().flatten()
+    }
+
+    /// Makes PowerShell answer for the command `name`, unless a backend
+    /// already does. Describing it waits until a word needs checking.
+    fn powershell_command(&mut self, name: &str) -> bool {
+        if self.native.as_ref().is_none_or(|n| n.has_backend(name)) {
+            return self.native.is_some();
+        }
+        let Some(shell) = self.powershell_executable() else {
+            return false;
+        };
+        let trusted = &self.ctx.settings.trusted_completers;
+        if let Some(native) = self.native.as_mut() {
+            native.register(
+                name,
+                std::rc::Rc::new(native::powershell::Command::new(name, shell, trusted)),
+            );
+        }
+        true
+    }
+
+    /// The names of commands PowerShell can run, for repairing a name that
+    /// isn't one. Asked once per run.
+    fn powershell_names(&mut self) -> Vec<String> {
+        if let Some(names) = &self.powershell_names {
+            return names.clone();
+        }
+        let names = match self.powershell_executable() {
+            Some(shell) => match native::powershell::commands(&shell, &mut self.budget) {
+                Ok(names) => names,
+                Err(error) => {
+                    self.note(format!("PowerShell command names: {error}"));
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        self.powershell_names = Some(names.clone());
+        names
     }
 
     fn repair(&mut self, script: &Script, index: usize) -> Vec<State> {
@@ -756,6 +914,37 @@ impl<'a> Run<'a> {
         }
         let starts = match self.resolve(name) {
             Resolution::Executable(path) => vec![State::new(name, Some(path))],
+            Resolution::Alias(target) => {
+                self.note(format!(
+                    "`{name}` is an alias for `{}`; its words come from {}",
+                    std::iter::once(target.program.as_str())
+                        .chain(target.args.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    target.program
+                ));
+                let mut state = State::new(&target.program, Some(target.path));
+                // Leading words before any option name the alias's subcommands.
+                state.command_path = target
+                    .args
+                    .iter()
+                    .take_while(|arg| !arg.starts_with('-'))
+                    .cloned()
+                    .collect();
+                state.context = target.args;
+                vec![state]
+            }
+            Resolution::PowerShell(command) => {
+                if !self.powershell_command(&command) {
+                    return Vec::new();
+                }
+                if !command.eq_ignore_ascii_case(name) {
+                    self.note(format!("`{name}` runs the PowerShell command {command}"));
+                }
+                let mut state = State::new(&command, None);
+                state.powershell = true;
+                vec![state]
+            }
             Resolution::ShellDefined => {
                 return if matches!(name, "cd" | "pushd") {
                     self.path_candidates(script, index, p, Some(p + 1))
@@ -824,10 +1013,19 @@ impl<'a> Run<'a> {
         None
     }
 
+    /// The app's first argument starts another program's words.
+    fn arguments_end_options(&mut self, state: &State) -> bool {
+        self.native.as_mut().is_some_and(|n| {
+            n.backend(&state.program, state.path.as_ref(), &mut self.budget)
+                .is_some_and(|b| b.arguments_end_options())
+        })
+    }
+
     fn has_native(&mut self, state: &State) -> bool {
-        self.native
-            .as_mut()
-            .is_some_and(|n| n.backend(&state.program, state.path.as_ref()).is_some())
+        self.native.as_mut().is_some_and(|n| {
+            n.backend(&state.program, state.path.as_ref(), &mut self.budget)
+                .is_some()
+        })
     }
 
     /// Repairs words naming paths that don't exist: the target of `cd`
@@ -980,9 +1178,15 @@ impl<'a> Run<'a> {
             ));
         }
         let suspicion = self.suspect(index, p, TokenRole::Executable, name, evidence.clone());
+        let powershell = if self.ctx.shell == Shell::Powershell && self.executables.is_some() {
+            self.powershell_names()
+        } else {
+            Vec::new()
+        };
         let Some(provider) = self.executables.as_mut() else {
             return Vec::new();
         };
+        provider.extra = powershell.clone();
         let slot = providers::Slot {
             role: TokenRole::Executable,
             program: "",
@@ -1011,10 +1215,23 @@ impl<'a> Run<'a> {
         let word = &script.commands[index].words[p];
         let splits =
             self.split_candidates(index, p, word.span, name, &vocabulary, &evidence, suspicion);
+        let ranked: Vec<(String, ScoreBreakdown)> = ranked
+            .into_iter()
+            .map(|(to, score)| (to.to_owned(), score))
+            .collect();
         ranked
             .into_iter()
             .map(|(to, score)| {
-                let mut state = State::new(to, self.ctx.which(to));
+                let to = to.as_str();
+                let path = self.ctx.which(to);
+                let mut state = State::new(to, path.clone());
+                // A PowerShell command takes PowerShell's parameter rules.
+                if path.is_none()
+                    && powershell.iter().any(|n| n == to)
+                    && self.powershell_command(to)
+                {
+                    state.powershell = true;
+                }
                 state.weak = suspicion < STRONG_SUSPICION;
                 state.score = score.total;
                 state
@@ -1126,7 +1343,9 @@ impl<'a> Run<'a> {
         } else {
             self.fallback_check(state, role, typed)
         };
+        // PowerShell parameters never cluster.
         if role == TokenRole::OptionName
+            && !state.powershell
             && let Check::Invalid(vocabulary) = &check
             && let Some(resolved) = short_cluster(typed, vocabulary)
         {
@@ -1168,11 +1387,30 @@ impl<'a> Run<'a> {
                         takes_value: word.takes_value,
                         confirmed: vocabulary.authoritative,
                     }
+                } else if let Some(word) = (role == TokenRole::OptionName)
+                    .then(|| native.resolve_option(&slot, &mut self.budget))
+                    .flatten()
+                {
+                    // Another spelling of a listed option (`-rec` for
+                    // PowerShell's `-Recurse`).
+                    Check::Valid {
+                        takes_value: word.takes_value,
+                        confirmed: vocabulary.authoritative,
+                    }
                 } else if vocabulary.words.is_empty() {
                     if role == TokenRole::OptionName {
                         Check::Unknown
                     } else {
                         Check::Arguments
+                    }
+                } else if role == TokenRole::Subcommand
+                    && !vocabulary.authoritative
+                    && native.confirms(&slot, &mut self.budget)
+                {
+                    // A partial list omits it, but the app accepts it.
+                    Check::Valid {
+                        takes_value: None,
+                        confirmed: true,
                     }
                 } else {
                     Check::Invalid(vocabulary)
@@ -1304,7 +1542,14 @@ impl<'a> Run<'a> {
                 if text == "--" {
                     break;
                 }
-                let is_option = text.len() > 1 && text.starts_with('-');
+                // PowerShell parameters start with a letter (`-5` is a
+                // number) and take attached values after `:`.
+                let is_option = text.len() > 1
+                    && text.starts_with('-')
+                    && (!state.powershell
+                        || text[1..].starts_with(|c: char| c.is_alphabetic() || "_?".contains(c)));
+                let separator = if state.powershell { ':' } else { '=' };
+                let attached = is_option && text.contains(separator);
                 if !is_option && level == Level::Arguments {
                     state.context.push(text.to_owned());
                     i += 1;
@@ -1313,7 +1558,7 @@ impl<'a> Run<'a> {
                 let (role, typed) = if is_option {
                     (
                         TokenRole::OptionName,
-                        text.split('=').next().unwrap_or(text),
+                        text.split(separator).next().unwrap_or(text),
                     )
                 } else {
                     (TokenRole::Subcommand, text)
@@ -1337,51 +1582,39 @@ impl<'a> Run<'a> {
                                 detail: format!("{} completion lists `{text}`", state.program),
                             });
                         }
-                        // `--output=jsn`: check the attached value too.
-                        if let Some(value) =
-                            text.strip_prefix(typed).and_then(|t| t.strip_prefix('='))
-                            && takes_value != Some(false)
-                            && let Some(span) = attached_value_span(word, src, typed)
-                            && let Some(vocabulary) = self.check_value(&state, &[typed], value)
-                            && let Branching::Branches(mut branches) = self.branch(
-                                &state,
-                                (index, i),
-                                TokenRole::OptionValue,
-                                (value, ""),
-                                span,
-                                &vocabulary,
-                            )
-                        {
-                            let joined = |mut s: State| {
-                                let value = s.context.pop().unwrap_or_default();
-                                s.context.push(format!("{typed}={value}"));
-                                s
-                            };
-                            let (first, _) = branches.remove(0);
-                            for (other, _) in branches.into_iter().rev() {
-                                frontier.push((joined(other), i + 1, level, false));
-                            }
-                            state = joined(first);
-                            i += 1;
-                            continue;
-                        }
-                        pending_value =
-                            is_option && !text.contains('=') && takes_value != Some(false);
+                        pending_value = is_option && !attached && takes_value != Some(false);
                         if !is_option {
                             state.command_path.push(text.to_owned());
                         }
                         state.context.push(text.to_owned());
+                        if attached && takes_value != Some(false) {
+                            let mut branches = self.repair_attached_value(
+                                state,
+                                (index, i),
+                                word,
+                                (src, separator),
+                                typed,
+                            );
+                            state = branches.remove(0);
+                            for other in branches.into_iter().rev() {
+                                frontier.push((other, i + 1, level, false));
+                            }
+                        }
                         i += 1;
                         continue;
                     }
                     Check::Arguments => {
+                        // node's script: the rest is the script's.
+                        if self.arguments_end_options(&state) {
+                            break;
+                        }
                         level = Level::Arguments;
                         state.context.push(text.to_owned());
                         i += 1;
                         continue;
                     }
                     Check::Unknown if is_option => {
-                        pending_value = !text.contains('=');
+                        pending_value = !attached;
                         state.context.push(text.to_owned());
                         i += 1;
                         continue;
@@ -1390,9 +1623,11 @@ impl<'a> Run<'a> {
                         self.unchecked = true;
                         break;
                     }
-                    Check::Invalid(_) if is_option && word.option_name_span(src).is_none() => {
+                    Check::Invalid(_)
+                        if is_option && word.option_name_span_with(src, separator).is_none() =>
+                    {
                         // A quoted option name can't be edited in place.
-                        pending_value = !text.contains('=');
+                        pending_value = !attached;
                         state.context.push(text.to_owned());
                         i += 1;
                         continue;
@@ -1400,7 +1635,9 @@ impl<'a> Run<'a> {
                     Check::Invalid(vocabulary) => vocabulary,
                 };
                 let span = match role {
-                    TokenRole::OptionName => word.option_name_span(src).unwrap_or(word.span),
+                    TokenRole::OptionName => word
+                        .option_name_span_with(src, separator)
+                        .unwrap_or(word.span),
                     _ => word.span,
                 };
                 match self.branch(
@@ -1413,7 +1650,7 @@ impl<'a> Run<'a> {
                 ) {
                     Branching::NotSuspicious => {
                         // A partial list says nothing about a word far from it.
-                        pending_value = is_option && !text.contains('=');
+                        pending_value = is_option && !attached;
                         state.context.push(text.to_owned());
                         i += 1;
                     }
@@ -1422,15 +1659,28 @@ impl<'a> Run<'a> {
                         break;
                     }
                     Branching::Branches(mut branches) => {
-                        let pending = |takes_value: Option<bool>| {
-                            is_option && !text.contains('=') && takes_value != Some(false)
-                        };
-                        let (first, takes_value) = branches.remove(0);
-                        for (other, takes_value) in branches.into_iter().rev() {
-                            frontier.push((other, i + 1, level, pending(takes_value)));
+                        let mut checked = Vec::new();
+                        for (branch, takes_value) in branches.drain(..) {
+                            let pending = is_option && !attached && takes_value != Some(false);
+                            let values = if attached && takes_value != Some(false) {
+                                self.repair_attached_value(
+                                    branch,
+                                    (index, i),
+                                    word,
+                                    (src, separator),
+                                    typed,
+                                )
+                            } else {
+                                vec![branch]
+                            };
+                            checked.extend(values.into_iter().map(|state| (state, pending)));
+                        }
+                        let (first, pending) = checked.remove(0);
+                        for (other, pending) in checked.into_iter().rev() {
+                            frontier.push((other, i + 1, level, pending));
                         }
                         state = first;
-                        pending_value = pending(takes_value);
+                        pending_value = pending;
                         i += 1;
                     }
                 }
@@ -1440,16 +1690,56 @@ impl<'a> Run<'a> {
         done
     }
 
+    /// Check an attached value after resolving its option name, including
+    /// when both parts of the same word were misspelled.
+    fn repair_attached_value(
+        &mut self,
+        mut state: State,
+        position: (usize, usize),
+        word: &parser::Word,
+        (source, separator): (&str, char),
+        original_name: &str,
+    ) -> Vec<State> {
+        let Some(span) = attached_value_span(word, source, original_name, separator) else {
+            return vec![state];
+        };
+        let attached = state.context.pop().expect("the option was appended");
+        let (name, value) = attached
+            .split_once(separator)
+            .expect("an attached option value");
+        if let Some(vocabulary) = self.check_value(&state, &[name], value)
+            && let Branching::Branches(branches) = self.branch(
+                &state,
+                position,
+                TokenRole::OptionValue,
+                (value, ""),
+                span,
+                &vocabulary,
+            )
+        {
+            return branches
+                .into_iter()
+                .map(|(mut branch, _)| {
+                    let corrected = branch.context.pop().expect("the value was appended");
+                    branch.context.push(format!("{name}{separator}{corrected}"));
+                    branch
+                })
+                .collect();
+        }
+        state.context.push(attached);
+        vec![state]
+    }
+
     /// The values the app lists for the option ending the context (plus
-    /// `extra` words), when `typed` is not among them. Values that look like
-    /// paths or URIs are never judged.
+    /// `extra` words), when `typed` is not among them. A native protocol must
+    /// declare its value grammar before interpreting slashes as vocabulary.
     fn check_value(
         &mut self,
         state: &State,
         extra: &[&str],
         typed: &str,
     ) -> Option<providers::Vocabulary> {
-        if typed.is_empty() || typed.contains('/') {
+        if typed.is_empty() {
             return None;
         }
         let mut context = state.context.clone();
@@ -1459,9 +1749,13 @@ impl<'a> Run<'a> {
                 &state.program,
                 state.path.as_ref(),
                 &context,
+                typed,
                 &mut self.budget,
             )?
         } else {
+            if typed.contains('/') {
+                return None;
+            }
             let slot = providers::Slot {
                 role: TokenRole::OptionValue,
                 program: &state.program,
@@ -1753,6 +2047,29 @@ impl<'a> Run<'a> {
 /// first letter is a listed short option. Otherwise only a multi-letter
 /// option (`find -type`, `--verbose`) can have been meant: replacing a
 /// cluster with a single short option would silently drop the rest of it.
+/// A cmdlet-shaped name, `Verb-Noun`, optionally module-qualified.
+fn is_cmdlet_name(name: &str) -> bool {
+    regex!(r"^([A-Za-z0-9_.]+\\)?[A-Za-z]+-[A-Za-z][A-Za-z0-9]*$").is_match(name)
+}
+
+/// The name an application runs under: its file name, without Windows'
+/// executable extensions.
+fn program_name(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if cfg!(windows)
+        && let Some((stem, extension)) = name.rsplit_once('.')
+        && ["exe", "cmd", "bat", "com"]
+            .iter()
+            .any(|e| extension.eq_ignore_ascii_case(e))
+    {
+        return stem.to_owned();
+    }
+    name
+}
+
 fn short_cluster(typed: &str, vocabulary: &providers::Vocabulary) -> Option<Check> {
     let letters = typed
         .strip_prefix('-')
@@ -1791,15 +2108,20 @@ fn short_cluster(typed: &str, vocabulary: &providers::Vocabulary) -> Option<Chec
 /// The entire value suffix of `--name=value`, including its quotes/escapes.
 /// The parsed word must be literal, and the option name must be plain.
 /// Replacing the whole suffix lets the selected dialect quote it safely.
-fn attached_value_span(word: &parser::Word, src: &str, name: &str) -> Option<Span> {
-    let name_span = word.option_name_span(src)?;
+fn attached_value_span(
+    word: &parser::Word,
+    src: &str,
+    name: &str,
+    separator: char,
+) -> Option<Span> {
+    let name_span = word.option_name_span_with(src, separator)?;
     let raw = &src[name_span.end..word.span.end];
-    let value = raw.strip_prefix('=')?;
+    let value = raw.strip_prefix(separator)?;
     (name_span.of(src) == name
         && !value.is_empty()
         && word
             .literal()
-            .is_some_and(|text| text.starts_with(&format!("{name}="))))
+            .is_some_and(|text| text.starts_with(&format!("{name}{separator}"))))
     .then(|| Span::new(name_span.end + 1, word.span.end))
 }
 
@@ -1875,33 +2197,26 @@ fn check_structure(old: &Script, source: &str, edits: &[TokenEdit]) -> Result<()
         }
         let mut expected: Vec<String> = Vec::new();
         for (i, x) in a.words.iter().enumerate() {
-            let word = match edits.iter().find(|e| e.command == n && e.word == i) {
-                Some(edit) if edit.role == TokenRole::Split => {
-                    expected.extend(edit.to.split(' ').map(str::to_owned));
-                    continue;
-                }
-                Some(edit) if edit.role == TokenRole::OptionName => {
-                    let old_text = literal(old, x);
+            let word_edits = || edits.iter().filter(|e| e.command == n && e.word == i);
+            if let Some(split) = word_edits().find(|e| e.role == TokenRole::Split) {
+                expected.extend(split.to.split(' ').map(str::to_owned));
+                continue;
+            }
+            let mut word = literal(old, x);
+            for edit in word_edits() {
+                word = if edit.role == TokenRole::OptionName {
+                    format!("{}{}", edit.to, &word[edit.from.len().min(word.len())..])
+                } else if edit.role == TokenRole::OptionValue && word != edit.from {
+                    // `--output=jsn` → `--output=json`: replace the suffix.
                     format!(
                         "{}{}",
-                        edit.to,
-                        &old_text[edit.from.len().min(old_text.len())..]
-                    )
-                }
-                // `--output=jsn` → `--output=json`: the value is the suffix.
-                Some(edit)
-                    if edit.role == TokenRole::OptionValue && literal(old, x) != edit.from =>
-                {
-                    let old_text = literal(old, x);
-                    format!(
-                        "{}{}",
-                        &old_text[..old_text.len().saturating_sub(edit.from.len())],
+                        &word[..word.len().saturating_sub(edit.from.len())],
                         edit.to
                     )
-                }
-                Some(edit) => edit.to.clone(),
-                None => literal(old, x),
-            };
+                } else {
+                    edit.to.clone()
+                };
+            }
             expected.push(word);
         }
         let actual: Vec<String> = b.words.iter().map(|w| literal(&new, w)).collect();
@@ -2814,9 +3129,14 @@ esac
             correct(&failure("[[ -n x ]] && gti status"), &ctx).outcome,
             Outcome::UnsupportedSyntax(_)
         ));
-        let unsupported = Context::new(Settings::default(), Shell::Powershell, "fuck".into());
+        // PowerShell statements and expressions stay unsupported.
+        let powershell = Context::new(Settings::default(), Shell::Powershell, "fuck".into());
         assert!(matches!(
-            correct(&failure("gti status"), &unsupported).outcome,
+            correct(
+                &failure("foreach ($f in $files) { gti status }"),
+                &powershell
+            )
+            .outcome,
             Outcome::UnsupportedSyntax(_)
         ));
         let mut f = failure("aws sts get-caller-identity");
@@ -3179,6 +3499,47 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
     }
 
     #[test]
+    fn an_option_name_and_its_attached_value_are_repaired_together() {
+        let fake = fake_aws();
+        for shell in [Shell::Bash, Shell::Fish, Shell::Tcsh] {
+            let mut ctx = context(&fake);
+            ctx.shell = shell;
+            for value in ["jsn", "'jsn'", "\"jsn\""] {
+                let source =
+                    format!("aws ec2 describe-instances --outpt={value} --region 'eu-west-1'");
+                let report = correct(&failure(&source), &ctx);
+                let candidate = report.outcome.candidates().first().unwrap_or_else(|| {
+                    panic!(
+                        "{shell:?}: {source}: {:?} {:?}",
+                        report.outcome, report.notes
+                    )
+                });
+                assert_eq!(
+                    candidate.script,
+                    "aws ec2 describe-instances --output=json --region 'eu-west-1'",
+                    "{shell:?}: {source}"
+                );
+                assert_eq!(candidate.edits.len(), 2);
+                assert_eq!(candidate.edits[0].role, TokenRole::OptionName);
+                assert_eq!(candidate.edits[1].role, TokenRole::OptionValue);
+                assert_eq!(candidate.edits[0].word, candidate.edits[1].word);
+                let old =
+                    parser::parse_with_dialect(&source, parser::Dialect::for_shell(shell).unwrap());
+                assert!(
+                    check_structure(
+                        &old,
+                        &candidate.script.replace("eu-west-1", "us-east-1"),
+                        &candidate.edits,
+                    )
+                    .is_err(),
+                    "another value must not change"
+                );
+            }
+        }
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
     fn resource_names_are_looked_up_only_with_network_completion_and_need_approval() {
         let fake = fake_aws();
         fs::write(
@@ -3300,4 +3661,348 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
             );
         }
     }
+
+    #[test]
+    fn aliases_take_their_target_programs_vocabulary_and_arguments() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("alias-vocabulary");
+        // eza's completer, recording the words it is asked about.
+        let eza = dir.script(
+            "eza",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/queries\"\nshift\nprintf -- '--color\\t\\n--icons\\t\\n--long\\t\\n:4\\n'\n",
+        );
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_aliases(&[("ls", "eza --icons"), ("ll", "ls --long")])
+            .with_which("eza", Some(eza.to_str().unwrap()))
+            .with_which("ls", Some("/bin/ls"))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        for (source, expected) in [
+            ("ls --colro=auto", "ls --color=auto"),
+            ("ll --colro", "ll --color"),
+        ] {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Backend::new(Flavor::Cobra, "eza", eza.clone()));
+            let report =
+                correct_with_backends(&failure(source), &ctx, vec![("eza".into(), backend)]);
+            assert_eq!(scripts(&report.outcome), [expected], "{:?}", report.notes);
+            assert!(
+                report
+                    .notes
+                    .iter()
+                    .any(|n| n.contains("is an alias for `eza")),
+                "{:?}",
+                report.notes
+            );
+        }
+        let queries = fs::read_to_string(dir.0.join("queries")).unwrap();
+        assert!(queries.contains("__complete --icons -"), "{queries}");
+        assert!(queries.contains("__complete --icons --long -"), "{queries}");
+    }
+
+    #[test]
+    fn the_safety_gate_judges_what_an_alias_runs() {
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into()).with_aliases(&[
+            ("rmf", "rm -rf"),
+            ("gs", "git status"),
+            ("pp", "git pull && git push"),
+        ]);
+        let gate = |original: &str, candidate: &str| {
+            safety::assess_with_context(&parser::parse(original), candidate, &[], &ctx)
+        };
+        for (original, candidate, why) in [
+            ("rmf buidl", "rmf build", "rm"),
+            ("rmff build", "rmf build", "rm"),
+            ("pp --forse", "pp --force", "can't analyze"),
+        ] {
+            let assessment = gate(original, candidate);
+            assert_eq!(
+                assessment.decision,
+                Decision::Confirm,
+                "{candidate}: {assessment:?}"
+            );
+            assert!(
+                assessment.reasons.iter().any(|r| r.contains(why)),
+                "{candidate}: {assessment:?}"
+            );
+        }
+        assert_eq!(gate("gs -sb", "gs -s").decision, Decision::Allow);
+        // Replay of the failed command judges the expansion as well.
+        assert_eq!(
+            safety::assess_replay_with_context("rmf build", parser::Dialect::Posix, &ctx).decision,
+            Decision::Confirm
+        );
+    }
+
+    #[test]
+    fn powershell_lines_are_repaired_with_their_own_quoting() {
+        let fake = fake_aws();
+        let ctx = Context::new(Settings::default(), Shell::Powershell, "fuck".into())
+            .with_executables(&["aws", "git"])
+            .with_which("aws", Some(fake.aws.to_str().unwrap()))
+            .with_which("git", Some(fake.dir.0.join("bin/git").to_str().unwrap()))
+            .with_which("gti", None)
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        for (source, expected) in [
+            (
+                "aws ec2 describ-instances --regoin 'eu-west-1' | Select-Object -First 3",
+                "aws ec2 describe-instances --region 'eu-west-1' | Select-Object -First 3",
+            ),
+            ("gti status; Get-Date", "git status; Get-Date"),
+        ] {
+            let report = correct(&failure(source), &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first().copied(),
+                Some(expected),
+                "{:?}",
+                report.notes
+            );
+            let parsed = parser::parse_with_dialect(expected, parser::Dialect::PowerShell);
+            assert!(parsed.is_fully_supported());
+        }
+        // Cmdlet names are PowerShell's, never misspelled executables.
+        let ctx = ctx.with_which("pwsh", None);
+        assert!(scripts(&correct(&failure("Get-ChildItme -Path x"), &ctx).outcome).is_empty());
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    /// Get-ChildItem, Set-ExecutionPolicy, and a simple function as
+    /// PowerShell 7.6 describes them (abridged).
+    fn powershell_commands() -> Vec<(String, std::rc::Rc<dyn native::NativeCompletionBackend>)> {
+        use native::powershell::{Command, Description, Parameter};
+        let parameter = |name: &str, switch: bool, aliases: &[&str], values: &[&str]| Parameter {
+            name: name.into(),
+            switch,
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+            ..Parameter::default()
+        };
+        let common = |p: Parameter| Parameter { common: true, ..p };
+        let describe = |name: &str, open: bool, parameters: Vec<Parameter>| Description {
+            name: name.into(),
+            kind: if open { "Function" } else { "Cmdlet" }.into(),
+            module: "Microsoft.PowerShell.Management".into(),
+            shipped: true,
+            open,
+            parameters,
+        };
+        let gci = describe(
+            "Get-ChildItem",
+            false,
+            vec![
+                parameter("Path", false, &[], &[]),
+                parameter("LiteralPath", false, &["PSPath", "LP"], &[]),
+                parameter("Recurse", true, &["s", "r"], &[]),
+                parameter("Depth", false, &[], &[]),
+                parameter("Name", true, &[], &[]),
+                common(parameter(
+                    "ErrorAction",
+                    false,
+                    &["ea"],
+                    &["SilentlyContinue", "Stop"],
+                )),
+                common(parameter("Verbose", true, &["vb"], &[])),
+            ],
+        );
+        let policy = describe(
+            "Set-ExecutionPolicy",
+            false,
+            vec![
+                parameter(
+                    "ExecutionPolicy",
+                    false,
+                    &[],
+                    &["Unrestricted", "RemoteSigned", "AllSigned", "Bypass"],
+                ),
+                parameter("Scope", false, &[], &["Process", "CurrentUser"]),
+                parameter("Force", true, &[], &[]),
+            ],
+        );
+        let tool = describe(
+            "Invoke-Tool",
+            true,
+            vec![parameter("Mode", false, &[], &[])],
+        );
+        [gci, policy, tool]
+            .into_iter()
+            .map(|d| {
+                let name = d.name.clone();
+                (
+                    name,
+                    std::rc::Rc::new(Command::described(d))
+                        as std::rc::Rc<dyn native::NativeCompletionBackend>,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn powershell_commands_take_parameters_from_powershell() {
+        let fake = fake_aws();
+        let git = fake.dir.0.join("bin/git");
+        let ctx = Context::new(Settings::default(), Shell::Powershell, "fuck".into())
+            .with_executables(&["git"])
+            .with_which("git", Some(git.to_str().unwrap()))
+            .with_which("pwsh", None)
+            .with_which("powershell", None)
+            .with_which("man", None)
+            .with_history::<&str>(&[])
+            .with_powershell_commands(&format!(
+                "gci\tAlias\tCmdlet\tGet-ChildItem\n\
+                 Get-ChildItem\tCmdlet\tCmdlet\tGet-ChildItem\n\
+                 Set-ExecutionPolicy\tCmdlet\tCmdlet\tSet-ExecutionPolicy\n\
+                 Invoke-Tool\tFunction\tFunction\tInvoke-Tool\n\
+                 g\tAlias\tApplication\t{}\n",
+                git.display()
+            ));
+        let run = |source: &str, error: &str| {
+            let mut failure = failure(source);
+            failure.exit_status = Some(1);
+            if !error.is_empty() {
+                failure.output = CapturedOutput::Combined {
+                    text: error.into(),
+                    origin: OutputOrigin::ShellErrors,
+                };
+            }
+            correct_with_backends(&failure, &ctx, powershell_commands())
+        };
+        let report = run(
+            "Get-ChildItem -Recrse",
+            "A parameter cannot be found that matches parameter name 'Recrse'.",
+        );
+        assert!(
+            matches!(&report.outcome, Outcome::Suggestion(c) if c[0].script == "Get-ChildItem -Recurse"),
+            "{:?} {:?}",
+            report.outcome,
+            report.notes
+        );
+        for (source, expected) in [
+            // An alias takes its command's parameters and stays as typed;
+            // abbreviations PowerShell accepts are left alone.
+            ("gci -rec -Dpth 2", "gci -rec -Depth 2"),
+            (
+                "Get-ChildItem -Path:docs -Recrse",
+                "Get-ChildItem -Path:docs -Recurse",
+            ),
+            ("Get-ChildItem -Pth:docs", "Get-ChildItem -Path:docs"),
+            ("Get-ChildItem -ea stpo", "Get-ChildItem -ea Stop"),
+            (
+                "Set-ExecutionPolicy -ExecutionPolicy RemoteSignd -Scope process",
+                "Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope process",
+            ),
+            // An alias for a program takes the program's vocabulary.
+            ("g sttus", "g status"),
+        ] {
+            let report = run(source, "");
+            assert_eq!(
+                scripts(&report.outcome).first().copied(),
+                Some(expected),
+                "{source}: {:?}",
+                report.notes
+            );
+        }
+        // Case, aliases, prefixes, numbers, and attached values are valid.
+        for source in [
+            "Get-ChildItem -RECURSE -lp x -s -ea silentlycontinue",
+            "Get-ChildItem docs -Depth -5 -Name",
+            "gci -Path:docs -Recurse:$false",
+            "Set-ExecutionPolicy Bypass -Force",
+            // A simple function takes parameters it doesn't declare.
+            "Invoke-Tool -Whatever x",
+        ] {
+            let report = run(source, "");
+            assert!(
+                scripts(&report.outcome).is_empty(),
+                "{source}: {:?}",
+                report.outcome
+            );
+        }
+    }
+
+    #[test]
+    fn real_powershell_repairs_cmdlet_names_and_parameters() {
+        let Some(pwsh) = native::powershell::tests::pwsh() else {
+            eprintln!("skipped: PowerShell is not installed");
+            return;
+        };
+        let ctx = Context::new(Settings::default(), Shell::Powershell, "fuck".into())
+            .with_executables::<&str>(&[])
+            .with_which("pwsh", Some(pwsh.to_str().unwrap()))
+            .with_which("Get-ChildItme", None)
+            .with_which("Get-ChildItem", None)
+            .with_which("man", None)
+            .with_history::<&str>(&[])
+            .with_powershell_commands("Get-ChildItme\t\t\t\n");
+        let mut failure = failure("Get-ChildItme -Recrse -Name");
+        failure.exit_status = Some(127);
+        failure.output = CapturedOutput::Combined {
+            text: "The term 'Get-ChildItme' is not recognized as a name of a cmdlet, function, \
+                   script file, or executable program."
+                .into(),
+            origin: OutputOrigin::ShellErrors,
+        };
+        let report = correct(&failure, &ctx);
+        assert_eq!(
+            scripts(&report.outcome).first().copied(),
+            Some("Get-ChildItem -Recurse -Name"),
+            "{:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn node_options_come_from_node_and_its_scripts_arguments_are_left_alone() {
+        let dir = Dir::new("node");
+        let node = dir.script(
+            "bin/node",
+            "#!/bin/sh\ncase \"$1\" in\n\
+             --completion-bash) cat <<'EOF'\n\
+             _node_complete() {\n  local cur_word options\n  cur_word=\"${COMP_WORDS[COMP_CWORD]}\"\n  \
+             if [[ \"${cur_word}\" == -* ]] ; then\n    \
+             COMPREPLY=( $(compgen -W '--inspect --inspect= --require -r --watch --prof --max-old-space-size' -- \"${cur_word}\") )\n    \
+             return 0\n  fi\n}\n\
+             complete -o filenames -o nospace -o bashdefault -F _node_complete node node_g\n\
+             EOF\n;;\n\
+             --help) printf '%s\\n' 'Options:' '  --inspect[=[host:]port]     inspector' \
+             '  -r, --require=...           preload' '  --watch                     watch' \
+             '  --prof                      profile';;\n\
+             *) touch \"$(dirname \"$0\")/ran\";;\nesac\n",
+        );
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_executables(&["node"])
+            .with_which("node", Some(node.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let mut failed = failure("node --inpsect app.js");
+        failed.exit_status = Some(9);
+        failed.output = CapturedOutput::Combined {
+            text: "node: bad option: --inpsect\n".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&failed, &ctx);
+        assert!(
+            matches!(&report.outcome, Outcome::Suggestion(c) if c[0].script == "node --inspect app.js"),
+            "{:?} {:?}",
+            report.outcome,
+            report.notes
+        );
+        for (source, expected) in [
+            ("node --requir ./x.js app.js", Some("node --require ./x.js app.js")),
+            ("node --wacth app.js", Some("node --watch app.js")),
+            // The script's options are its own, even after `--inspect`.
+            ("node --inspect app.js --prot 80", None),
+            ("node app.js --wacth", None),
+        ] {
+            let report = correct(&failure(source), &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first().copied(),
+                expected,
+                "{source}: {:?}",
+                report.notes
+            );
+        }
+        assert!(!dir.0.join("bin/ran").exists(), "only node's own listings ran");
+    }
+
 }

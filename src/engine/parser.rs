@@ -22,6 +22,8 @@
 
 use crate::shlex;
 
+mod powershell;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Dialect {
     #[default]
@@ -30,6 +32,8 @@ pub enum Dialect {
     /// tcsh's interactive syntax: simple commands, pipelines, lists, and
     /// redirections. Its control words and `( )` are not read.
     Tcsh,
+    /// PowerShell's argument-mode command lines (see [`powershell`]).
+    PowerShell,
 }
 
 impl Dialect {
@@ -39,7 +43,7 @@ impl Dialect {
             Shell::Bash | Shell::Zsh | Shell::Generic => Some(Self::Posix),
             Shell::Fish => Some(Self::Fish),
             Shell::Tcsh => Some(Self::Tcsh),
-            Shell::Powershell => None,
+            Shell::Powershell => Some(Self::PowerShell),
         }
     }
 }
@@ -86,8 +90,14 @@ impl Word {
     /// The span of the name in an option word written without quotes, such
     /// as `--color` in `--color=auto`; the value part keeps its bytes.
     pub fn option_name_span(&self, src: &str) -> Option<Span> {
+        self.option_name_span_with(src, '=')
+    }
+
+    /// [`Word::option_name_span`] where `separator` attaches the value
+    /// (`:` for PowerShell's `-Path:value`).
+    pub fn option_name_span_with(&self, src: &str, separator: char) -> Option<Span> {
         let raw = self.span.of(src);
-        let end = raw.find('=').unwrap_or(raw.len());
+        let end = raw.find(separator).unwrap_or(raw.len());
         let name = &raw[..end];
         (name.len() > 1
             && name.starts_with('-')
@@ -316,6 +326,9 @@ pub fn parse(source: &str) -> Script {
 }
 
 pub fn parse_with_dialect(source: &str, dialect: Dialect) -> Script {
+    if dialect == Dialect::PowerShell {
+        return powershell::parse(source);
+    }
     let mut parser = Parser {
         dialect,
         src: source,
@@ -838,7 +851,8 @@ impl Parser<'_> {
         match self.dialect {
             Dialect::Fish => self.fish_keyword(text, word.span),
             Dialect::Posix => self.posix_keyword(text, word.span),
-            Dialect::Tcsh => false,
+            // PowerShell lines have their own parser.
+            Dialect::Tcsh | Dialect::PowerShell => false,
         }
     }
 
@@ -1300,6 +1314,7 @@ impl Parser<'_> {
                             RESERVED.contains(&w) || ["begin", "end", "switch", "not"].contains(&w)
                         }
                         Dialect::Posix => RESERVED.contains(&w),
+                        Dialect::PowerShell => false,
                     }
             }) {
                 self.diagnose(
@@ -1972,6 +1987,9 @@ pub fn quote_word(value: &str) -> String {
 pub fn quote_word_with_dialect(value: &str, dialect: Dialect) -> String {
     if dialect == Dialect::Posix {
         return quote_word(value);
+    }
+    if dialect == Dialect::PowerShell {
+        return powershell::quote(value);
     }
     if !value.is_empty()
         && value

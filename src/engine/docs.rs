@@ -93,7 +93,7 @@ pub fn options(text: &str) -> Vec<CompletionItem> {
                     let (name, rest) = part.split_once([' ', '=', '[']).unwrap_or((part, ""));
                     (
                         name,
-                        !part[name.len()..].trim_start().starts_with('[')
+                        !part[name.len()..].starts_with('[')
                             && (part.contains('=') || !rest.trim().is_empty()),
                     )
                 })
@@ -259,6 +259,20 @@ mod tests {
         assert_eq!(
             items.iter().map(|i| i.takes_value).collect::<Vec<_>>(),
             [Some(true), Some(true), Some(false), Some(false)]
+        );
+    }
+
+    #[test]
+    fn optional_separate_values_can_follow_cargo_selectors() {
+        let items = options(
+            "  -p, --package [<SPEC>]  Package to build\n      --bin [<NAME>]  Build the named binary\n      --color[=WHEN]  Color output\n",
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.takes_value)
+                .collect::<Vec<_>>(),
+            [Some(true), Some(true), Some(true), Some(false)]
         );
     }
 

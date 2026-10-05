@@ -73,6 +73,17 @@ pub trait CandidateProvider {
 /// Program names: `$PATH` executables, shell aliases, and builtins.
 pub struct Executables<'c> {
     pub ctx: &'c Context,
+    /// Commands the shell runs besides those (PowerShell's cmdlets).
+    pub extra: Vec<String>,
+}
+
+impl<'c> Executables<'c> {
+    pub fn new(ctx: &'c Context) -> Self {
+        Executables {
+            ctx,
+            extra: Vec::new(),
+        }
+    }
 }
 
 impl CandidateProvider for Executables<'_> {
@@ -90,6 +101,7 @@ impl CandidateProvider for Executables<'_> {
             .iter()
             .map(String::as_str)
             .chain(self.ctx.shell.get_builtin_commands().iter().copied())
+            .chain(self.extra.iter().map(String::as_str))
             .map(|w| CompletionItem {
                 value: w.to_owned(),
                 takes_value: None,
@@ -115,6 +127,7 @@ type Memo =
 /// The installed app's own completer, for its subcommands and options.
 pub struct NativeCompletion<'c> {
     pub trusted: &'c [String],
+    trusted_help: &'c [String],
     /// Value queries may look up resources over the network.
     pub network: bool,
     backends: HashMap<String, Option<Rc<dyn NativeCompletionBackend>>>,
@@ -122,23 +135,52 @@ pub struct NativeCompletion<'c> {
     memo: Memo,
     notes: Vec<String>,
     shell: crate::shells::Shell,
+    workspace: Workspace<'c>,
+}
+
+/// The working directory and the directories trusted to run project code.
+#[derive(Clone, Debug, Default)]
+pub struct Workspace<'c> {
+    pub cwd: Option<PathBuf>,
+    pub trusted: &'c [String],
+}
+
+impl Workspace<'_> {
+    /// Why `program` may not list its commands here (see [`crate::workspace`]).
+    pub fn refuses(&self, program: &str) -> Option<String> {
+        let cwd = self.cwd.clone().or_else(|| std::env::current_dir().ok())?;
+        crate::workspace::untrusted_project(program, &cwd, self.trusted)
+    }
 }
 
 impl<'c> NativeCompletion<'c> {
     pub fn new(trusted: &'c [String], network: bool) -> Self {
         NativeCompletion {
             trusted,
+            trusted_help: &[],
             network,
             backends: HashMap::new(),
             caches: HashMap::new(),
             memo: HashMap::new(),
             notes: Vec::new(),
             shell: crate::shells::Shell::Bash,
+            workspace: Workspace::default(),
         }
+    }
+
+    /// Completers that evaluate project files run only in trusted workspaces.
+    pub fn with_workspace(mut self, workspace: Workspace<'c>) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     pub fn with_shell(mut self, shell: crate::shells::Shell) -> Self {
         self.shell = shell;
+        self
+    }
+
+    pub fn with_trusted_help(mut self, trusted: &'c [String]) -> Self {
+        self.trusted_help = trusted;
         self
     }
 
@@ -150,10 +192,15 @@ impl<'c> NativeCompletion<'c> {
         program: &str,
         path: Option<&PathBuf>,
         context: &[String],
+        typed: &str,
         budget: &mut Budget,
     ) -> Option<Vocabulary> {
-        let backend = self.backend(program, path)?;
+        let backend = self.backend(program, path, budget)?;
         if !backend.capabilities().values {
+            return None;
+        }
+        let query: Vec<&str> = context.iter().map(String::as_str).collect();
+        if typed.contains('/') && !backend.value_syntax_contains_slashes(&query) {
             return None;
         }
         let key = (program.to_owned(), context.to_vec(), "\0values".to_owned());
@@ -166,17 +213,27 @@ impl<'c> NativeCompletion<'c> {
                 result
             }
         };
-        let words: Vec<CompletionItem> = result
-            .ok()?
-            .into_iter()
-            .filter(|i| !i.is_option())
-            .collect();
+        let items = match result {
+            Ok(items) => items,
+            Err(error) => {
+                self.note(format!("{program} option-value completion: {error}"));
+                return None;
+            }
+        };
+        let items = match backend.prepare_value_candidates(&query, typed, items) {
+            Ok(items) => items,
+            Err(error) => {
+                self.note(format!("{program} option-value syntax: {error}"));
+                return None;
+            }
+        };
+        let words: Vec<CompletionItem> = items.into_iter().filter(|i| !i.is_option()).collect();
         if words.is_empty() {
             return None;
         }
         // With network lookups on, words the offline answer lacks are
         // resource names. If that answer fails, every word counts as one.
-        let resources = if backend.capabilities().resources {
+        let mut resources: Vec<String> = if backend.capabilities().resources {
             let key = (program.to_owned(), context.to_vec(), "\0offline".to_owned());
             let offline = match self.memo.get(&key) {
                 Some((hit, _)) => hit.clone(),
@@ -198,6 +255,12 @@ impl<'c> NativeCompletion<'c> {
         } else {
             Vec::new()
         };
+        let context: Vec<&str> = context.iter().map(String::as_str).collect();
+        for word in &words {
+            if backend.candidate_is_resource(&context, word) && !resources.contains(&word.value) {
+                resources.push(word.value.clone());
+            }
+        }
         Some(Vocabulary {
             words,
             // Value lists can lag the service (new regions, formats).
@@ -215,6 +278,37 @@ impl<'c> NativeCompletion<'c> {
             cached: false,
             resources,
         })
+    }
+
+    /// Whether a word missing from a partial list is a command the app
+    /// accepts without listing it, when its protocol can tell.
+    pub fn confirms(&mut self, slot: &Slot, budget: &mut Budget) -> bool {
+        let Some(backend) = self.backend(slot.program, slot.path, budget) else {
+            return false;
+        };
+        let context: Vec<&str> = slot.context.iter().map(String::as_str).collect();
+        backend.confirms(&context, slot.typed, budget) == Some(true)
+    }
+
+    /// The listed option `slot.typed` names under the protocol's own
+    /// matching rules (case, aliases, abbreviations), when it has them.
+    pub fn resolve_option(&mut self, slot: &Slot, budget: &mut Budget) -> Option<CompletionItem> {
+        let backend = self.backend(slot.program, slot.path, budget)?;
+        let context: Vec<&str> = slot.context.iter().map(String::as_str).collect();
+        backend.resolve_option(&context, slot.typed, budget)
+    }
+
+    /// Answers for `program` come from `backend` (a PowerShell command,
+    /// which has no executable to discover from), unless one already does.
+    pub fn register(&mut self, program: &str, backend: Rc<dyn NativeCompletionBackend>) {
+        if !self.has_backend(program) {
+            self.backends.insert(program.to_owned(), Some(backend));
+        }
+    }
+
+    /// A backend answers for `program` already.
+    pub fn has_backend(&self, program: &str) -> bool {
+        self.backends.get(program).is_some_and(Option::is_some)
     }
 
     /// Writes new answers to the disk cache.
@@ -256,12 +350,28 @@ impl<'c> NativeCompletion<'c> {
         &mut self,
         program: &str,
         path: Option<&PathBuf>,
+        budget: &mut Budget,
     ) -> Option<Rc<dyn NativeCompletionBackend>> {
         if !self.backends.contains_key(program) {
+            let refused = path.and_then(|_| self.workspace.refuses(program));
             let found = match path {
                 None => None,
+                Some(_) if refused.is_some() => {
+                    self.note(format!(
+                        "{program}: completion not probed: {}",
+                        refused.unwrap_or_default()
+                    ));
+                    None
+                }
                 Some(path) => {
-                    match native::discover_for_shell(program, path, self.trusted, self.shell) {
+                    match native::discover_for_shell_with_budget(
+                        program,
+                        path,
+                        self.trusted,
+                        self.trusted_help,
+                        self.shell,
+                        budget,
+                    ) {
                         Discovery::Found(mut backend) => {
                             backend.network = self.network;
                             self.note(format!(
@@ -312,24 +422,25 @@ impl CandidateProvider for NativeCompletion<'_> {
         if slot.role == TokenRole::Executable {
             return Answer::NotApplicable;
         }
-        let Some(backend) = self.backend(slot.program, slot.path) else {
+        let Some(backend) = self.backend(slot.program, slot.path, budget) else {
             return Answer::NotApplicable;
         };
         // An empty prefix enumerates the level; a dash prefix its options.
+        let context: Vec<&str> = slot.context.iter().map(String::as_str).collect();
+        let capabilities = backend.capabilities_for(&context);
         let options = slot.role == TokenRole::OptionName;
         let short = slot.typed.len() > 1 && !slot.typed.starts_with("--");
-        if options && short && !backend.capabilities().short_options {
+        if options && short && !capabilities.short_options {
             return Answer::NotApplicable;
         }
         let prefix = if options {
-            backend.capabilities().option_prefix
+            capabilities.option_prefix
         } else {
             ""
         };
         // Arguments (including global option values) can carry secrets.
         // Handwritten handlers may mix command words and resource names.
         // Only an authoritative command-only context may reach disk.
-        let capabilities = backend.capabilities();
         let cacheable = capabilities.complete_subcommands
             && capabilities.complete_options
             && slot.context == slot.command_path;
@@ -363,23 +474,38 @@ impl CandidateProvider for NativeCompletion<'_> {
             }
         };
         self.memo.insert(key, (result.clone(), cached));
+        // Answering can teach a backend what it is (a PowerShell command's
+        // parameter list is complete only for a closed command).
+        let capabilities = backend.capabilities_for(&context);
         let via = format!("{} completion", backend.id());
         match result {
-            Ok(items) => Answer::Words(Vocabulary {
-                words: items
+            Ok(items) => {
+                let words: Vec<_> = items
                     .into_iter()
                     .filter(|i| i.is_option() == options)
-                    .collect(),
-                authoritative: if options {
-                    backend.capabilities().complete_options
+                    .collect();
+                let resources = if !options {
+                    words
+                        .iter()
+                        .filter(|word| backend.candidate_is_resource(&context, word))
+                        .map(|word| word.value.clone())
+                        .collect()
                 } else {
-                    backend.capabilities().complete_subcommands
-                },
-                via,
-                source: Source::NativeCompletion,
-                cached,
-                resources: Vec::new(),
-            }),
+                    Vec::new()
+                };
+                Answer::Words(Vocabulary {
+                    words,
+                    authoritative: if options {
+                        capabilities.complete_options
+                    } else {
+                        capabilities.complete_subcommands
+                    },
+                    via,
+                    source: Source::NativeCompletion,
+                    cached,
+                    resources,
+                })
+            }
             // The protocol has no data for this position (gcloud's static
             // tree and positionals): nothing here is a subcommand.
             Err(CompletionError::Unsupported(_)) => Answer::Words(Vocabulary {
@@ -659,6 +785,7 @@ pub struct HelpText<'c> {
     pub trusted: &'c [String],
     texts: HashMap<(PathBuf, Vec<String>), Option<String>>,
     notes: Vec<String>,
+    workspace: Workspace<'c>,
 }
 
 impl<'c> HelpText<'c> {
@@ -667,7 +794,15 @@ impl<'c> HelpText<'c> {
             trusted,
             texts: HashMap::new(),
             notes: Vec::new(),
+            workspace: Workspace::default(),
         }
+    }
+
+    /// Programs whose `--help` evaluates project files run only in trusted
+    /// workspaces.
+    pub fn with_workspace(mut self, workspace: Workspace<'c>) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     fn text(
@@ -679,6 +814,13 @@ impl<'c> HelpText<'c> {
     ) -> Option<&str> {
         let trusted = self.trusted.iter().any(|t| t == "*" || t == program);
         if !trusted || !super::probe::is_trusted_location(path) {
+            return None;
+        }
+        if let Some(why) = self.workspace.refuses(program) {
+            let note = format!("{program}: --help not read: {why}");
+            if !self.notes.contains(&note) {
+                self.notes.push(note);
+            }
             return None;
         }
         // Walk iteratively, so even malformed paths supplied by an embedder
@@ -1186,5 +1328,35 @@ esac
             "a free-form leaf value must not be repaired to a global enum"
         );
         assert!(!dir.0.join("ran").exists());
+    }
+    #[test]
+    fn project_evaluating_completers_need_a_trusted_workspace() {
+        let dir = std::env::temp_dir().join(format!("notypo-workspace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Makefile"), "all:\n").unwrap();
+        let trusted = vec!["*".to_owned()];
+        let mut native = NativeCompletion::new(&trusted, false).with_workspace(Workspace {
+            cwd: Some(dir.clone()),
+            trusted: &[],
+        });
+        let mut budget = Budget::new(Duration::from_secs(5), Duration::from_secs(2), 4);
+        let make = PathBuf::from("/usr/bin/make");
+        assert!(native.backend("make", Some(&make), &mut budget).is_none());
+        assert_eq!(budget.spawned(), 0, "nothing ran");
+        let notes = native.notes();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.to_lowercase().contains("makefile") && n.contains("trusted_workspaces")),
+            "{notes:?}"
+        );
+        // A trusted workspace lets discovery go ahead.
+        let workspaces = vec![dir.display().to_string()];
+        let workspace = Workspace {
+            cwd: Some(dir.clone()),
+            trusted: &workspaces,
+        };
+        assert_eq!(workspace.refuses("make"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

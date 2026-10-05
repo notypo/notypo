@@ -3,7 +3,7 @@
 //! `@memoize` caches.
 
 use crate::settings::Settings;
-use crate::shells::Shell;
+use crate::shells::{PowerShellCommand, Shell};
 use crate::{path_index, utils};
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
@@ -23,6 +23,10 @@ pub struct Context {
     which_overrides: HashMap<String, Option<PathBuf>>,
     /// Answer `which` only from this listing (`/listing/bin/<name>`).
     which_listing: Option<HashSet<String>>,
+    /// Shell aliases in place of the parent shell's (tests).
+    alias_overrides: Option<HashMap<String, String>>,
+    /// PowerShell's command resolutions in place of the session's (tests).
+    powershell_overrides: Option<HashMap<String, PowerShellCommand>>,
 }
 
 /// Names `get_all_executables` never offers: our own entry points.
@@ -39,7 +43,42 @@ impl Context {
             recent_history: OnceLock::new(),
             which_overrides: HashMap::new(),
             which_listing: None,
+            alias_overrides: None,
+            powershell_overrides: None,
         }
+    }
+
+    /// Fixes the shell's aliases (tests).
+    pub fn with_aliases(mut self, pairs: &[(&str, &str)]) -> Context {
+        self.alias_overrides = Some(
+            pairs
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        );
+        self
+    }
+
+    /// Fixes how the PowerShell session resolved command names (tests):
+    /// lines of `name<TAB>kind<TAB>target kind<TAB>target`.
+    pub fn with_powershell_commands(mut self, report: &str) -> Context {
+        self.powershell_overrides = Some(crate::shells::parse_powershell_commands(report));
+        self
+    }
+
+    /// How the parent PowerShell session resolved the failed line's command
+    /// names, keyed by lowercased name; empty for other shells.
+    pub fn powershell_commands(&self) -> &HashMap<String, PowerShellCommand> {
+        self.powershell_overrides
+            .as_ref()
+            .unwrap_or_else(|| self.shell.get_powershell_commands())
+    }
+
+    /// The parent shell's aliases (`TF_SHELL_ALIASES`, or tcsh's own list).
+    pub fn aliases(&self) -> &HashMap<String, String> {
+        self.alias_overrides
+            .as_ref()
+            .unwrap_or_else(|| self.shell.get_aliases())
     }
 
     /// Fixes the executables list instead of reading `$PATH` (tests).
@@ -95,8 +134,7 @@ impl Context {
                 .flat_map(|listing| listing.names)
                 .filter(|name| !ENTRY_POINTS.contains(&name.as_str()));
             let aliases = self
-                .shell
-                .get_aliases()
+                .aliases()
                 .keys()
                 .chain(self.shell.get_functions())
                 .filter(|a| **a != self.alias)

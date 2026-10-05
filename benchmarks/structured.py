@@ -12,12 +12,15 @@ compare.py.
     python3 benchmarks/structured.py      # writes benchmarks/structured-results.md
     python3 benchmarks/structured.py --shell-fixtures --case shell \
         --output benchmarks/shell-results.md
+    python3 benchmarks/structured.py --protocols --case protocol \
+        --output benchmarks/protocol-results.md
 """
 
 import argparse
 import json
 import math
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -73,6 +76,61 @@ def environment(cache):
     for key in ("TF_HISTORY", "SHELL_LOGGER_SOCKET", "NOTYPO_NO_CACHE"):
         env.pop(key, None)
     return env
+
+
+# Installed apps reached through the newer bridges, each under the trust it
+# needs: (label, app, command, expected, trusted_completers, trusted_help).
+PROTOCOL_CASES = [
+    ("pip protocol", "pip3", "pip3 config lsit", "pip3 config list", ["python:pip"], []),
+    ("npm protocol", "npm", "npm config lsit", "npm config list", ["npm:npm"], []),
+    ("cargo protocol", "cargo", "cargo build --releae", "cargo build --release",
+     ["rust:cargo"], ["rust:cargo"]),
+    ("clap protocol (sofka)", "sofka", "sofka --readoly", "sofka --readonly",
+     ["sofka"], ["sofka"]),
+    ("clap protocol (just shim)", "just", "just --dry-rnu", "just --dry-run", ["just"], []),
+    ("urfave/cli protocol (lefthook)", "lefthook", "lefthook valdate", "lefthook validate",
+     ["github.com/evilmartians/lefthook/v2"], ["lefthook"]),
+    ("cobra protocol (k9s, user-trusted)", "k9s", "k9s --readoly", "k9s --readonly",
+     ["github.com/derailed/k9s"], []),
+    ("bash handler protocol (bq)", "bq", "bq qeury x", "bq query x", ["bq"], []),
+]
+
+
+def protocol_cases():
+    cases = []
+    for label, app, command, expected, completers, help_ in PROTOCOL_CASES:
+        overrides = {
+            "NOTYPO_TRUSTED_COMPLETERS": json.dumps(completers),
+            "NOTYPO_TRUSTED_HELP": json.dumps(help_),
+            "NOTYPO_DISABLED_SOURCES": "help:man:history:legacy",
+            "HOMEBREW_NO_AUTO_UPDATE": "1",
+        }
+        cases.append((label, app, command, overrides, expected))
+    return cases + powershell_cases()
+
+
+def powershell_cases():
+    """PowerShell's own commands, described by a profile-free PowerShell. The
+    session report is what the PowerShell function would pass."""
+    pwsh = os.environ.get("NOTYPO_BENCH_PWSH") or shutil.which("pwsh")
+    if not pwsh:
+        print("skip PowerShell protocol: pwsh is not installed")
+        return []
+    cases = []
+    for label, command, expected, report in [
+        ("PowerShell protocol (parameter)", "Get-ChildItem -Recrse", "Get-ChildItem -Recurse",
+         "Get-ChildItem\tCmdlet\tCmdlet\tGet-ChildItem"),
+        ("PowerShell protocol (cmdlet name)", "Get-ChildItme -Name", "Get-ChildItem -Name",
+         "Get-ChildItme\t\t\t"),
+    ]:
+        overrides = {
+            "TF_SHELL": "powershell",
+            "NOTYPO_POWERSHELL": pwsh,
+            "NOTYPO_POWERSHELL_COMMANDS": report,
+            "NOTYPO_DISABLED_SOURCES": "help:man:history:legacy",
+        }
+        cases.append((label, pwsh, command, overrides, expected))
+    return cases
 
 
 def shell_fixtures(scratch):
@@ -132,6 +190,8 @@ def main():
     parser.add_argument("--samples", type=int, default=15)
     parser.add_argument("--output", default=str(ROOT / "benchmarks" / "structured-results.md"))
     parser.add_argument("--shell-fixtures", action="store_true", help="include isolated fish/Zsh handlers")
+    parser.add_argument("--protocols", action="store_true",
+                        help="include installed apps behind the newer protocol bridges")
     parser.add_argument("--case", help="only run labels containing this text")
     options = parser.parse_args()
     if options.samples < 1:
@@ -147,17 +207,20 @@ def main():
         if options.shell_fixtures:
             fixtures, marker = shell_fixtures(scratch)
             cases.extend(fixtures)
+        if options.protocols:
+            cases.extend(protocol_cases())
         for label, app, command, overrides, expected in cases:
             if options.case and options.case not in label:
                 continue
             if shutil.which(app) is None:
                 print(f"skip {label}: {app} is not installed")
                 continue
+            slug = re.sub(r"[^A-Za-z0-9]+", "-", label)
             cold, warm, rss = [], [], []
             probes_cold = probes_warm = None
             suggestion = None
             for n in range(options.samples):
-                cache = scratch / f"cold-{label}-{n}"
+                cache = scratch / f"cold-{slug}-{n}"
                 cache.mkdir()
                 elapsed, peak, report = run(command, environment(cache) | overrides)
                 cold.append(elapsed)
@@ -166,7 +229,7 @@ def main():
                 suggestion = (report["candidates"] or [{}])[0].get("command")
                 if expected and suggestion != expected:
                     sys.exit(f"{label}: expected {expected!r}, got {suggestion!r}")
-            cache = scratch / f"warm-{label}"
+            cache = scratch / f"warm-{slug}"
             cache.mkdir()
             run(command, environment(cache) | overrides)
             for _ in range(options.samples):
@@ -191,6 +254,7 @@ def main():
             sys.exit("the shell fixture operation was executed")
 
     fixture_only = bool(rows) and all(r["case"].endswith(" shell handler") for r in rows)
+    protocol_only = bool(rows) and all(" protocol" in r["case"] for r in rows)
     lines = [
         "# Correction benchmark with installed shell handlers" if fixture_only else
         "# Correction benchmark against installed CLIs",
@@ -222,6 +286,20 @@ def main():
             "Handwritten handlers provide partial evidence and use request-local memoization.",
             "Warm runs reuse the cache directory but repeat their native probes.",
             "Zsh's completion-system initialization dominates its elapsed time.",
+        ])
+    if protocol_only:
+        lines.extend([
+            "",
+            "Installed apps behind the newer bridges, each with the trust it needs",
+            "(`trusted_completers`, plus `trusted_help` for Cargo, Sofka's generator,",
+            "and lefthook's urfave/cli v3 hooks); help, man, history, and legacy",
+            "sources are off. The harness checks every suggestion; none is executed.",
+            "These bridges keep answers in request memory, so warm runs repeat their",
+            "probes; cobra answers for command-only contexts reach the disk cache.",
+            "The bq case runs the Cloud SDK's bash helper, which starts Python for",
+            "`bq help`. PowerShell cases start a profile-free PowerShell once to",
+            "describe the cmdlet, and once more to list command names when the",
+            "name itself is wrong; their peak RSS is that PowerShell's.",
         ])
     Path(options.output).write_text("\n".join(lines) + "\n")
     print(f"wrote {options.output}")

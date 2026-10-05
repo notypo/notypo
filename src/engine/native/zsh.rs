@@ -205,8 +205,8 @@ pub(super) fn complete(
             takes_value: None,
             description: None,
         });
-        if items.len() >= budget.max_candidates {
-            break;
+        if items.len() > budget.max_candidates {
+            return Err(super::over_limit());
         }
     }
     Ok(items)
