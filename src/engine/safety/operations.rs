@@ -13,6 +13,7 @@ const CERTIFICATE: &str = "deletes or revokes certificates";
 const MIGRATION: &str = "can discard database data or roll back migrations";
 const BACKUP: &str = "can remove backup snapshots or stored data";
 const NETWORK: &str = "changes tunnels, network configuration, or intercepted traffic";
+const PACKAGES: &str = "can install, remove, or switch packages or tool versions";
 
 /// Skip only known option values. A value containing a sensitive verb or flag
 /// must not be mistaken for an operation. `--` makes all following words data.
@@ -347,6 +348,17 @@ pub(super) fn risk(program: &str, args: &[&str]) -> Option<&'static str> {
     match program {
         "npm" => npm_risk(args),
         "cargo" => cargo_risk(args),
+        "dotnet" => {
+            // Builds evaluate MSBuild; run/test and external tools run code;
+            // new, package, workload, and configuration operations can write.
+            // Only an exact host information query has no operation to run.
+            (!(args.len() == 1
+                && ["--version", "--info", "--list-sdks", "--list-runtimes"].contains(&args[0]))
+                && !args.is_empty())
+            .then_some(
+                "can evaluate project code, execute tools, or change .NET files and packages",
+            )
+        }
         "npx" => Some("can execute package code"),
         "pip" | "pip3" => options(args, value_options(program))
             .iter()
@@ -802,8 +814,346 @@ pub(super) fn risk(program: &str, args: &[&str]) -> Option<&'static str> {
                     }))
             .then_some(NETWORK)
         }
+        "bundle" | "bundler" => first_in(
+            &positionals(args, &["--gemfile", "--path", "--retry", "--jobs", "-j"]),
+            &[
+                "install", "add", "update", "remove", "clean", "pristine", "cache", "package",
+                "plugin", "binstubs",
+            ],
+        )
+        .then_some(PACKAGES),
+        "composer" => first_in(
+            &positionals(args, &["--working-dir", "-d"]),
+            &[
+                "install",
+                "i",
+                "require",
+                "update",
+                "u",
+                "upgrade",
+                "remove",
+                "rm",
+                "reinstall",
+                "create-project",
+                "global",
+                "self-update",
+                "selfupdate",
+                "bump",
+            ],
+        )
+        .then_some(PACKAGES),
+        "poetry" => first_in(
+            &positionals(args, &["--directory", "-C", "--project", "-P"]),
+            &["add", "remove", "install", "update", "lock", "sync", "self"],
+        )
+        .then_some(PACKAGES),
+        // The first short letter selects dpkg's, rpm's, and nix-env's mode:
+        // `rpm -qi` queries, `rpm -ivh` installs.
+        "dpkg" => mode(
+            args,
+            &['i', 'r', 'P'],
+            &[
+                "--install",
+                "--remove",
+                "--purge",
+                "--unpack",
+                "--configure",
+            ],
+        )
+        .then_some(PACKAGES),
+        "rpm" => mode(
+            args,
+            &['i', 'U', 'F', 'e'],
+            &[
+                "--install",
+                "--upgrade",
+                "--freshen",
+                "--erase",
+                "--reinstall",
+                "--rollback",
+            ],
+        )
+        .then_some(PACKAGES),
+        "nix-env" => mode(
+            args,
+            &['i', 'e', 'u', 'G'],
+            &[
+                "--install",
+                "--uninstall",
+                "--upgrade",
+                "--set",
+                "--rollback",
+                "--switch-generation",
+                "--delete-generations",
+            ],
+        )
+        .then_some(PACKAGES),
+        "nix" => {
+            let words = positionals(
+                args,
+                &["--profile", "--option", "--extra-experimental-features"],
+            );
+            (path_is(
+                &words,
+                "profile",
+                &[
+                    "install",
+                    "add",
+                    "remove",
+                    "upgrade",
+                    "rollback",
+                    "wipe-history",
+                ],
+            ) || first_in(&words, &["upgrade-nix"]))
+            .then_some(PACKAGES)
+        }
+        "guix" => {
+            let words = positionals(args, &["--profile", "-p"]);
+            (first_in(&words, &["install", "remove", "upgrade", "pull"])
+                || words.first() == Some(&"package")
+                    && options(args, &[]).iter().any(|(name, _)| {
+                        [
+                            "--install",
+                            "--remove",
+                            "--upgrade",
+                            "--roll-back",
+                            "--switch-generation",
+                        ]
+                        .contains(name)
+                            || ["-i", "-r", "-u"].contains(name)
+                    })
+                || path_is(
+                    &words,
+                    "system",
+                    &["reconfigure", "roll-back", "switch-generation"],
+                )
+                || path_is(
+                    &words,
+                    "home",
+                    &["reconfigure", "roll-back", "switch-generation"],
+                ))
+            .then_some(PACKAGES)
+        }
+        // These install or remove whatever they are given; only help,
+        // version, and dry-run forms change nothing.
+        "emerge" => (!options(args, &[]).iter().any(|(name, _)| {
+            [
+                "--pretend",
+                "--search",
+                "--searchdesc",
+                "--info",
+                "--help",
+                "--version",
+                "--list-sets",
+                "--check-news",
+            ]
+            .contains(name)
+                || ['p', 's', 'S', 'h', 'V']
+                    .iter()
+                    .any(|flag| short_is(name, *flag))
+        }))
+        .then_some(PACKAGES),
+        "xbps-install" | "xbps-remove" | "pkg_add" | "pkg_delete" => {
+            (!options(args, &[]).iter().any(|(name, _)| {
+                ["--help", "--version", "-h", "-V"].contains(name)
+                    || ["xbps-install", "xbps-remove"].contains(&program) && *name == "-n"
+                    || ["pkg_add", "pkg_delete"].contains(&program) && *name == "-n"
+            }))
+            .then_some(PACKAGES)
+        }
+        "makepkg" => options(args, &["-p", "--config"])
+            .iter()
+            .any(|(name, _)| {
+                ["--install", "--syncdeps", "--rmdeps"].contains(name)
+                    || !name.starts_with("--")
+                        && ['i', 's', 'r'].iter().any(|flag| short_is(name, *flag))
+            })
+            .then_some(PACKAGES),
+        "eopkg" => first_in(
+            &positionals(args, &[]),
+            &[
+                "install",
+                "it",
+                "remove",
+                "rm",
+                "upgrade",
+                "up",
+                "remove-orphans",
+                "rmo",
+                "emerge",
+                "em",
+            ],
+        )
+        .then_some(PACKAGES),
+        "pkg" => first_in(
+            &positionals(args, &["-j", "-c", "-r", "-C", "-R", "-o"]),
+            &[
+                "install",
+                "add",
+                "delete",
+                "remove",
+                "upgrade",
+                "autoremove",
+                "lock",
+                "unlock",
+            ],
+        )
+        .then_some(PACKAGES),
+        "pkgin" => first_in(
+            &positionals(args, &[]),
+            &[
+                "install",
+                "in",
+                "remove",
+                "rm",
+                "upgrade",
+                "ug",
+                "full-upgrade",
+                "fug",
+                "autoremove",
+                "ar",
+                "import",
+                "im",
+            ],
+        )
+        .then_some(PACKAGES),
+        "mas" => first_in(
+            &positionals(args, &[]),
+            &[
+                "install",
+                "uninstall",
+                "upgrade",
+                "purchase",
+                "lucky",
+                "get",
+                "reset",
+            ],
+        )
+        .then_some(PACKAGES),
+        "softwareupdate" => options(args, &[])
+            .iter()
+            .any(|(name, _)| {
+                [
+                    "--install",
+                    "--install-rosetta",
+                    "--fetch-full-installer",
+                    "--schedule",
+                    "--background",
+                    "--set-catalog",
+                    "--clear-catalog",
+                    "--download",
+                ]
+                .contains(name)
+                    || !name.starts_with("--")
+                        && ['i', 'd'].iter().any(|flag| short_is(name, *flag))
+            })
+            .then_some(PACKAGES),
+        "asdf" => {
+            let words = positionals(args, &[]);
+            (first_in(
+                &words,
+                &[
+                    "install",
+                    "uninstall",
+                    "global",
+                    "local",
+                    "set",
+                    "update",
+                    "reshim",
+                    "plugin-add",
+                    "plugin-remove",
+                    "plugin-update",
+                ],
+            ) || path_is(&words, "plugin", &["add", "remove", "update"]))
+            .then_some(PACKAGES)
+        }
+        "mise" | "rtx" => {
+            let words = positionals(args, &["--cd", "-C", "--env", "-E", "--jobs", "-j"]);
+            (first_in(
+                &words,
+                &[
+                    "install",
+                    "i",
+                    "uninstall",
+                    "rm",
+                    "remove",
+                    "use",
+                    "u",
+                    "upgrade",
+                    "up",
+                    "prune",
+                    "self-update",
+                    "implode",
+                    "link",
+                    "sync",
+                ],
+            ) || ["plugins", "plugin", "p"].iter().any(|parent| {
+                path_is(
+                    &words,
+                    parent,
+                    &[
+                        "install",
+                        "i",
+                        "add",
+                        "a",
+                        "uninstall",
+                        "rm",
+                        "remove",
+                        "update",
+                        "upgrade",
+                        "link",
+                    ],
+                )
+            }))
+            .then_some(PACKAGES)
+        }
+        "sdk" => first_in(
+            &positionals(args, &[]),
+            &[
+                "install",
+                "i",
+                "uninstall",
+                "rm",
+                "use",
+                "u",
+                "default",
+                "d",
+                "upgrade",
+                "ug",
+                "selfupdate",
+                "flush",
+                "env",
+            ],
+        )
+        .then_some(PACKAGES),
         _ => None,
     }
+}
+
+/// A mode selected by the first short option's first letter, or a long
+/// option naming the mode.
+fn mode(args: &[&str], letters: &[char], long: &[&str]) -> bool {
+    let mut first_short = true;
+    for arg in args {
+        if *arg == "--" {
+            break;
+        }
+        let name = arg.split_once('=').map_or(*arg, |(name, _)| name);
+        if long.contains(&name) {
+            return true;
+        }
+        if first_short
+            && let Some(shorts) = arg.strip_prefix('-')
+            && !arg.starts_with("--")
+            && let Some(letter) = shorts.chars().next()
+        {
+            if letters.contains(&letter) {
+                return true;
+            }
+            first_short = false;
+        }
+    }
+    false
 }
 
 fn npm_risk(args: &[&str]) -> Option<&'static str> {
@@ -1125,6 +1475,112 @@ mod tests {
                     "replay {dialect:?}: {command}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn package_managers_installs_removals_and_version_switches_require_approval() {
+        for command in [
+            "bundle install",
+            "bundle --gemfile install update",
+            "bundler add example",
+            "composer require example/example",
+            "composer -d install update",
+            "poetry add example",
+            "poetry self update",
+            "dpkg -i example.deb",
+            "dpkg --purge example",
+            "rpm -ivh example.rpm",
+            "rpm -e example",
+            "rpm --upgrade example.rpm",
+            "microdnf install example",
+            "dnf5 remove example",
+            "nix-env -iA nixpkgs.example",
+            "nix-env --uninstall example",
+            "nix profile install nixpkgs#example",
+            "guix install example",
+            "guix package -r example",
+            "guix system reconfigure example.scm",
+            "emerge example",
+            "emerge -uDN @world",
+            "emerge --depclean",
+            "xbps-install -S example",
+            "xbps-remove example",
+            "pkg_add example",
+            "pkg_delete example",
+            "makepkg -si",
+            "makepkg --install",
+            "eopkg it example",
+            "pkg delete example",
+            "pkg -j jail install example",
+            "pkgin fug",
+            "mas install 123",
+            "softwareupdate -ia",
+            "softwareupdate --install-rosetta",
+            "asdf install nodejs latest",
+            "asdf global nodejs 22",
+            "asdf plugin add example",
+            "mise use node@22",
+            "mise plugins install example",
+            "sdk install java",
+            "sdk use java 21",
+        ] {
+            for dialect in [Dialect::Posix, Dialect::Fish, Dialect::Tcsh] {
+                let original = parser::parse_with_dialect(&format!("{command}e"), dialect);
+                let gate = safety::assess(&original, command, &[]);
+                assert_eq!(
+                    gate.decision,
+                    Decision::Confirm,
+                    "{dialect:?}: {command}: {:?}",
+                    gate.reasons
+                );
+            }
+            assert_eq!(
+                safety::assess_replay_with_dialect(command, Dialect::Posix).decision,
+                Decision::Confirm,
+                "replay: {command}"
+            );
+        }
+        for command in [
+            "bundle exec rake test",
+            "bundle --gemfile install list",
+            "composer show",
+            "poetry show",
+            "dpkg -l",
+            "dpkg -L example",
+            "rpm -qi example",
+            "rpm -qa",
+            "rpm -Va",
+            "nix-env -qa",
+            "nix profile list",
+            "nix search nixpkgs example",
+            "guix search example",
+            "guix package --list-installed",
+            "emerge --search example",
+            "emerge -pv example",
+            "xbps-install -n example",
+            "pkg_add -n example",
+            "makepkg --printsrcinfo",
+            "eopkg list-installed",
+            "pkg info example",
+            "pkgin search example",
+            "mas list",
+            "softwareupdate --list",
+            "asdf list",
+            "asdf current",
+            "mise ls",
+            "mise plugins ls",
+            "sdk list java",
+            "sdk current",
+        ] {
+            let script = parser::parse(command);
+            let gate = safety::assess(&script, command, &[]);
+            assert_eq!(
+                gate.decision,
+                Decision::Allow,
+                "{command}: {:?}",
+                gate.reasons
+            );
         }
     }
 

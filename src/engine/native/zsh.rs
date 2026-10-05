@@ -1,6 +1,12 @@
 //! Installed zsh autoload handlers run inside a real completion widget.
 //! `vared` edits a private variable; accepting that buffer never executes it.
 //! Only an opted-in handler's matches are captured, over a separate descriptor.
+//!
+//! A handler the user's session defined in memory (inline in `.zshrc`, or
+//! by `source <(tool completion zsh)`) has no autoload file. The shell
+//! integration passes its `compdef` registration and the definitions of the
+//! functions from the same source (`$functions_source`), which the driver
+//! evaluates; the session's startup files are never run.
 
 use super::{CompletionError, CompletionItem, probe_error};
 use crate::engine::parser::{self, Dialect};
@@ -11,11 +17,19 @@ use std::path::{Path, PathBuf};
 const DRIVER: &str = r#"unsetopt monitor
 unset HISTFILE
 autoload -Uz +X compinit || exit 3
-fpath=( ${1:h} $fpath )
+[[ $1 == file ]] && fpath=( ${2:h} $fpath )
 compinit -u -D || exit 3
 zmodload zsh/zutil || exit 3
-typeset -g notypo_function=${1:t}
-autoload -Uz -- "$1" || exit 3
+if [[ $1 == file ]]; then
+    typeset -g notypo_function=${2:t}
+    autoload -Uz -- "$2" || exit 3
+elif [[ $1 == text ]]; then
+    eval "$2" >/dev/null 2>&1 || exit 3
+    typeset -g notypo_function=$3
+    (( $+functions[$notypo_function] )) || exit 3
+else
+    exit 3
+fi
 typeset -ga notypo_matches=()
 typeset -gi notypo_called=0 notypo_status=0
 _notypo_handler() {
@@ -25,7 +39,7 @@ _notypo_handler() {
     notypo_status=$?
     return $notypo_status
 }
-compdef _notypo_handler "$2" || exit 3
+compdef _notypo_handler "$4" || exit 3
 compadd() {
     if (( ${notypo_collect:-0} )); then
         local -a notypo_added=()
@@ -59,7 +73,7 @@ zle-line-init() {
 }
 zle -N zle-line-init
 bindkey -e
-typeset notypo_buffer=$3
+typeset notypo_buffer=$5
 vared notypo_buffer || exit 4
 (( notypo_called )) || exit 5
 (( notypo_status <= 1 )) || exit 6
@@ -130,9 +144,49 @@ fn declares(path: &Path, name: &str) -> bool {
         .any(|word| word.split('=').next() == Some(name))
 }
 
+/// Where the handler comes from.
+pub(super) enum Source<'a> {
+    File(&'a Path),
+    /// Definitions passed by the parent session, and the handler's name.
+    Text {
+        definitions: &'a str,
+        function: &'a str,
+    },
+}
+
+/// The variable the zsh integration fills: `compdef <function> <word>`
+/// lines, a `#notypo-functions` line, then `functions` output.
+const MEMORY: &str = "NOTYPO_ZSH_COMPLETIONS";
+const SEPARATOR: &str = "#notypo-functions\n";
+const MEMORY_LIMIT: usize = 64 * 1024;
+
+/// The session's handler for `name`: its definitions and function name.
+pub(super) fn memory(name: &str) -> Option<(String, String)> {
+    memory_in(&std::env::var(MEMORY).ok()?, name)
+}
+
+fn memory_in(text: &str, name: &str) -> Option<(String, String)> {
+    if text.len() > MEMORY_LIMIT || text.contains('\0') {
+        return None;
+    }
+    let (specs, definitions) = text.split_once(SEPARATOR)?;
+    let function = specs.lines().find_map(|line| {
+        let mut words = line.split(' ');
+        match (words.next(), words.next(), words.next(), words.next()) {
+            (Some("compdef"), Some(function), Some(word), None) if word == name => Some(function),
+            _ => None,
+        }
+    })?;
+    let valid = |c: char| c.is_ascii_alphanumeric() || "_-:.".contains(c);
+    if function.is_empty() || !function.chars().all(valid) || definitions.trim().is_empty() {
+        return None;
+    }
+    Some((definitions.to_owned(), function.to_owned()))
+}
+
 pub(super) fn complete(
     zsh: &Path,
-    script: &Path,
+    source: &Source<'_>,
     name: &str,
     words: &[&str],
     prefix: &str,
@@ -154,6 +208,13 @@ pub(super) fn complete(
         ("fpath".into(), None),
         ("HISTFILE".into(), None),
     ]);
+    let (mode, code, function): (&str, OsString, &str) = match source {
+        Source::File(script) => ("file", script.into(), ""),
+        Source::Text {
+            definitions,
+            function,
+        } => ("text", definitions.into(), function),
+    };
     let output = probe::run_completion_terminal(
         &Probe {
             program: zsh,
@@ -163,7 +224,9 @@ pub(super) fn complete(
                 "-c".into(),
                 DRIVER.into(),
                 "notypo-completion".into(),
-                script.into(),
+                mode.into(),
+                code,
+                function.into(),
                 name.into(),
                 line.into(),
             ],
@@ -263,6 +326,49 @@ mod tests {
             values(backend.complete(&[], "", &mut budget).unwrap())
                 .contains(&"newly-installed".into())
         );
+    }
+
+    #[test]
+    fn session_handlers_name_their_function_and_carry_definitions() {
+        let text = "compdef _tool tool\ncompdef _other other\n#notypo-functions\n_tool () {\n\t_tool_commands\n}\n";
+        let (definitions, function) = memory_in(text, "tool").unwrap();
+        assert_eq!(function, "_tool");
+        assert!(definitions.starts_with("_tool () {"));
+        assert_eq!(memory_in(text, "missing"), None);
+        assert_eq!(
+            memory_in("compdef _tool tool\n#notypo-functions\n", "tool"),
+            None
+        );
+        assert_eq!(
+            memory_in("compdef $(x) tool\n#notypo-functions\nf () {}\n", "tool"),
+            None
+        );
+        assert_eq!(
+            memory_in("compdef _tool tool extra\n#notypo-functions\nf\n", "tool"),
+            None
+        );
+    }
+
+    #[test]
+    fn session_definitions_run_in_a_real_widget_with_their_helpers() {
+        let Some(zsh) = crate::utils::which("zsh") else {
+            return;
+        };
+        let definitions = "_tool () {\n\t_tool_commands\n}\n_tool_commands () {\n\t_arguments '1:command:(build deploy)'\n}\n";
+        let source = Source::Text {
+            definitions,
+            function: "_tool",
+        };
+        let items = complete(&zsh, &source, "tool", &[], "", Vec::new(), &mut budget()).unwrap();
+        assert_eq!(values(items), ["build", "deploy"]);
+        let missing = Source::Text {
+            definitions,
+            function: "_absent",
+        };
+        assert!(matches!(
+            complete(&zsh, &missing, "tool", &[], "", Vec::new(), &mut budget()),
+            Err(CompletionError::Failed(_))
+        ));
     }
 
     #[test]

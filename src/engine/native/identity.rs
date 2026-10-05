@@ -14,6 +14,9 @@ pub fn identify(path: &Path) -> Option<String> {
     if cargo_installation(path).is_some() {
         return Some("rust:cargo".into());
     }
+    if super::dotnet::installation(path).is_some() {
+        return Some("dotnet:sdk".into());
+    }
     let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     if let Some(package) = npm_package(&real) {
         return Some(format!("npm:{package}"));
@@ -33,6 +36,9 @@ pub fn identify(path: &Path) -> Option<String> {
 pub fn package_manager_name(path: &Path) -> Option<&'static str> {
     if cargo_installation(path).is_some() {
         return Some("cargo");
+    }
+    if super::dotnet::installation(path).is_some() {
+        return Some("dotnet");
     }
     let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     if let Some(entry) = npm_entrypoint(&real) {
@@ -156,7 +162,7 @@ pub(super) fn npm_entrypoint(path: &Path) -> Option<&'static str> {
     })
 }
 
-fn npm_manifest(real: &Path) -> Option<(PathBuf, serde_json::Value)> {
+pub(super) fn npm_manifest(real: &Path) -> Option<(PathBuf, serde_json::Value)> {
     let parts: Vec<Component> = real.components().collect();
     let at = parts
         .iter()

@@ -27,6 +27,7 @@ const LIBRARIES: &[&str] = &[
     "gopkg.in/alecthomas/kingpin.v2",
     "github.com/alecthomas/kingpin/v2",
     "github.com/choria-io/fisk",
+    "github.com/jessevdk/go-flags",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +39,8 @@ pub struct GoModule {
     /// Each library's linked release. A replaced module has none: the
     /// substitute's behavior is not that release's.
     pub versions: BTreeMap<String, String>,
+    /// go-flags uses POSIX option syntax on Windows with this build tag.
+    pub force_posix: bool,
 }
 
 impl GoModule {
@@ -55,8 +58,9 @@ impl GoModule {
 pub fn module(binary: &Path) -> Option<GoModule> {
     let key = fingerprint(&[binary.to_owned()], &["go-module"]);
     // Bump with LIBRARIES: older entries omit libraries added since (v2
-    // added urfave/cli and versions, v3 kingpin and fisk).
-    let mut cache = CompletionCache::open("go-modules", "v3");
+    // added urfave/cli and versions, v3 kingpin and fisk, v4 go-flags and
+    // its forceposix build tag).
+    let mut cache = CompletionCache::open("go-modules", "v4");
     if let Some(hit) = cache.as_ref().and_then(|c| c.get(&key)) {
         return decode(hit);
     }
@@ -74,6 +78,7 @@ fn encode(module: Option<&GoModule>) -> Vec<CompletionItem> {
             std::iter::once(format!("path\t{}", m.path))
                 .chain(m.libraries.iter().map(|l| format!("dep\t{l}")))
                 .chain(m.versions.iter().map(|(l, v)| format!("ver\t{l}\t{v}")))
+                .chain(m.force_posix.then(|| "tag\tforceposix".to_owned()))
                 .map(|value| CompletionItem {
                     value,
                     takes_value: None,
@@ -103,6 +108,7 @@ fn decode(items: &[CompletionItem]) -> Option<GoModule> {
         path,
         libraries,
         versions,
+        force_posix: items.iter().any(|item| item.value == "tag\tforceposix"),
     })
 }
 
@@ -157,6 +163,7 @@ fn parse(info: &str) -> Option<GoModule> {
     let mut libraries = Vec::new();
     let mut versions = BTreeMap::new();
     let mut previous: Option<&str> = None;
+    let mut force_posix = false;
     for line in info.lines() {
         let mut fields = line.split('\t');
         match (fields.next(), fields.next(), fields.next()) {
@@ -175,6 +182,14 @@ fn parse(info: &str) -> Option<GoModule> {
                     versions.remove(replaced);
                 }
             }
+            (Some("build"), Some(setting), _) => {
+                if let Some(tags) = setting.strip_prefix("-tags=") {
+                    force_posix = tags
+                        .trim_matches('"')
+                        .split([',', ' '])
+                        .any(|tag| tag == "forceposix");
+                }
+            }
             _ => {}
         }
         previous = None;
@@ -183,6 +198,7 @@ fn parse(info: &str) -> Option<GoModule> {
         path: path?,
         libraries,
         versions,
+        force_posix,
     })
 }
 
@@ -209,6 +225,20 @@ pub(crate) fn fake_binary_info(path: &str, lines: &str) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn go_flags_dependency_and_forceposix_build_tag_survive_the_identity_cache() {
+        for (tags, expected) in [
+            ("forceposix", true),
+            ("other,forceposix", true),
+            ("forceposix_extra", false),
+        ] {
+            let module = parse(&format!("path\texample.com/fixture\ndep\tgithub.com/jessevdk/go-flags\tv1.6.1\th1:x\nbuild\t-tags={tags}\n")).unwrap();
+            assert!(module.uses("github.com/jessevdk/go-flags"));
+            assert_eq!(module.force_posix, expected);
+            assert_eq!(decode(&encode(Some(&module))), Some(module));
+        }
+    }
 
     #[test]
     fn finds_module_information_across_chunk_boundaries() {

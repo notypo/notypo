@@ -578,6 +578,7 @@ esac
             path: MODULE.into(),
             libraries: vec![library.into()],
             versions: [(library.to_owned(), version.to_owned())].into(),
+            force_posix: false,
         };
         let mut protocol = linked(&module).unwrap().unwrap();
         protocol.trusted_help = help.iter().map(|h| h.to_string()).collect();

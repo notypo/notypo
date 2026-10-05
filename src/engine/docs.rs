@@ -34,11 +34,23 @@ fn aliases(head: &str) -> Vec<&str> {
     parts
 }
 
-/// Removes terminal overstrike formatting (`X\bX` bold, `_\bX` underline).
-pub fn strip_overstrike(text: &str) -> String {
+/// Removes terminal formatting: overstrike (`X\bX` bold, `_\bX`
+/// underline) and ANSI CSI sequences, which some programs print even when
+/// their output is not a terminal (swift's help is bold).
+pub fn strip_formatting(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            // Parameters and intermediates, then one final byte.
+            for c in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&c) {
+                    break;
+                }
+            }
+            continue;
+        }
         if chars.peek() == Some(&'\x08') {
             chars.next();
             continue;
@@ -52,9 +64,17 @@ pub fn strip_overstrike(text: &str) -> String {
 
 /// Options documented in `text`. A line starting with options defines them:
 /// an option followed only by spacing takes no value, one followed by a
-/// placeholder takes one. Long options mentioned elsewhere are included with
-/// unknown arity.
+/// placeholder takes one, and so does one whose description carries yargs's
+/// `[string]`, `[number]`, or `[array]` type (yargs prints no placeholder).
+/// Long options mentioned elsewhere are included with unknown arity.
 pub fn options(text: &str) -> Vec<CompletionItem> {
+    // The type, then only other tags (`[required]`, `[choices: ...]`).
+    let yargs_value = regex!(r"\[(?:string|number|array)\](?:\s+\[[^\[\]]*\])*\s*$");
+    // The options of the declaration being read, its indent, and those
+    // yargs types as taking a value.
+    let mut block: Vec<String> = Vec::new();
+    let mut block_indent = 0;
+    let mut typed: Vec<String> = Vec::new();
     let mut items: Vec<CompletionItem> = Vec::new();
     let mut add = |name: &str, takes_value: Option<bool>| {
         let name = name.trim_end_matches(|c: char| ",.;:)]".contains(c));
@@ -100,9 +120,19 @@ pub fn options(text: &str) -> Vec<CompletionItem> {
                 .collect();
             // A placeholder on the long spelling applies to its short alias.
             let takes_value = Some(declarations.iter().any(|(_, valued)| *valued));
+            block = declarations
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect();
+            block_indent = line.len() - line.trim_start().len();
             for (name, _) in declarations {
                 add(name, takes_value);
             }
+        } else if line.trim().is_empty() || line.len() - line.trim_start().len() <= block_indent {
+            block.clear();
+        }
+        if yargs_value.is_match(line) {
+            typed.extend(block.iter().cloned());
         }
         for word in line.split(|c: char| c.is_whitespace() || "[]()'\"`".contains(c)) {
             if word.starts_with("--") {
@@ -110,11 +140,17 @@ pub fn options(text: &str) -> Vec<CompletionItem> {
             }
         }
     }
+    for item in &mut items {
+        if typed.contains(&item.value) {
+            item.takes_value = Some(true);
+        }
+    }
     items
 }
 
 /// Finite option choices explicitly documented as `{json,yaml}` or
-/// `[possible values: json, yaml]` / `[choices: json, yaml]`. Descriptive
+/// `[possible values: json, yaml]` / `[choices: json, yaml]` (yargs quotes
+/// strings: `[choices: "json", "yaml"]`). Descriptive
 /// prose and arbitrary placeholders are not a vocabulary of values.
 pub fn option_values(text: &str, option: &str) -> Vec<CompletionItem> {
     let choices = regex!(r"(?i)\[(?:possible values|choices):\s*([^\[\]]+)\]");
@@ -140,7 +176,16 @@ pub fn option_values(text: &str, option: &str) -> Vec<CompletionItem> {
             declaration.and_then(|head| braces.captures(head).map(|c| c[1].to_owned()))
         });
         let Some(list) = list else { continue };
-        let words: Vec<_> = list.split([',', '|']).map(str::trim).collect();
+        // yargs quotes string choices: `[choices: "never", "any-change"]`.
+        let words: Vec<_> = list
+            .split([',', '|'])
+            .map(str::trim)
+            .map(|w| {
+                w.strip_prefix('"')
+                    .and_then(|w| w.strip_suffix('"'))
+                    .unwrap_or(w)
+            })
+            .collect();
         // Broken or shell-shaped metadata must not introduce executable text.
         if words.is_empty()
             || words.iter().any(|w| {
@@ -169,15 +214,23 @@ pub fn option_values(text: &str, option: &str) -> Vec<CompletionItem> {
 }
 
 /// Subcommands listed under a `Commands:` style heading in help output.
-pub fn subcommands(help: &str) -> Vec<CompletionItem> {
+/// Some lists repeat the program before each command: Thor's (Ruby)
+/// `  bundle install [OPTIONS]  # Description` under `Bundler commands:`,
+/// and swift's `  swift build      Build Swift packages`. When every entry
+/// starts with `program`'s name, the second word is the command.
+pub fn subcommands(help: &str, program: &str) -> Vec<CompletionItem> {
+    let program = program.rsplit(['/', '\\']).next().unwrap_or(program);
     let heading = regex!(
         r"(?i)^\s*(?:available |core |other |management |additional )?(?:sub)?commands?:?\s*$"
     );
+    let thor_heading = regex!(r"^[A-Z][A-Za-z0-9_-]* commands:\s*$");
     let entry = regex!(r"^\s{1,8}([a-z][a-z0-9_-]*)(?:,\s*[a-z][a-z0-9_-]*)*(?:\s{2,}|\s*$)");
+    let prefixed = regex!(r"^\s{1,8}([a-z][a-z0-9_.-]*) ([a-z][a-z0-9_:-]*)(?:\s|$)");
     let mut items: Vec<CompletionItem> = Vec::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
     let mut in_section = false;
     for line in help.lines() {
-        if heading.is_match(line) {
+        if heading.is_match(line) || thor_heading.is_match(line) {
             in_section = true;
             continue;
         }
@@ -188,8 +241,11 @@ pub fn subcommands(help: &str) -> Vec<CompletionItem> {
             continue;
         }
         if !line.starts_with(char::is_whitespace) {
-            in_section = heading.is_match(line);
+            in_section = heading.is_match(line) || thor_heading.is_match(line);
             continue;
+        }
+        if let Some(caps) = prefixed.captures(line) {
+            pairs.push((caps[1].to_owned(), caps[2].to_owned()));
         }
         if let Some(caps) = entry.captures(line)
             && !items.iter().any(|i| i.value == caps[1])
@@ -199,6 +255,21 @@ pub fn subcommands(help: &str) -> Vec<CompletionItem> {
                 takes_value: None,
                 description: None,
             });
+        }
+    }
+    // Entries must name the program; other leading words are aliases,
+    // nested commands (`db migrate`), or prose.
+    pairs.retain(|(word, _)| word == program);
+    if pairs.len() >= 2 {
+        items.clear();
+        for (_, command) in pairs {
+            if !items.iter().any(|i| i.value == command) {
+                items.push(CompletionItem {
+                    value: command,
+                    takes_value: None,
+                    description: None,
+                });
+            }
         }
     }
     items
@@ -215,7 +286,7 @@ mod tests {
     #[test]
     fn reads_bsd_and_gnu_style_man_pages() {
         let bsd = "LS(1)\n\nS\x08SY\x08YN\x08NO\x08OP\x08PS\x08SI\x08IS\x08S\n     ls [-\x08-@\x08@A\x08A] [-\x08--\x08-c\x08co\x08ol\x08lo\x08or\x08r=_\x08w_\x08h_\x08e_\x08n]\n\n     -\x08-A\x08A      Include dot entries.\n\n     -\x08-D\x08D _\x08f_\x08o_\x08r_\x08m_\x08a_\x08t\n             Format dates.\n";
-        let text = strip_overstrike(bsd);
+        let text = strip_formatting(bsd);
         assert!(text.contains("[--color=when]"), "{text}");
         let items = options(&text);
         assert_eq!(names(&items), ["--color", "-A", "-D"]);
@@ -247,9 +318,33 @@ mod tests {
     #[test]
     fn reads_subcommands_from_help() {
         let help = "Usage: cargo [OPTIONS] [COMMAND]\n\nOptions:\n  -V, --version  Print version\n\nCommands:\n    build, b    Compile the current package\n    check, c    Analyze\n    test, t     Run the tests\n    ...         See all commands with --list\n\nSee 'cargo help <command>'\n";
-        assert_eq!(names(&subcommands(help)), ["build", "check", "test"]);
+        assert_eq!(
+            names(&subcommands(help, "cargo")),
+            ["build", "check", "test"]
+        );
         let cobra = "Available Commands:\n  completion  Generate completion\n  get         Display resources\n\nFlags:\n  -h, --help   help\n";
-        assert_eq!(names(&subcommands(cobra)), ["completion", "get"]);
+        assert_eq!(names(&subcommands(cobra, "kubectl")), ["completion", "get"]);
+    }
+
+    #[test]
+    fn reads_thor_command_lists_after_the_program_name() {
+        // bundler 1.17.2's `bundle --help`.
+        let bundler = "Bundler commands:\n  bundle add GEM VERSION         # Add gem to Gemfile and run bundle install\n  bundle install [OPTIONS]       # Install the current environment to the system\n  bundle plugin                  # Manage the bundler plugins\n  bundle plugin help [COMMAND]   # Describe subcommands or one specific subco...\n  bundle version                 # Prints the bundler's version information\n\nOptions:\n      [--no-color]  # Disable colorization in output\n";
+        assert_eq!(
+            names(&subcommands(bundler, "/usr/bin/bundle")),
+            ["add", "install", "plugin", "version"]
+        );
+        // Lines naming different first words are not a Thor list.
+        let mixed = "Commands:\n  bundle add GEM  # Add\n  rails new APP  # New\n";
+        assert!(subcommands(mixed, "bundle").is_empty());
+        // A list of nested commands under one group is not program-prefixed.
+        let nested = "Commands:\n  db migrate   Run migrations\n  db seed      Seed data\n";
+        assert!(subcommands(nested, "app").is_empty());
+        // swift 6.4's help, bold even when piped.
+        let swift = strip_formatting(
+            "\x1b[1mSubcommands:\x1b[0m\n\n  \x1b[1mswift build\x1b[0m      Build Swift packages\n  \x1b[1mswift package\x1b[0m    Create and work on packages\n\n  Use \x1b[1m`swift --version`\x1b[0m for Swift version information.\n",
+        );
+        assert_eq!(names(&subcommands(&swift, "swift")), ["build", "package"]);
     }
 
     #[test]
@@ -288,6 +383,29 @@ mod tests {
         assert_eq!(names(&option_values(help, "--mode")), ["local", "remote"]);
         assert!(option_values(help, "--path").is_empty());
         assert!(option_values(help, "--absent").is_empty());
+        // yargs types say which options take a value, here or below.
+        let typed = "  -v, --verbose   Show debug logs  [count]\n  --profile       Use the profile  [string]\n  --require-approval   What needs approval\n             [string] [choices: \"never\"]\n  --json  JSON  [boolean] [default: false]\n  --tags  Tags   [array]\n  --notes  Mentions [string] in prose\n";
+        let items = options(typed);
+        let arity = |name: &str| items.iter().find(|i| i.value == name).unwrap().takes_value;
+        assert_eq!(arity("--verbose"), Some(false));
+        assert_eq!(arity("-v"), Some(false));
+        assert_eq!(arity("--profile"), Some(true));
+        assert_eq!(arity("--require-approval"), Some(true));
+        assert_eq!(arity("--json"), Some(false));
+        assert_eq!(arity("--tags"), Some(true));
+        assert_eq!(arity("--notes"), Some(false), "prose isn't a type tag");
+        // yargs (aws-cdk 2.1144.0): quoted strings on a continuation line.
+        let yargs = "  --require-approval                        What changes require manual approval\n                         [string] [choices: \"never\", \"any-change\", \"broadening\"]\n  --notification-arns                       ARNs\n";
+        assert_eq!(
+            names(&option_values(yargs, "--require-approval")),
+            ["never", "any-change", "broadening"]
+        );
+        for list in ["\"a,b\"", "\"a\"b\"", "\"$(id)\""] {
+            assert!(
+                option_values(&format!("  --x <X>  [choices: {list}]\n"), "--x").is_empty(),
+                "{list}"
+            );
+        }
     }
 
     #[test]

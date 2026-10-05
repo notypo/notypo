@@ -150,7 +150,7 @@ fn main() {
     let help = "Usage: tool nodes [COMMAND] [OPTIONS]\n\nCommands:\n  list    List nodes\n  show    Show a node\n\nOptions:\n  -p, --profile <PROFILE>  Select profile\n  -o, --output <FORMAT>  Output [possible values: json, yaml, text]\n  --region <REGION>  Select region\n  --verbose         Talk\n";
     measure("read help vocabulary", iterations, samples, || {
         black_box(docs::options(black_box(help)));
-        black_box(docs::subcommands(black_box(help)));
+        black_box(docs::subcommands(black_box(help), "tool"));
         black_box(docs::option_values(black_box(help), "--output"));
     });
     let none = |_: &str| 0;

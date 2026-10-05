@@ -24,19 +24,25 @@ mod bash;
 mod cargo;
 mod clap;
 mod click;
+mod dotnet;
 mod fish;
 mod git;
 mod go;
+mod go_flags;
 mod identity;
 mod kingpin;
 mod node;
 mod npm;
+mod oclif;
 mod pip;
 pub mod powershell;
+mod powershell_completer;
+mod symfony;
 mod urfave;
+mod yargs;
 mod zsh;
 
-pub use identity::package_manager_name;
+pub use identity::{identify as app_identity, package_manager_name};
 
 /// One valid word for a position, as reported by the app.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +130,35 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
     /// option or resource lists deeper in the command. Describe that position.
     fn capabilities_for(&self, _words: &[&str]) -> Capabilities {
         self.capabilities()
+    }
+    /// Protocol-specific option syntax, beyond the shell's usual `-`/`=`.
+    fn option_separator(&self, _typed: &str) -> Option<char> {
+        None
+    }
+
+    fn is_short_option(&self, typed: &str) -> bool {
+        typed.len() > 1 && !typed.starts_with("--")
+    }
+
+    /// Length of an option name whose characters include a value separator,
+    /// such as the SDK's `--debug:custom-hive`.
+    fn option_name_len(&self, _typed: &str) -> Option<usize> {
+        None
+    }
+    fn option_prefix(&self, _typed: &str) -> &'static str {
+        self.capabilities().option_prefix
+    }
+    fn is_option(&self, _words: &[&str], item: &CompletionItem) -> bool {
+        item.is_option()
+    }
+    /// Required/optional value handling when the app reports precise arity.
+    fn option_requires_value(
+        &self,
+        _words: &[&str],
+        _typed: &str,
+        _next: Option<&str>,
+    ) -> Option<bool> {
+        None
     }
     /// A positional list known to contain resource names rather than command
     /// vocabulary, even when the resources are local and require no network.
@@ -239,12 +274,22 @@ pub enum Flavor {
     Npm,
     /// Cargo's installed command list and bounded documentation/metadata.
     Cargo,
+    /// The installed .NET SDK's `dotnet complete` and parser schema.
+    Dotnet,
     /// Go apps built with urfave/cli: `app <commands> [-] <completion flag>`.
     Urfave,
     /// Click 8 apps: `<VAR>=bash_complete` with COMP_WORDS/COMP_CWORD.
     Click,
     /// Go apps built with kingpin or fisk: `app --completion-bash <words>`.
     Kingpin,
+    /// Go apps built with go-flags: `GO_FLAGS_COMPLETION=verbose app <words>`.
+    GoFlags,
+    /// Node apps built with yargs: `app --get-yargs-completions <words>`.
+    Yargs,
+    /// oclif apps, read from their packages' `oclif.manifest.json` files.
+    Oclif,
+    /// Symfony Console apps (Composer, framework consoles): `app _complete`.
+    Symfony,
     /// Node.js's own option list, from `node --completion-bash`.
     Node,
     /// A function registered by the app's bash completion script (opt-in).
@@ -253,6 +298,9 @@ pub enum Flavor {
     FishScript,
     /// An installed zsh autoload function, queried inside a ZLE widget.
     ZshFunction,
+    /// An argument completer registered in the user's PowerShell session,
+    /// asked through `TabExpansion2` (opt-in).
+    PowerShellCompleter,
 }
 
 /// Go apps whose completion was audited: the probe only lists words, and
@@ -295,10 +343,34 @@ pub struct Backend {
     /// The invocation learned from a generated script, never a guessed variable.
     clap: Option<Box<clap::Protocol>>,
     cargo: Option<Box<cargo::Protocol>>,
+    dotnet: Option<Box<dotnet::Protocol>>,
     urfave: Option<Box<urfave::Protocol>>,
     click: Option<Box<click::Protocol>>,
     kingpin: Option<Box<kingpin::Protocol>>,
+    go_flags: Option<Box<go_flags::Protocol>>,
+    /// State of the later bridges, boxed together so `Backend` stays small
+    /// (Clippy limits `Discovery::Found`'s size on Windows targets).
+    bridge: Option<Box<Bridge>>,
     memo: ProbeMemo,
+}
+
+#[derive(Clone, Debug)]
+enum Bridge {
+    Yargs(yargs::Protocol),
+    Oclif(oclif::Protocol),
+    Symfony(symfony::Protocol),
+    /// A completion function the parent bash session defined in memory:
+    /// its registration and the definitions from the same file.
+    BashMemory(String),
+    /// A zsh session's handler: definitions from its source and its name.
+    ZshMemory {
+        definitions: String,
+        function: String,
+    },
+    /// A fish session's `complete` lines and the user functions they call.
+    FishMemory(String),
+    /// A PowerShell session's argument completer and its script's functions.
+    PowerShellMemory(powershell_completer::Registration),
 }
 
 impl PartialEq for Backend {
@@ -312,6 +384,9 @@ impl Eq for Backend {}
 impl Backend {
     pub fn new(flavor: Flavor, name: &str, completer: PathBuf) -> Backend {
         let cargo = (flavor == Flavor::Cargo).then(|| Box::new(cargo::Protocol::new(&completer)));
+        let dotnet = (flavor == Flavor::Dotnet)
+            .then(|| dotnet::Protocol::new(&completer).map(Box::new))
+            .flatten();
         Backend {
             flavor,
             name: name.to_owned(),
@@ -322,9 +397,12 @@ impl Backend {
             application: None,
             clap: None,
             cargo,
+            dotnet,
             urfave: None,
             click: None,
             kingpin: (flavor == Flavor::Kingpin).then(Box::default),
+            go_flags: (flavor == Flavor::GoFlags).then(Box::default),
+            bridge: None,
             trust: match flavor {
                 Flavor::AwsCompleter | Flavor::Gcloud | Flavor::Azure | Flavor::Git => {
                     Trust::Bridge
@@ -332,6 +410,58 @@ impl Backend {
                 _ => Trust::UserTrusted,
             },
             memo: ProbeMemo::default(),
+        }
+    }
+
+    fn yargs(&self) -> Option<&yargs::Protocol> {
+        match self.bridge.as_deref() {
+            Some(Bridge::Yargs(protocol)) => Some(protocol),
+            _ => None,
+        }
+    }
+
+    fn oclif(&self) -> Option<&oclif::Protocol> {
+        match self.bridge.as_deref() {
+            Some(Bridge::Oclif(protocol)) => Some(protocol),
+            _ => None,
+        }
+    }
+
+    fn symfony(&self) -> Option<&symfony::Protocol> {
+        match self.bridge.as_deref() {
+            Some(Bridge::Symfony(protocol)) => Some(protocol),
+            _ => None,
+        }
+    }
+
+    fn zsh_memory(&self) -> Option<(&str, &str)> {
+        match self.bridge.as_deref() {
+            Some(Bridge::ZshMemory {
+                definitions,
+                function,
+            }) => Some((definitions, function)),
+            _ => None,
+        }
+    }
+
+    fn fish_memory(&self) -> Option<&str> {
+        match self.bridge.as_deref() {
+            Some(Bridge::FishMemory(script)) => Some(script),
+            _ => None,
+        }
+    }
+
+    fn bash_memory(&self) -> Option<&str> {
+        match self.bridge.as_deref() {
+            Some(Bridge::BashMemory(script)) => Some(script),
+            _ => None,
+        }
+    }
+
+    fn powershell_memory(&self) -> Option<&powershell_completer::Registration> {
+        match self.bridge.as_deref() {
+            Some(Bridge::PowerShellMemory(registration)) => Some(registration),
+            _ => None,
         }
     }
 
@@ -345,11 +475,29 @@ impl Backend {
         self
     }
 
+    pub fn set_workspace(&mut self, trusted: &[String], cwd: Option<&Path>) {
+        if let Some(protocol) = &mut self.go_flags {
+            protocol.cwd = cwd.map(Path::to_owned);
+        }
+        if let Some(protocol) = &mut self.dotnet {
+            protocol.trusted_workspaces = trusted.to_vec();
+            protocol.cwd = cwd.map(Path::to_owned);
+        }
+    }
+
     /// What identifies this installation's answers in the disk cache:
     /// completer and app files, extension and component directories.
     /// `None` when answers depend on the working directory (git reads
     /// aliases from the repository's configuration).
     pub fn cache_identity(&self) -> Option<String> {
+        // A session's own functions are not identified by any file.
+        if self.bash_memory().is_some()
+            || self.zsh_memory().is_some()
+            || self.fish_memory().is_some()
+            || self.powershell_memory().is_some()
+        {
+            return None;
+        }
         // urfave/cli and click callbacks can read the working directory's
         // project (lefthook's hooks, flask's application).
         if matches!(
@@ -359,9 +507,14 @@ impl Backend {
                 | Flavor::Pip
                 | Flavor::Npm
                 | Flavor::Cargo
+                | Flavor::Dotnet
                 | Flavor::Urfave
                 | Flavor::Click
                 | Flavor::Kingpin
+                | Flavor::GoFlags
+                | Flavor::Yargs
+                | Flavor::Oclif
+                | Flavor::Symfony
         ) {
             return None;
         }
@@ -446,10 +599,33 @@ pub fn discover_for_shell(
     let identity = identity.as_deref();
     let found = match discover_protocol(name, path, trusted, identity) {
         Discovery::None => {
-            let handlers: [HandlerDiscovery; 3] = match shell {
-                crate::shells::Shell::Zsh => [zsh_function, bash_function, fish_script],
-                crate::shells::Shell::Fish => [fish_script, bash_function, zsh_function],
-                _ => [bash_function, fish_script, zsh_function],
+            // The session's own registration is what its Tab runs; other
+            // shells' functions come after it.
+            let handlers: [HandlerDiscovery; 4] = match shell {
+                crate::shells::Shell::Zsh => [
+                    zsh_function,
+                    bash_function,
+                    fish_script,
+                    powershell_completer,
+                ],
+                crate::shells::Shell::Fish => [
+                    fish_script,
+                    bash_function,
+                    zsh_function,
+                    powershell_completer,
+                ],
+                crate::shells::Shell::Powershell => [
+                    powershell_completer,
+                    bash_function,
+                    fish_script,
+                    zsh_function,
+                ],
+                _ => [
+                    bash_function,
+                    fish_script,
+                    zsh_function,
+                    powershell_completer,
+                ],
             };
             handlers
                 .into_iter()
@@ -509,11 +685,27 @@ pub fn discover_for_shell_with_budget(
         }
         return found;
     }
+    if let Discovery::Found(backend) = &mut found
+        && let Some(protocol) = &mut backend.go_flags
+    {
+        protocol.trusted_help = trusted_help.to_vec();
+        let protocol = protocol.clone();
+        if !protocol.allowed(backend) {
+            return Discovery::NotTrusted(format!(
+                "{} uses go-flags, whose completion can run default marshalers, value callbacks, and code after a custom completion handler; add it to trusted_help as well to use it",
+                described(&backend.name, backend.identity.as_deref())
+            ));
+        }
+        return found;
+    }
     if !matches!(
         &found,
         Discovery::None
             | Discovery::Found(Backend {
-                flavor: Flavor::BashFunction | Flavor::FishScript | Flavor::ZshFunction,
+                flavor: Flavor::BashFunction
+                    | Flavor::FishScript
+                    | Flavor::ZshFunction
+                    | Flavor::PowerShellCompleter,
                 ..
             })
     ) {
@@ -543,6 +735,11 @@ pub fn discover_for_shell_with_budget(
         if let Some(protocol) = click::Protocol::from_script(&text, name, path) {
             return Discovery::Found(
                 click::backend(name, path, app_identity, protocol).with_helper(script.clone()),
+            );
+        }
+        if let Some(protocol) = yargs::Protocol::from_script(&text, name, path) {
+            return Discovery::Found(
+                yargs::backend(name, path, app_identity, protocol).with_helper(script.clone()),
             );
         }
         // Loading this file runs the app's generator; run it directly.
@@ -589,9 +786,22 @@ pub fn discover_for_shell_with_budget(
         .as_deref()
         .is_some_and(|identity| identity.starts_with("python:"))
     {
-        click::discover_from_help(path, budget).map(|found| {
+        click::discover_from_help(path, app_identity.as_deref(), budget).map(|found| {
             found.map(|protocol| click::backend(name, path, app_identity.clone(), protocol))
         })
+    } else if symfony::is_php_script(path) {
+        // A PHP script may be a Symfony Console app; its help says so.
+        symfony::discover_from_help(path, budget).map(|found| {
+            found.map(|protocol| symfony::backend(name, path, app_identity.clone(), protocol))
+        })
+    } else if let Some(found) = app_identity
+        .as_deref()
+        .is_some_and(|identity| identity.starts_with("npm:"))
+        .then(|| yargs::discover_from_help(path, budget))
+        .and_then(Result::transpose)
+    {
+        // A Node bin depending on yargs whose help is yargs's.
+        found.map(|protocol| Some(yargs::backend(name, path, app_identity.clone(), protocol)))
     } else {
         clap::discover_generated(name, path, budget).map(|found| {
             found.map(|protocol| clap::backend(name, path, app_identity.clone(), protocol))
@@ -625,6 +835,29 @@ fn described(name: &str, identity: Option<&str>) -> String {
 
 fn zsh_function(name: &str, trusted: &[String], identity: Option<&str>) -> Discovery {
     let name = app_name(name);
+    // The parent zsh session's own handler is what its Tab runs.
+    if let Some((definitions, function)) = zsh::memory(name) {
+        if !identity::is_trusted(trusted, name, identity) {
+            return Discovery::NotTrusted(format!(
+                "{} has a completion function in your zsh session; add it to trusted_completers to use it",
+                described(name, identity)
+            ));
+        }
+        if !cfg!(unix) {
+            return Discovery::Unavailable("ZLE completion requires a Unix terminal".into());
+        }
+        return match crate::utils::which("zsh").filter(|p| probe::is_trusted_location(p)) {
+            Some(zsh) => {
+                let mut backend = Backend::new(Flavor::ZshFunction, name, zsh);
+                backend.bridge = Some(Box::new(Bridge::ZshMemory {
+                    definitions,
+                    function,
+                }));
+                Discovery::Found(backend)
+            }
+            None => Discovery::Unavailable("zsh is not installed".into()),
+        };
+    }
     let Some(script) = zsh::script_for(name) else {
         return Discovery::None;
     };
@@ -648,6 +881,23 @@ fn zsh_function(name: &str, trusted: &[String], identity: Option<&str>) -> Disco
 
 fn fish_script(name: &str, trusted: &[String], identity: Option<&str>) -> Discovery {
     let name = app_name(name);
+    // The parent fish session's own completions are what its Tab offers.
+    if let Some(script) = fish::memory_script(name) {
+        if !identity::is_trusted(trusted, name, identity) {
+            return Discovery::NotTrusted(format!(
+                "{} has completions in your fish session; add it to trusted_completers to use them",
+                described(name, identity)
+            ));
+        }
+        return match crate::utils::which("fish").filter(|f| probe::is_trusted_location(f)) {
+            Some(fish) => {
+                let mut backend = Backend::new(Flavor::FishScript, name, fish);
+                backend.bridge = Some(Box::new(Bridge::FishMemory(script)));
+                Discovery::Found(backend)
+            }
+            None => Discovery::Unavailable("fish is not installed".into()),
+        };
+    }
     let Some(script) = fish::script_for(name) else {
         return Discovery::None;
     };
@@ -666,9 +916,49 @@ fn fish_script(name: &str, trusted: &[String], identity: Option<&str>) -> Discov
     }
 }
 
+/// The argument completer the parent PowerShell session registered for
+/// `name`; PowerShell has no installed completion files to look for.
+fn powershell_completer(name: &str, trusted: &[String], identity: Option<&str>) -> Discovery {
+    let name = app_name(name);
+    let Some(registration) = powershell_completer::memory(name) else {
+        return Discovery::None;
+    };
+    if !identity::is_trusted(trusted, name, identity) {
+        return Discovery::NotTrusted(format!(
+            "{} has an argument completer in your PowerShell session; add it to trusted_completers to use it",
+            described(name, identity)
+        ));
+    }
+    match powershell::executable(crate::utils::which) {
+        Some(shell) => {
+            let mut backend = Backend::new(Flavor::PowerShellCompleter, name, shell);
+            backend.bridge = Some(Box::new(Bridge::PowerShellMemory(registration)));
+            Discovery::Found(backend)
+        }
+        None => Discovery::Unavailable("PowerShell is not installed".into()),
+    }
+}
+
 /// A trusted program's bash completion function, when it has nothing else.
 fn bash_function(name: &str, trusted: &[String], identity: Option<&str>) -> Discovery {
     let name = app_name(name);
+    // The parent bash session's own registration is what its Tab runs.
+    if let Some(script) = bash::memory_script(name) {
+        if !identity::is_trusted(trusted, name, identity) {
+            return Discovery::NotTrusted(format!(
+                "{} has a completion function in your bash session; add it to trusted_completers to use it",
+                described(name, identity)
+            ));
+        }
+        return match crate::utils::which("bash").filter(|b| probe::is_trusted_location(b)) {
+            Some(bash) => {
+                let mut backend = Backend::new(Flavor::BashFunction, name, bash);
+                backend.bridge = Some(Box::new(Bridge::BashMemory(script)));
+                Discovery::Found(backend)
+            }
+            None => Discovery::Unavailable("bash is not installed".into()),
+        };
+    }
     let Some(script) = bash::script_for(name) else {
         return Discovery::None;
     };
@@ -714,6 +1004,15 @@ fn discover_protocol(
             ))
         };
     }
+    // An oclif app's manifests describe it; reading them runs nothing.
+    if identity.is_some_and(|identity| identity.starts_with("npm:"))
+        && let Some(protocol) = oclif::discover(path)
+    {
+        let mut backend = Backend::new(Flavor::Oclif, name, path.to_owned());
+        backend.trust = Trust::Bridge;
+        backend.bridge = Some(Box::new(Bridge::Oclif(protocol)));
+        return Discovery::Found(backend);
+    }
     if identity == Some("npm:npm") {
         if identity::npm_entrypoint(path) != Some("npm") {
             return Discovery::Unavailable(
@@ -742,6 +1041,16 @@ fn discover_protocol(
         } else {
             Discovery::NotTrusted(format!(
                 "{} provides its installed command list; add it to trusted_completers to use it",
+                described(name, identity)
+            ))
+        };
+    }
+    if identity == Some("dotnet:sdk") {
+        return if identity::is_trusted(trusted, name, identity) {
+            found(Flavor::Dotnet, path.to_owned())
+        } else {
+            Discovery::NotTrusted(format!(
+                "{} supports SDK completion; add it to trusted_completers to use it",
                 described(name, identity)
             ))
         };
@@ -786,6 +1095,10 @@ fn go_app(name: &str, path: &Path, trusted: &[String]) -> Discovery {
             if flavor == Flavor::Urfave {
                 backend.urfave = urfave::linked(&module).ok().flatten().map(Box::new);
             }
+            if let Some(protocol) = &mut backend.go_flags {
+                protocol.windows = cfg!(windows) && !module.force_posix;
+                protocol.identify(path);
+            }
             backend.identity = Some(module.path);
             Discovery::Found(backend)
         }
@@ -816,6 +1129,7 @@ fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Fl
     let posener = module.uses("github.com/posener/complete");
     let cobra = module.uses("github.com/spf13/cobra");
     let kingpin = kingpin::linked(module);
+    let go_flags = module.uses(go_flags::LIBRARY);
     // An app that doesn't speak one library's protocol runs normally when
     // given its request (cobra's `__complete`, posener's empty command line,
     // urfave/cli's or kingpin's flag). Only an audit settles which library
@@ -833,6 +1147,7 @@ fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Fl
             (cobra, "cobra"),
             (matches!(urfave, Ok(Some(_))), "urfave/cli"),
             (kingpin, "kingpin"),
+            (go_flags, "go-flags"),
         ]
         .into_iter()
         .filter_map(|(linked, library)| linked.then_some(library))
@@ -856,6 +1171,8 @@ fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Fl
         Flavor::Urfave
     } else if kingpin {
         Flavor::Kingpin
+    } else if go_flags {
+        Flavor::GoFlags
     } else {
         return Err(GoRefusal::NoProtocol);
     };
@@ -867,6 +1184,7 @@ fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Fl
                 Flavor::Cobra => "cobra",
                 Flavor::Urfave => "urfave/cli",
                 Flavor::Kingpin => "kingpin",
+                Flavor::GoFlags => "go-flags",
                 _ => "posener",
             }
         )));
@@ -957,6 +1275,32 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
     .collect();
     let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
     match flavor {
+        Flavor::Dotnet => {
+            env.extend([
+                set("DOTNET_CLI_TELEMETRY_OPTOUT", "1"),
+                set("DOTNET_NOLOGO", "1"),
+                set("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1"),
+                set("DOTNET_GENERATE_ASPNET_CERTIFICATE", "false"),
+                set("DOTNET_ADD_GLOBAL_TOOLS_TO_PATH", "false"),
+                set("DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE", "true"),
+                set("DOTNET_EnableDiagnostics", "0"),
+                set("COMPlus_EnableDiagnostics", "0"),
+                set("CORECLR_ENABLE_PROFILING", "0"),
+                set("COR_ENABLE_PROFILING", "0"),
+                unset("DOTNET_STARTUP_HOOKS"),
+            ]);
+            env.extend(
+                [
+                    "DOTNET_HOST_TRACE",
+                    "DOTNET_HOST_TRACEFILE",
+                    "DOTNET_HOST_TRACE_VERBOSITY",
+                    "COREHOST_TRACE",
+                    "COREHOST_TRACEFILE",
+                    "COREHOST_TRACE_VERBOSITY",
+                ]
+                .map(unset),
+            );
+        }
         Flavor::AwsCompleter => {
             env.extend([
                 set("AWS_CONFIG_FILE", null),
@@ -1016,7 +1360,19 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
             unset("PYTHONSTARTUP"),
         ]),
         Flavor::Node => env.extend([unset("NODE_OPTIONS"), unset("NODE_REPL_EXTERNAL_MODULE")]),
-        Flavor::Kingpin => env.extend([
+        Flavor::Yargs => env.extend([
+            unset("NODE_OPTIONS"),
+            unset("NODE_REPL_EXTERNAL_MODULE"),
+            // Node's fetch honors the blocked proxy only when asked to.
+            set("NODE_USE_ENV_PROXY", "1"),
+            set("NO_UPDATE_NOTIFIER", "1"),
+            set("NO_COLOR", "1"),
+            set("FORCE_COLOR", "0"),
+            set("KUBECONFIG", null),
+            set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
+            set("GIT_TERMINAL_PROMPT", "0"),
+        ]),
+        Flavor::Kingpin | Flavor::GoFlags => env.extend([
             set("KUBECONFIG", null),
             set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
             set("GIT_TERMINAL_PROMPT", "0"),
@@ -1111,7 +1467,10 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
         // Cloud SDK's wrappers (bq, gsutil) load credentials, probing the GCE
         // metadata server without a proxy, and check for updates unless told
         // not to.
-        Flavor::BashFunction | Flavor::FishScript | Flavor::ZshFunction => env.extend([
+        Flavor::BashFunction
+        | Flavor::FishScript
+        | Flavor::ZshFunction
+        | Flavor::PowerShellCompleter => env.extend([
             set("KUBECONFIG", null),
             set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
             set("GH_PROMPT_DISABLED", "1"),
@@ -1120,7 +1479,19 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
             set("CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK", "true"),
             set("CLOUDSDK_AUTH_DISABLE_CREDENTIALS", "true"),
         ]),
-        Flavor::Argcomplete | Flavor::Git | Flavor::Posener => {}
+        // Composer stays offline and quiet; no completion debug log.
+        Flavor::Symfony => env.extend([
+            set("COMPOSER_DISABLE_NETWORK", "1"),
+            set("COMPOSER_NO_INTERACTION", "1"),
+            set("COMPOSER_NO_AUDIT", "1"),
+            set("SHELL_VERBOSITY", "0"),
+            set("NO_COLOR", "1"),
+            unset("SYMFONY_COMPLETION_DEBUG"),
+            set("KUBECONFIG", null),
+            set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
+        ]),
+        // oclif manifests are read, never run.
+        Flavor::Argcomplete | Flavor::Git | Flavor::Posener | Flavor::Oclif => {}
     }
     env
 }
@@ -1216,17 +1587,47 @@ impl NativeCompletionBackend for Backend {
             Flavor::Pip => "pip",
             Flavor::Npm => "npm",
             Flavor::Cargo => "cargo",
+            Flavor::Dotnet => "dotnet",
             Flavor::Urfave => "urfave",
             Flavor::Click => "click",
             Flavor::Kingpin => "kingpin",
+            Flavor::GoFlags => "go-flags",
+            Flavor::Yargs => "yargs",
+            Flavor::Oclif => "oclif",
+            Flavor::Symfony => "symfony",
             Flavor::Node => "node",
             Flavor::BashFunction => "bash",
             Flavor::FishScript => "fish",
             Flavor::ZshFunction => "zsh",
+            Flavor::PowerShellCompleter => "powershell-completer",
         }
     }
 
     fn location(&self) -> String {
+        if self.bash_memory().is_some() {
+            return format!(
+                "your bash session's completion function (via {})",
+                self.completer.display()
+            );
+        }
+        if self.fish_memory().is_some() {
+            return format!(
+                "your fish session's completions (via {})",
+                self.completer.display()
+            );
+        }
+        if let Some((_, function)) = self.zsh_memory() {
+            return format!(
+                "your zsh session's {function} (via {})",
+                self.completer.display()
+            );
+        }
+        if self.powershell_memory().is_some() {
+            return format!(
+                "your PowerShell session's argument completer (via {})",
+                self.completer.display()
+            );
+        }
         self.helper.as_ref().map_or_else(
             || self.completer.display().to_string(),
             |script| format!("{} (via {})", script.display(), self.completer.display()),
@@ -1238,6 +1639,9 @@ impl NativeCompletionBackend for Backend {
     }
 
     fn capabilities(&self) -> Capabilities {
+        if let Some(protocol) = &self.dotnet {
+            return protocol.capabilities(self.trust);
+        }
         if let Some(protocol) = &self.cargo {
             return protocol.capabilities(&self.name);
         }
@@ -1248,6 +1652,18 @@ impl NativeCompletionBackend for Backend {
             return protocol.capabilities(self.trust);
         }
         if let Some(protocol) = &self.kingpin {
+            return protocol.capabilities(self.trust);
+        }
+        if let Some(protocol) = &self.go_flags {
+            return protocol.capabilities(self.trust);
+        }
+        if let Some(protocol) = self.yargs() {
+            return protocol.capabilities(self.trust);
+        }
+        if let Some(protocol) = self.oclif() {
+            return protocol.capabilities();
+        }
+        if let Some(protocol) = self.symfony() {
             return protocol.capabilities(self.trust);
         }
         Capabilities {
@@ -1277,6 +1693,7 @@ impl NativeCompletionBackend for Backend {
                     | Flavor::BashFunction
                     | Flavor::FishScript
                     | Flavor::ZshFunction
+                    | Flavor::PowerShellCompleter
                     | Flavor::ClapDynamic
                     | Flavor::Pip
                     | Flavor::Node
@@ -1289,6 +1706,7 @@ impl NativeCompletionBackend for Backend {
                     | Flavor::BashFunction
                     | Flavor::FishScript
                     | Flavor::ZshFunction
+                    | Flavor::PowerShellCompleter
                     | Flavor::Pip
                     | Flavor::Npm
                     | Flavor::Node
@@ -1298,14 +1716,17 @@ impl NativeCompletionBackend for Backend {
                 Flavor::BashFunction
                     | Flavor::FishScript
                     | Flavor::ZshFunction
+                    | Flavor::PowerShellCompleter
                     | Flavor::Pip
                     | Flavor::Npm
             ),
-            descriptions: matches!(self.flavor, Flavor::Cobra | Flavor::FishScript)
-                || self
-                    .clap
-                    .as_deref()
-                    .is_some_and(clap::Protocol::descriptions),
+            descriptions: matches!(
+                self.flavor,
+                Flavor::Cobra | Flavor::FishScript | Flavor::PowerShellCompleter
+            ) || self
+                .clap
+                .as_deref()
+                .is_some_and(clap::Protocol::descriptions),
             query_dialect: match self.flavor {
                 Flavor::Cobra
                 | Flavor::Git
@@ -1315,10 +1736,77 @@ impl NativeCompletionBackend for Backend {
                 | Flavor::Node => None,
                 Flavor::Cargo => None,
                 Flavor::FishScript => Some(super::parser::Dialect::Fish),
+                Flavor::PowerShellCompleter => Some(super::parser::Dialect::PowerShell),
                 _ => Some(super::parser::Dialect::Posix),
             },
             trust: self.trust,
         }
+    }
+
+    fn option_separator(&self, typed: &str) -> Option<char> {
+        if let Some(protocol) = &self.go_flags {
+            return protocol.option_separator(typed);
+        }
+        self.dotnet.as_ref().and_then(|protocol| {
+            protocol
+                .option_syntax(typed)
+                .map(|(_, separator)| separator)
+        })
+    }
+
+    fn is_short_option(&self, typed: &str) -> bool {
+        self.go_flags.as_ref().map_or_else(
+            || typed.len() > 1 && !typed.starts_with("--"),
+            |protocol| protocol.is_short_option(typed),
+        )
+    }
+
+    fn option_name_len(&self, typed: &str) -> Option<usize> {
+        self.dotnet
+            .as_ref()?
+            .option_syntax(typed)
+            .map(|(length, _)| length)
+    }
+
+    fn resolve_option(
+        &self,
+        words: &[&str],
+        typed: &str,
+        _budget: &mut Budget,
+    ) -> Option<CompletionItem> {
+        self.dotnet.as_ref()?.resolve_option(words, typed)
+    }
+
+    fn option_prefix(&self, typed: &str) -> &'static str {
+        if let Some(protocol) = &self.go_flags {
+            return protocol.option_prefix(typed);
+        }
+        if self.flavor == Flavor::Dotnet && typed.starts_with('/') {
+            "/"
+        } else {
+            self.capabilities().option_prefix
+        }
+    }
+
+    fn is_option(&self, words: &[&str], item: &CompletionItem) -> bool {
+        item.is_option()
+            || self
+                .go_flags
+                .as_ref()
+                .is_some_and(|protocol| protocol.is_option(&item.value))
+            || self
+                .dotnet
+                .as_ref()
+                .is_some_and(|protocol| protocol.is_option(words, &item.value))
+    }
+
+    fn option_requires_value(
+        &self,
+        words: &[&str],
+        typed: &str,
+        next: Option<&str>,
+    ) -> Option<bool> {
+        self.dotnet.as_ref()?.requires_value(words, typed, next)
     }
 
     fn capabilities_for(&self, words: &[&str]) -> Capabilities {
@@ -1333,6 +1821,12 @@ impl NativeCompletionBackend for Backend {
         if let Some(protocol) = &self.click {
             return protocol.capabilities_for(words, self.trust);
         }
+        if let Some(protocol) = self.oclif() {
+            return protocol.capabilities_for(words);
+        }
+        if let Some(protocol) = self.symfony() {
+            return protocol.capabilities_for(words, self.trust);
+        }
         let mut capabilities = self.capabilities();
         if matches!(self.flavor, Flavor::Pip | Flavor::Npm) && words.is_empty() {
             capabilities.complete_subcommands = true;
@@ -1341,6 +1835,9 @@ impl NativeCompletionBackend for Backend {
     }
 
     fn candidates_are_resources(&self, words: &[&str]) -> bool {
+        if let Some(protocol) = &self.dotnet {
+            return protocol.resources(words);
+        }
         match self.flavor {
             Flavor::Pip => pip::resources(self, words),
             Flavor::Npm => npm::resources(self, words),
@@ -1349,6 +1846,23 @@ impl NativeCompletionBackend for Backend {
     }
 
     fn candidate_is_resource(&self, words: &[&str], item: &CompletionItem) -> bool {
+        if self.flavor == Flavor::GoFlags {
+            // This wire format cannot distinguish command names from
+            // callback-provided filenames or other local resources.
+            return !self.is_option(words, item);
+        }
+        if let Some(protocol) = self.yargs() {
+            return protocol.resource(self, words, item);
+        }
+        if let Some(protocol) = self.oclif() {
+            return protocol.resource(words, item);
+        }
+        if let Some(protocol) = self.symfony() {
+            return protocol.resource(words, item);
+        }
+        if let Some(protocol) = &self.dotnet {
+            return !self.is_option(words, item) && protocol.resources(words);
+        }
         if self.flavor == Flavor::Cargo {
             return item.value.starts_with('+') || cargo::resource_value(words);
         }
@@ -1359,9 +1873,11 @@ impl NativeCompletionBackend for Backend {
     }
 
     fn value_syntax_contains_slashes(&self, words: &[&str]) -> bool {
-        self.cargo
-            .as_ref()
-            .is_some_and(|protocol| protocol.feature_value(words))
+        self.flavor == Flavor::GoFlags
+            || self
+                .cargo
+                .as_ref()
+                .is_some_and(|protocol| protocol.feature_value(words))
     }
 
     fn prepare_value_candidates(
@@ -1370,6 +1886,9 @@ impl NativeCompletionBackend for Backend {
         typed: &str,
         items: Vec<CompletionItem>,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
+        if let Some(protocol) = &self.dotnet {
+            return Ok(protocol.prepare_values(words, typed, items));
+        }
         if self
             .cargo
             .as_ref()
@@ -1408,6 +1927,15 @@ impl NativeCompletionBackend for Backend {
         if let Some(protocol) = &self.click {
             return protocol.values(self, words, budget);
         }
+        if let Some(protocol) = self.yargs() {
+            return protocol.values(self, words, budget);
+        }
+        if let Some(protocol) = self.oclif() {
+            return protocol.values(words);
+        }
+        if let Some(protocol) = self.symfony() {
+            return protocol.values(self, words, budget);
+        }
         if matches!(
             self.flavor,
             Flavor::Pip | Flavor::Npm | Flavor::Urfave | Flavor::Kingpin
@@ -1435,9 +1963,13 @@ impl NativeCompletionBackend for Backend {
             Flavor::Pip
                 | Flavor::Npm
                 | Flavor::Cargo
+                | Flavor::Dotnet
                 | Flavor::Urfave
                 | Flavor::Click
                 | Flavor::Kingpin
+                | Flavor::Yargs
+                | Flavor::Oclif
+                | Flavor::Symfony
         ) {
             return self.complete_values(words, budget);
         }
@@ -1449,6 +1981,18 @@ impl NativeCompletionBackend for Backend {
     }
 
     fn confirms(&self, words: &[&str], typed: &str, budget: &mut Budget) -> Option<bool> {
+        if let Some(protocol) = self.yargs() {
+            return protocol.confirms(self, words, typed, budget);
+        }
+        if let Some(protocol) = self.symfony() {
+            return protocol.confirms(self, words, typed, budget);
+        }
+        if let Some(protocol) = &self.go_flags {
+            return protocol.confirms(self, words, typed, budget);
+        }
+        if let Some(protocol) = &self.dotnet {
+            return protocol.confirms(words, typed);
+        }
         if let Some(protocol) = &self.kingpin {
             return protocol.confirms(self, words, typed, budget);
         }
@@ -1512,6 +2056,12 @@ impl Backend {
         if let Some(protocol) = &self.cargo {
             return protocol.complete(self, words, prefix, budget);
         }
+        if self.flavor == Flavor::Dotnet {
+            let protocol = self.dotnet.as_ref().ok_or_else(|| {
+                CompletionError::Unsupported("no verified .NET SDK installation".into())
+            })?;
+            return protocol.complete(self, words, prefix, budget);
+        }
         if self.flavor == Flavor::Urfave {
             let protocol = self.urfave.as_ref().ok_or_else(|| {
                 CompletionError::Unsupported("no urfave/cli release was identified".into())
@@ -1521,20 +2071,60 @@ impl Backend {
         if let Some(protocol) = &self.kingpin {
             return protocol.complete(self, words, prefix, budget);
         }
+        if let Some(protocol) = &self.go_flags {
+            return protocol.complete(self, words, prefix, budget);
+        }
+        if let Some(protocol) = self.oclif() {
+            return protocol.complete(words, prefix);
+        }
+        if self.flavor == Flavor::Symfony {
+            let protocol = self.symfony().ok_or_else(|| {
+                CompletionError::Unsupported("no Symfony Console help was read".into())
+            })?;
+            return protocol.complete(self, words, prefix, budget);
+        }
+        if self.flavor == Flavor::Yargs {
+            let protocol = self.yargs().ok_or_else(|| {
+                CompletionError::Unsupported("no yargs completion evidence is known".into())
+            })?;
+            return protocol.complete(self, words, prefix, budget);
+        }
         if self.flavor == Flavor::Click {
             let protocol = self.click.as_ref().ok_or_else(|| {
                 CompletionError::Unsupported("no click completion variable is known".into())
             })?;
             return protocol.complete(self, words, prefix, budget);
         }
+        if let Some(registration) = self.powershell_memory() {
+            let key = ["powershell-completer"]
+                .into_iter()
+                .chain(words.iter().copied())
+                .chain([prefix])
+                .collect::<Vec<_>>();
+            let text = self.memoized(&key, || {
+                powershell_completer::query(
+                    &self.completer,
+                    registration,
+                    &self.name,
+                    words,
+                    prefix,
+                    env,
+                    budget,
+                )
+            })?;
+            return powershell_completer::parse(&text, &self.name, budget.max_candidates);
+        }
         if self.flavor == Flavor::BashFunction {
-            let script = self
-                .helper
-                .as_deref()
-                .ok_or_else(|| CompletionError::Unsupported("no completion script".into()))?;
+            let source = match (self.bash_memory(), self.helper.as_deref()) {
+                (Some(text), _) => bash::Source::Text(text),
+                (None, Some(script)) => bash::Source::File(script),
+                (None, None) => {
+                    return Err(CompletionError::Unsupported("no completion script".into()));
+                }
+            };
             return bash::complete(
                 &self.completer,
-                script,
+                &source,
                 &self.name,
                 words,
                 prefix,
@@ -1543,13 +2133,16 @@ impl Backend {
             );
         }
         if self.flavor == Flavor::FishScript {
-            let script = self
-                .helper
-                .as_deref()
-                .ok_or_else(|| CompletionError::Unsupported("no completion script".into()))?;
+            let source = match (self.fish_memory(), self.helper.as_deref()) {
+                (Some(text), _) => fish::Source::Text(text),
+                (None, Some(script)) => fish::Source::File(script),
+                (None, None) => {
+                    return Err(CompletionError::Unsupported("no completion script".into()));
+                }
+            };
             return fish::complete(
                 &self.completer,
-                script,
+                &source,
                 &self.name,
                 words,
                 prefix,
@@ -1558,13 +2151,21 @@ impl Backend {
             );
         }
         if self.flavor == Flavor::ZshFunction {
-            let script = self
-                .helper
-                .as_deref()
-                .ok_or_else(|| CompletionError::Unsupported("no completion function".into()))?;
+            let source = match (self.zsh_memory(), self.helper.as_deref()) {
+                (Some((definitions, function)), _) => zsh::Source::Text {
+                    definitions,
+                    function,
+                },
+                (None, Some(script)) => zsh::Source::File(script),
+                (None, None) => {
+                    return Err(CompletionError::Unsupported(
+                        "no completion function".into(),
+                    ));
+                }
+            };
             return zsh::complete(
                 &self.completer,
-                script,
+                &source,
                 &self.name,
                 words,
                 prefix,
@@ -1583,12 +2184,22 @@ impl Backend {
             | Flavor::BashFunction => line.chars().count(),
             Flavor::FishScript
             | Flavor::ZshFunction
+            | Flavor::PowerShellCompleter
             | Flavor::ClapDynamic
             | Flavor::Pip
             | Flavor::Npm => {
                 unreachable!("shell queries use their own driver")
             }
-            Flavor::Cargo | Flavor::Urfave | Flavor::Click | Flavor::Kingpin | Flavor::Node => {
+            Flavor::Cargo
+            | Flavor::Dotnet
+            | Flavor::Urfave
+            | Flavor::Click
+            | Flavor::Kingpin
+            | Flavor::GoFlags
+            | Flavor::Yargs
+            | Flavor::Oclif
+            | Flavor::Symfony
+            | Flavor::Node => {
                 unreachable!("these queries use their own bridge")
             }
             Flavor::Azure | Flavor::Argcomplete | Flavor::Posener => line.len(),
@@ -2130,6 +2741,7 @@ esac
             path: path.into(),
             libraries: libraries.iter().map(|l| l.to_string()).collect(),
             versions: Default::default(),
+            force_posix: false,
         };
         let cobra = "github.com/spf13/cobra";
         assert_eq!(

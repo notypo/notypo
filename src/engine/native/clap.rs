@@ -371,7 +371,7 @@ pub(super) fn discover_generated(
         budget,
         true,
     )?;
-    for command in docs::subcommands(&help)
+    for command in docs::subcommands(&help, name)
         .into_iter()
         .filter(|item| {
             [

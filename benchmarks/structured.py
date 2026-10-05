@@ -85,6 +85,8 @@ PROTOCOL_CASES = [
     ("npm protocol", "npm", "npm config lsit", "npm config list", ["npm:npm"], []),
     ("cargo protocol", "cargo", "cargo build --releae", "cargo build --release",
      ["rust:cargo"], ["rust:cargo"]),
+    ("dotnet protocol", "dotnet", "dotnet build --configuraton Release",
+     "dotnet build --configuration Release", ["dotnet:sdk"], []),
     ("clap protocol (sofka)", "sofka", "sofka --readoly", "sofka --readonly",
      ["sofka"], ["sofka"]),
     ("clap protocol (just shim)", "just", "just --dry-rnu", "just --dry-run", ["just"], []),
@@ -93,6 +95,8 @@ PROTOCOL_CASES = [
     ("cobra protocol (k9s, user-trusted)", "k9s", "k9s --readoly", "k9s --readonly",
      ["github.com/derailed/k9s"], []),
     ("bash handler protocol (bq)", "bq", "bq qeury x", "bq query x", ["bq"], []),
+    ("oclif manifests (eas)", "eas", "eas build --platfrom ios", "eas build --platform ios",
+     [], []),
 ]
 
 
@@ -130,7 +134,41 @@ def powershell_cases():
             "NOTYPO_DISABLED_SOURCES": "help:man:history:legacy",
         }
         cases.append((label, pwsh, command, overrides, expected))
+    # Apps' generated completers registered in a session, as a profile's
+    # `<app> completion powershell | Out-String | Invoke-Expression` leaves
+    # them; the variable is built by the integration function's own code.
+    for label, app, generator, command, expected in [
+        ("PowerShell completer protocol (mdbook)", "mdbook", "mdbook completions powershell",
+         "mdbook serv", "mdbook serve"),
+        ("PowerShell completer protocol (rustup)", "rustup", "rustup completions powershell",
+         "rustup toolchian list", "rustup toolchain list"),
+    ]:
+        if shutil.which(app) is None:
+            continue
+        overrides = {
+            "TF_SHELL": "powershell",
+            "NOTYPO_POWERSHELL": pwsh,
+            "NOTYPO_POWERSHELL_COMPLETIONS": session_completions(pwsh, generator, command),
+            "NOTYPO_TRUSTED_COMPLETERS": json.dumps([app]),
+            "NOTYPO_DISABLED_SOURCES": "help:man:history:legacy",
+        }
+        cases.append((label, app, command, overrides, expected))
     return cases
+
+
+def session_completions(pwsh, generator, line):
+    """NOTYPO_POWERSHELL_COMPLETIONS for `line` in a session that loaded the
+    completer `generator` prints, collected by the integration's own code."""
+    alias = subprocess.run([str(BINARY), "--alias"], capture_output=True, text=True, check=True,
+                           env=dict(os.environ, TF_SHELL="powershell")).stdout
+    start = alias.index("$env:NOTYPO_POWERSHELL_COMPLETIONS = try {")
+    end = alias.index("} catch { };", start) + len("} catch { };")
+    script = (f"{generator} | Out-String | Invoke-Expression\n"
+              f"$history = $env:NOTYPO_BENCH_LINE\n{alias[start:end]}\n"
+              "[Console]::Out.Write($env:NOTYPO_POWERSHELL_COMPLETIONS)")
+    return subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, check=True,
+                          env=dict(os.environ, NOTYPO_BENCH_LINE=line)).stdout
 
 
 def shell_fixtures(scratch):

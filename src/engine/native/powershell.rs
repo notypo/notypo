@@ -312,7 +312,7 @@ fn last<'d>(description: &'d mut Description, name: &str) -> Result<&'d mut Para
 
 /// The probe's environment: no profile code, telemetry, update checks, or
 /// network, and a module analysis cache of notypo's own.
-fn environment(query: &[(&str, &str)]) -> Vec<(OsString, Option<OsString>)> {
+pub(super) fn environment(query: &[(&str, &str)]) -> Vec<(OsString, Option<OsString>)> {
     let set = |k: &str, v: &str| (OsString::from(k), Some(OsString::from(v)));
     let mut env: Vec<_> = [
         "HTTP_PROXY",

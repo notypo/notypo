@@ -809,6 +809,11 @@ impl<'a> Run<'a> {
                 let path = PathBuf::from(target);
                 (path.is_absolute() && crate::utils::is_executable_file(&path)).then_some(path)
             };
+            if matches!(reported.target_kind.as_str(), "Function" | "Filter")
+                && let Some(resolution) = self.resolve_wrapper(&reported.target)
+            {
+                return Some(resolution);
+            }
             return Some(
                 match (reported.kind.as_str(), reported.target_kind.as_str()) {
                     ("", _) => Resolution::Missing,
@@ -842,6 +847,40 @@ impl<'a> Run<'a> {
             .iter()
             .any(|function| function.eq_ignore_ascii_case(name))
             .then_some(Resolution::ShellDefined)
+    }
+
+    /// A PowerShell function that only runs one command with its arguments
+    /// (`function gst { git status @args }`) resolves as an alias for that
+    /// command would: an application's vocabulary with the wrapper's words
+    /// as context, or a PowerShell command's parameters.
+    fn resolve_wrapper(&self, function: &str) -> Option<Resolution> {
+        let aliases = self.ctx.aliases();
+        if function.is_empty() || !aliases.contains_key(&function.to_lowercase()) {
+            return None;
+        }
+        let dialect = parser::Dialect::PowerShell;
+        let functions = self.ctx.shell.get_functions();
+        let shell_defined = |program: &str| {
+            (is_cmdlet_name(program) && self.ctx.which(program).is_none())
+                || functions.iter().any(|f| f.eq_ignore_ascii_case(program))
+        };
+        if let Some(target) = aliases::target(
+            function,
+            dialect,
+            aliases,
+            |program| self.ctx.which(program),
+            shell_defined,
+        ) {
+            return Some(Resolution::Alias(target));
+        }
+        let aliases::Expansion::Expanded(text) = aliases::expand(function, dialect, aliases) else {
+            return None;
+        };
+        let script = parser::parse_with_dialect(&text, dialect);
+        let program = script.commands.first()?.words.first()?.literal()?;
+        (is_cmdlet_name(program) && self.ctx.which(program).is_none()).then(|| {
+            Resolution::PowerShell(program.rsplit('\\').next().unwrap_or(program).to_owned())
+        })
     }
 
     /// The PowerShell that answers for PowerShell commands.
@@ -1398,6 +1437,15 @@ impl<'a> Run<'a> {
                         confirmed: vocabulary.authoritative,
                     }
                 } else if vocabulary.words.is_empty() {
+                    if !vocabulary.authoritative {
+                        // A partial handler that lists nothing here (zsh's
+                        // _swift completes files after `swift`) says nothing:
+                        // ask documentation, as for apps without a completer.
+                        let fallback = self.fallback_check(state, role, typed);
+                        if matches!(fallback, Check::Valid { .. } | Check::Invalid(_)) {
+                            return fallback;
+                        }
+                    }
                     if role == TokenRole::OptionName {
                         Check::Unknown
                     } else {
@@ -1416,7 +1464,13 @@ impl<'a> Run<'a> {
                     Check::Invalid(vocabulary)
                 }
             }
-            providers::Answer::NotApplicable | providers::Answer::Failed(_) => Check::Unknown,
+            // A broken completer is reported; documentation still applies.
+            providers::Answer::NotApplicable | providers::Answer::Failed(_) => {
+                match self.fallback_check(state, role, typed) {
+                    check @ (Check::Valid { .. } | Check::Invalid(_)) => check,
+                    _ => Check::Unknown,
+                }
+            }
         }
     }
 
@@ -1544,22 +1598,32 @@ impl<'a> Run<'a> {
                 }
                 // PowerShell parameters start with a letter (`-5` is a
                 // number) and take attached values after `:`.
-                let is_option = text.len() > 1
-                    && text.starts_with('-')
-                    && (!state.powershell
-                        || text[1..].starts_with(|c: char| c.is_alphabetic() || "_?".contains(c)));
-                let separator = if state.powershell { ':' } else { '=' };
-                let attached = is_option && text.contains(separator);
+                let backend = self.native.as_mut().and_then(|native| {
+                    native.backend(&state.program, state.path.as_ref(), &mut self.budget)
+                });
+                let protocol_separator = backend
+                    .as_ref()
+                    .and_then(|backend| backend.option_separator(text));
+                let is_option = protocol_separator.is_some()
+                    || (text.len() > 1
+                        && text.starts_with('-')
+                        && (!state.powershell
+                            || text[1..]
+                                .starts_with(|c: char| c.is_alphabetic() || "_?".contains(c))));
+                let separator =
+                    protocol_separator.unwrap_or(if state.powershell { ':' } else { '=' });
+                let name_len = backend
+                    .as_ref()
+                    .and_then(|backend| backend.option_name_len(text))
+                    .unwrap_or_else(|| text.find(separator).unwrap_or(text.len()));
+                let attached = is_option && name_len < text.len();
                 if !is_option && level == Level::Arguments {
                     state.context.push(text.to_owned());
                     i += 1;
                     continue;
                 }
                 let (role, typed) = if is_option {
-                    (
-                        TokenRole::OptionName,
-                        text.split(separator).next().unwrap_or(text),
-                    )
+                    (TokenRole::OptionName, &text[..name_len])
                 } else {
                     (TokenRole::Subcommand, text)
                 };
@@ -1582,6 +1646,17 @@ impl<'a> Run<'a> {
                                 detail: format!("{} completion lists `{text}`", state.program),
                             });
                         }
+                        let context: Vec<_> = state.context.iter().map(String::as_str).collect();
+                        let takes_value = backend
+                            .as_ref()
+                            .and_then(|backend| {
+                                backend.option_requires_value(
+                                    &context,
+                                    typed,
+                                    words.get(i + 1).and_then(|word| word.literal()),
+                                )
+                            })
+                            .or(takes_value);
                         pending_value = is_option && !attached && takes_value != Some(false);
                         if !is_option {
                             state.command_path.push(text.to_owned());
@@ -1624,7 +1699,7 @@ impl<'a> Run<'a> {
                         break;
                     }
                     Check::Invalid(_)
-                        if is_option && word.option_name_span_with(src, separator).is_none() =>
+                        if is_option && word.option_name_span_to(src, typed.len()).is_none() =>
                     {
                         // A quoted option name can't be edited in place.
                         pending_value = !attached;
@@ -1636,7 +1711,7 @@ impl<'a> Run<'a> {
                 };
                 let span = match role {
                     TokenRole::OptionName => word
-                        .option_name_span_with(src, separator)
+                        .option_name_span_to(src, typed.len())
                         .unwrap_or(word.span),
                     _ => word.span,
                 };
@@ -1661,6 +1736,28 @@ impl<'a> Run<'a> {
                     Branching::Branches(mut branches) => {
                         let mut checked = Vec::new();
                         for (branch, takes_value) in branches.drain(..) {
+                            let name = branch.context.last().map(|word| {
+                                let length = backend
+                                    .as_ref()
+                                    .and_then(|backend| backend.option_name_len(word))
+                                    .unwrap_or_else(|| word.find(separator).unwrap_or(word.len()));
+                                &word[..length]
+                            });
+                            let context: Vec<_> = branch.context
+                                [..branch.context.len().saturating_sub(1)]
+                                .iter()
+                                .map(String::as_str)
+                                .collect();
+                            let takes_value = backend
+                                .as_ref()
+                                .and_then(|backend| {
+                                    backend.option_requires_value(
+                                        &context,
+                                        name?,
+                                        words.get(i + 1).and_then(|word| word.literal()),
+                                    )
+                                })
+                                .or(takes_value);
                             let pending = is_option && !attached && takes_value != Some(false);
                             let values = if attached && takes_value != Some(false) {
                                 self.repair_attached_value(
@@ -1704,8 +1801,10 @@ impl<'a> Run<'a> {
             return vec![state];
         };
         let attached = state.context.pop().expect("the option was appended");
-        let (name, value) = attached
-            .split_once(separator)
+        let suffix_len = word.literal().expect("a literal option").len() - original_name.len();
+        let (name, suffix) = attached.split_at(attached.len() - suffix_len);
+        let value = suffix
+            .strip_prefix(separator)
             .expect("an attached option value");
         if let Some(vocabulary) = self.check_value(&state, &[name], value)
             && let Branching::Branches(branches) = self.branch(
@@ -1788,7 +1887,7 @@ impl<'a> Run<'a> {
         let history = self.history.as_ref();
         let uses =
             |word: &str| history.map_or(0, |h| h.uses(&state.program, &state.command_path, word));
-        let ranked = within_window(ranking::rank_tokens_as(
+        let mut ranked = within_window(ranking::rank_tokens_as(
             comparison(role),
             typed,
             vocabulary.words.iter().map(|v| v.value.as_str()),
@@ -1796,6 +1895,12 @@ impl<'a> Run<'a> {
             &uses,
             BEAM,
         ));
+        if !vocabulary.authoritative {
+            // A word a partial list omits may be valid. One only as close as
+            // the floor (`x` and `MX`: half the letters differ) is no
+            // evidence against it.
+            ranked.retain(|(_, score)| score.total > ranking::FLOOR);
+        }
         if ranked.is_empty() && !vocabulary.authoritative {
             return Branching::NotSuspicious;
         }
@@ -2114,7 +2219,7 @@ fn attached_value_span(
     name: &str,
     separator: char,
 ) -> Option<Span> {
-    let name_span = word.option_name_span_with(src, separator)?;
+    let name_span = word.option_name_span_to(src, name.len())?;
     let raw = &src[name_span.end..word.span.end];
     let value = raw.strip_prefix(separator)?;
     (name_span.of(src) == name
@@ -2750,6 +2855,79 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
                 .candidates()
                 .is_empty()
         );
+    }
+
+    /// A completer that answers every slot the same way.
+    #[derive(Debug)]
+    struct Fixed {
+        answer: Result<Vec<native::CompletionItem>, native::CompletionError>,
+        complete: bool,
+    }
+
+    impl native::NativeCompletionBackend for Fixed {
+        fn id(&self) -> &str {
+            "fixed"
+        }
+
+        fn capabilities(&self) -> native::Capabilities {
+            native::Capabilities {
+                subcommands: true,
+                options: true,
+                option_arity: false,
+                values: false,
+                resources: false,
+                option_prefix: "-",
+                short_options: false,
+                complete_options: self.complete,
+                complete_subcommands: self.complete,
+                descriptions: false,
+                query_dialect: None,
+                trust: native::Trust::UserTrusted,
+            }
+        }
+
+        fn complete(
+            &self,
+            _words: &[&str],
+            _prefix: &str,
+            _budget: &mut Budget,
+        ) -> Result<Vec<native::CompletionItem>, native::CompletionError> {
+            self.answer.clone()
+        }
+    }
+
+    #[test]
+    fn documentation_answers_where_a_partial_or_broken_completer_says_nothing() {
+        let fake = fake_aws();
+        let tool = fake.dir.script(
+            "bin/tool",
+            "#!/bin/sh\n[ \"$*\" = --help ] || exit 1\nprintf 'Commands:\\n  build    Build it\\n  deploy   Ship it\\n'\n",
+        );
+        let settings = Settings {
+            trusted_help: vec!["tool".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("tool", Some(tool.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let run = |answer, complete| {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Fixed { answer, complete });
+            let report =
+                correct_with_backends(&failure("tool biuld"), &ctx, vec![("tool".into(), backend)]);
+            report
+                .outcome
+                .candidates()
+                .first()
+                .map(|c| c.script.clone())
+        };
+        // zsh's _swift lists nothing after `swift`; swift's help lists commands.
+        assert_eq!(run(Ok(Vec::new()), false).as_deref(), Some("tool build"));
+        let broken = Err(native::CompletionError::Failed("exited with 2".into()));
+        assert_eq!(run(broken, false).as_deref(), Some("tool build"));
+        // A complete list with nothing in it means no subcommands here.
+        assert_eq!(run(Ok(Vec::new()), true), None);
     }
 
     const NESTED_HELP: &str = r#"#!/bin/sh
@@ -3988,7 +4166,10 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
             report.notes
         );
         for (source, expected) in [
-            ("node --requir ./x.js app.js", Some("node --require ./x.js app.js")),
+            (
+                "node --requir ./x.js app.js",
+                Some("node --require ./x.js app.js"),
+            ),
             ("node --wacth app.js", Some("node --watch app.js")),
             // The script's options are its own, even after `--inspect`.
             ("node --inspect app.js --prot 80", None),
@@ -4002,7 +4183,9 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
                 report.notes
             );
         }
-        assert!(!dir.0.join("bin/ran").exists(), "only node's own listings ran");
+        assert!(
+            !dir.0.join("bin/ran").exists(),
+            "only node's own listings ran"
+        );
     }
-
 }

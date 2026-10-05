@@ -115,7 +115,7 @@ const DESTRUCTIVE_VERBS: &[&str] = &[
 const PACKAGE_MANAGERS: &[&str] = &[
     "apt", "apt-get", "aptitude", "yum", "dnf", "zypper", "pacman", "yay", "paru", "brew", "port",
     "pip", "pip3", "pipx", "npm", "pnpm", "yarn", "gem", "cargo", "snap", "flatpak", "apk",
-    "nix-env", "choco", "winget", "scoop", "conda", "mamba", "uv",
+    "nix-env", "choco", "winget", "scoop", "conda", "mamba", "uv", "microdnf", "dnf5",
 ];
 const PACKAGE_VERBS: &[&str] = &[
     "install",
@@ -543,6 +543,17 @@ fn assess_resolved(
         if let Some(flag) = args.iter().find(|a| FORCE_LONG.contains(a)) {
             gate.flag(Decision::Confirm, format!("uses {flag}"));
         }
+        // AWS CDK's way of skipping its own confirmation, as -auto-approve does.
+        if args.contains(&"--require-approval=never")
+            || args
+                .windows(2)
+                .any(|pair| pair[0] == "--require-approval" && pair[1] == "never")
+        {
+            gate.flag(
+                Decision::Confirm,
+                "uses --require-approval never".to_owned(),
+            );
+        }
         if FORCE_SHORT.contains(&program)
             && let Some(flag) = args.iter().find(|a| {
                 a.len() > 1
@@ -561,10 +572,15 @@ fn assess_resolved(
                 format!("git {} can discard or rewrite data", verbs[0]),
             );
         }
+        // oclif ids join topics with `:` (`heroku apps:destroy`); there a
+        // `reset` empties a resource (`heroku pg:reset`, `repo:reset`).
         if let Some(verb) = verbs.iter().find(|v| {
-            DESTRUCTIVE_VERBS
-                .iter()
-                .any(|d| **v == *d || v.starts_with(&format!("{d}-")))
+            v.split(':').enumerate().any(|(i, part)| {
+                i > 0 && part == "reset"
+                    || DESTRUCTIVE_VERBS
+                        .iter()
+                        .any(|d| part == *d || part.starts_with(&format!("{d}-")))
+            })
         }) {
             gate.flag(
                 Decision::Confirm,
@@ -735,6 +751,16 @@ mod tests {
         let unrelated = dir.script("unrelated", "#!/bin/sh\n# An unrelated application\n");
         dir.script("rust/lib/rustlib/manifest-cargo-test", "file:bin/cargo\n");
         let cargo = dir.script("rust/bin/cargo", "#!/bin/sh\n");
+        let dotnet = dir.script("sdk-install/dotnet", "#!/bin/sh\n");
+        dir.script("sdk-install/sdk/10.0.401/.version", "commit\n10.0.401\n");
+        dir.script(
+            "sdk-install/sdk/10.0.401/dotnet.deps.json",
+            r#"{"libraries":{"dotnet.deps.json/10.0.401":{}}}"#,
+        );
+        dir.script(
+            "sdk-install/sdk/10.0.401/dotnet.dll",
+            "CompleteCommand GetCompletions",
+        );
         for shell in [Shell::Bash, Shell::Fish, Shell::Tcsh] {
             let ctx = Context::new(Settings::default(), shell, "fuck".into())
                 .with_which("package-tool", Some(pip.to_str().unwrap()))
@@ -742,6 +768,7 @@ mod tests {
                 .with_which("js-packages", Some(npm.to_str().unwrap()))
                 .with_which("js-runner", Some(npx.to_str().unwrap()))
                 .with_which("rust-packages", Some(cargo.to_str().unwrap()))
+                .with_which("sdk-host", Some(dotnet.to_str().unwrap()))
                 .with_which("unrelated", Some(unrelated.to_str().unwrap()));
             let dialect = parser::Dialect::for_shell(shell).unwrap();
             for source in [
@@ -771,6 +798,7 @@ mod tests {
                 "js-packages view install",
                 "unrelated install example",
                 "rust-packages version",
+                "sdk-host --version",
             ] {
                 let script = parser::parse_with_dialect(source, dialect);
                 assert_eq!(
@@ -801,6 +829,12 @@ mod tests {
                 "rust-packages test",
                 "env X=1 rust-packages publish",
                 "sudo -n rust-packages danger",
+                "sdk-host build",
+                "sdk-host run --project app.csproj",
+                "sdk-host test",
+                "sdk-host tool install example",
+                "env X=1 sdk-host unknown-extension",
+                "sudo -n sdk-host nuget locals all --clear",
             ] {
                 let script = parser::parse_with_dialect(source, dialect);
                 assert_eq!(
@@ -848,6 +882,8 @@ mod tests {
                 "if gti diff; then echo y; fi",
                 "if git diff; then echo y; fi",
             ),
+            ("heroku apps:inof --app x", "heroku apps:info --app x"),
+            ("git rset HEAD a.txt", "git reset HEAD a.txt"),
         ] {
             let gate = check(original, candidate);
             assert_eq!(
@@ -887,6 +923,17 @@ mod tests {
             ("ssh hots", "ssh host"),
             ("cp a.txt /tmp/b", "cp a.txt /tmp/c"),
             ("tofu aply -auto-approve", "tofu apply -auto-approve"),
+            (
+                "cdk deploy --require-approval nevr",
+                "cdk deploy --require-approval never",
+            ),
+            ("heroku apps:destory --app x", "heroku apps:destroy --app x"),
+            ("heroku addons:destory pg", "heroku addons:destroy pg"),
+            ("heroku repo:resett --app x", "heroku repo:reset --app x"),
+            (
+                "cdk deploy --require-aproval=never",
+                "cdk deploy --require-approval=never",
+            ),
             ("ls", "for x in a; do ls; done"),
             (
                 "for f in $(ls); do ctt $f; done",

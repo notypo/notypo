@@ -6,7 +6,10 @@
 //! started with, or set by the app, and an app ignoring it just runs. So it
 //! comes from evidence only: an installed click script (read, never
 //! sourced), or, under `trusted_help`, a Python console script whose own
-//! help carries click's signature and names the program click uses.
+//! help carries click's signature and names the program click uses. An app
+//! that rewords click's help option (oci) counts when its help has click's
+//! `Usage: <prog> [OPTIONS]` line and click 8 is installed beside the app's
+//! own module, in the site-packages its interpreter reads.
 //!
 //! Resolving the context runs parameter type conversions and callbacks
 //! (without prompts), as the app's own completion does; command callbacks
@@ -18,7 +21,7 @@ use super::{Backend, Capabilities, CompletionError, CompletionItem, Flavor, Trus
 use crate::engine::cache::fingerprint;
 use crate::engine::probe::Budget;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Protocol {
@@ -150,9 +153,17 @@ impl Protocol {
         if !help.contains("Show this message and exit.") {
             return None;
         }
+        Self::from_usage(help, path, false)
+    }
+
+    /// The program click's usage line names. With `options`, the line must
+    /// have click's own shape, `Usage: <prog> [OPTIONS]`.
+    fn from_usage(help: &str, path: &Path, options: bool) -> Option<Self> {
         let program = help.lines().find_map(|line| {
             let line = line.trim_matches(|c: char| c.is_whitespace() || "│┃|".contains(c));
-            line.strip_prefix("Usage: ")?.split_whitespace().next()
+            let mut words = line.strip_prefix("Usage: ")?.split_whitespace();
+            let program = words.next()?;
+            (!options || words.next() == Some("[OPTIONS]")).then_some(program)
         })?;
         Some(Self {
             variable: variable_for(program)?,
@@ -320,6 +331,7 @@ fn parse(text: &str, limit: usize) -> Result<Vec<CompletionItem>, CompletionErro
 /// runs; no completion variable is set unless the help shows click's.
 pub(super) fn discover_from_help(
     path: &Path,
+    identity: Option<&str>,
     budget: &mut Budget,
 ) -> Result<Option<Protocol>, CompletionError> {
     let before = app_fingerprint(path);
@@ -330,7 +342,16 @@ pub(super) fn discover_from_help(
         budget,
         true,
     )?;
-    let Some(protocol) = Protocol::from_help(&help, path) else {
+    let module = identity
+        .and_then(|identity| identity.strip_prefix("python:"))
+        .and_then(|module| module.split('.').next());
+    let protocol = Protocol::from_help(&help, path).or_else(|| {
+        module
+            .is_some_and(|module| click_8_beside(path, module))
+            .then(|| Protocol::from_usage(&help, path, true))
+            .flatten()
+    });
+    let Some(protocol) = protocol else {
         return Ok(None);
     };
     if protocol.application_fingerprint != before {
@@ -339,6 +360,56 @@ pub(super) fn discover_from_help(
         ));
     }
     Ok(Some(protocol))
+}
+
+/// Whether click 8 is installed in the site-packages that holds `module`,
+/// the console script's own top-level package, for the interpreter its
+/// shebang names: a virtualenv or a Homebrew `libexec`. Only directory
+/// names are read.
+fn click_8_beside(script: &Path, module: &str) -> bool {
+    let Some(site) = site_packages(script, module) else {
+        return false;
+    };
+    std::fs::read_dir(&site).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).take(4096).any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("click-8.") && name.ends_with(".dist-info")
+        })
+    })
+}
+
+fn site_packages(script: &Path, module: &str) -> Option<PathBuf> {
+    if module.is_empty()
+        || !module
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return None;
+    }
+    let real = std::fs::canonicalize(script).ok()?;
+    let head = super::head(&real, 4096);
+    let interpreter = head
+        .lines()
+        .next()?
+        .strip_prefix("#!")?
+        .split_whitespace()
+        .next()?;
+    let prefix = Path::new(interpreter).parent()?.parent()?;
+    let mut libs: Vec<PathBuf> = std::fs::read_dir(prefix.join("lib"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|lib| {
+            lib.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("python"))
+        })
+        .take(64)
+        .collect();
+    libs.sort();
+    libs.into_iter()
+        .map(|lib| lib.join("site-packages"))
+        .find(|site| site.join(module).is_dir() || site.join(format!("{module}.py")).is_file())
 }
 
 #[cfg(all(test, unix))]
@@ -467,6 +538,52 @@ esac
 
     fn values(items: &[CompletionItem]) -> Vec<&str> {
         items.iter().map(|item| item.value.as_str()).collect()
+    }
+
+    /// oci-cli rewords click's help option; click 8 beside the app's own
+    /// module, in its interpreter's site-packages, plus click's usage line
+    /// stand in for the signature.
+    #[test]
+    fn click_usage_counts_with_click_8_beside_the_apps_module() {
+        let dir = Dir::new("click-site");
+        let python = dir.script("venv/bin/python3", "");
+        let script = dir.script(
+            "venv/bin/app",
+            &format!(
+                "#!{}\nimport sys\nfrom app_mod.cli import cli\nsys.exit(cli())\n",
+                python.display()
+            ),
+        );
+        let site = dir.0.join("venv/lib/python3.14/site-packages");
+        dir.script("venv/lib/python3.14/site-packages/app_mod/__init__.py", "");
+        assert!(!click_8_beside(&script, "app_mod"), "no click installed");
+        std::fs::create_dir_all(site.join("click-7.1.2.dist-info")).unwrap();
+        assert!(
+            !click_8_beside(&script, "app_mod"),
+            "click 7 speaks another protocol"
+        );
+        std::fs::create_dir_all(site.join("click-8.4.2.dist-info")).unwrap();
+        assert!(click_8_beside(&script, "app_mod"));
+        assert!(
+            !click_8_beside(&script, "other_mod"),
+            "not the app's site-packages"
+        );
+        assert!(!click_8_beside(&script, "../app_mod"));
+        let help = "Usage: app [OPTIONS] [COMMAND] [ARGS]...\n\nOptions:\n  -?, -h, --help  For detailed help, enter <command> --help.\n";
+        assert_eq!(Protocol::from_help(help, &script), None);
+        assert_eq!(
+            Protocol::from_usage(help, &script, true).map(|p| p.variable),
+            Some("_APP_COMPLETE".to_owned())
+        );
+        assert_eq!(
+            Protocol::from_usage("usage: app [-h] {a,b}\n", &script, true),
+            None,
+            "argparse's usage line"
+        );
+        assert_eq!(
+            Protocol::from_usage("Usage: app COMMAND\n", &script, true),
+            None
+        );
     }
 
     #[test]

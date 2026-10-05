@@ -111,6 +111,37 @@ fn base_name(program: &str) -> String {
 /// The project file listing with `program` would evaluate from `cwd`.
 fn project_file(program: &str, cwd: &Path) -> Option<PathBuf> {
     let name = base_name(program);
+    if name == "dotnet" {
+        // Completion evaluates a project in cwd. Parent-level SDK selection
+        // and imports can also supply custom SDKs and property functions.
+        let project = cwd.ancestors().find_map(|directory| {
+            std::fs::read_dir(directory).ok().and_then(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                            let extension = e.to_ascii_lowercase();
+                            extension.ends_with("proj")
+                                || ["sln", "slnx"].contains(&extension.as_str())
+                        })
+                    })
+            })
+        });
+        return project.or_else(|| {
+            cwd.ancestors()
+                .flat_map(|dir| {
+                    [
+                        "global.json",
+                        "Directory.Build.props",
+                        "Directory.Build.targets",
+                        "Directory.Packages.props",
+                    ]
+                    .map(|file| dir.join(file))
+                })
+                .find(|path| path.exists())
+        });
+    }
     let (_, files, upward) = EVALUATORS
         .iter()
         .find(|(names, _, _)| names.contains(&name.as_str()))?;
@@ -211,6 +242,54 @@ mod tests {
     impl Drop for Dir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn dotnet_project_and_parent_imports_require_workspace_trust() {
+        let root = Dir::new("dotnet");
+        let project = root.0.join("app");
+        std::fs::create_dir_all(project.join("nested")).unwrap();
+        assert_eq!(untrusted_project("dotnet", &project, &[]), None);
+        for file in [
+            "app.csproj",
+            "app.fsproj",
+            "app.vbproj",
+            "app.proj",
+            "app.vcxproj",
+            "app.sqlproj",
+            "app.sln",
+            "app.slnx",
+        ] {
+            let path = project.join(file);
+            std::fs::write(&path, "").unwrap();
+            assert!(
+                untrusted_project("dotnet.exe", &project, &[]).is_some(),
+                "{file}"
+            );
+            assert_eq!(
+                untrusted_project("dotnet", &project, &[project.display().to_string()]),
+                None
+            );
+            assert!(
+                untrusted_project("dotnet", &project.join("nested"), &[]).is_some(),
+                "parent {file}"
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+        for file in [
+            "global.json",
+            "Directory.Build.props",
+            "Directory.Build.targets",
+            "Directory.Packages.props",
+        ] {
+            let path = root.0.join(file);
+            std::fs::write(&path, "").unwrap();
+            assert!(
+                untrusted_project("dotnet", &project.join("nested"), &[]).is_some(),
+                "{file}"
+            );
+            std::fs::remove_file(path).unwrap();
         }
     }
 

@@ -11,7 +11,7 @@ use super::probe::Budget;
 use super::{Source, TokenRole};
 use crate::types::Context;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 /// A position in a command that needs a valid word.
@@ -151,6 +151,17 @@ impl Workspace<'_> {
         let cwd = self.cwd.clone().or_else(|| std::env::current_dir().ok())?;
         crate::workspace::untrusted_project(program, &cwd, self.trusted)
     }
+
+    fn refuses_resolved(&self, program: &str, path: &Path) -> Option<String> {
+        self.refuses(program).or_else(|| {
+            (native::package_manager_name(path) == Some("dotnet"))
+                .then(|| {
+                    self.refuses("dotnet")
+                        .or_else(|| self.refuses(&path.to_string_lossy()))
+                })
+                .flatten()
+        })
+    }
 }
 
 impl<'c> NativeCompletion<'c> {
@@ -227,7 +238,10 @@ impl<'c> NativeCompletion<'c> {
                 return None;
             }
         };
-        let words: Vec<CompletionItem> = items.into_iter().filter(|i| !i.is_option()).collect();
+        let words: Vec<CompletionItem> = items
+            .into_iter()
+            .filter(|i| !backend.is_option(&query, i))
+            .collect();
         if words.is_empty() {
             return None;
         }
@@ -353,7 +367,7 @@ impl<'c> NativeCompletion<'c> {
         budget: &mut Budget,
     ) -> Option<Rc<dyn NativeCompletionBackend>> {
         if !self.backends.contains_key(program) {
-            let refused = path.and_then(|_| self.workspace.refuses(program));
+            let refused = path.and_then(|path| self.workspace.refuses_resolved(program, path));
             let found = match path {
                 None => None,
                 Some(_) if refused.is_some() => {
@@ -373,7 +387,19 @@ impl<'c> NativeCompletion<'c> {
                         budget,
                     ) {
                         Discovery::Found(mut backend) => {
-                            backend.network = self.network;
+                            if backend.flavor == native::Flavor::Dotnet
+                                && let Some(why) = self.workspace.refuses("dotnet")
+                            {
+                                self.note(format!("{program}: completion not probed: {why}"));
+                                self.backends.insert(program.to_owned(), None);
+                                return None;
+                            }
+                            backend.set_workspace(
+                                self.workspace.trusted,
+                                self.workspace.cwd.as_deref(),
+                            );
+                            backend.network =
+                                self.network && backend.flavor != native::Flavor::Dotnet;
                             self.note(format!(
                                 "{program}: native completion via {} ({} protocol{}, {}); {}",
                                 backend.location(),
@@ -429,12 +455,12 @@ impl CandidateProvider for NativeCompletion<'_> {
         let context: Vec<&str> = slot.context.iter().map(String::as_str).collect();
         let capabilities = backend.capabilities_for(&context);
         let options = slot.role == TokenRole::OptionName;
-        let short = slot.typed.len() > 1 && !slot.typed.starts_with("--");
+        let short = backend.is_short_option(slot.typed);
         if options && short && !capabilities.short_options {
             return Answer::NotApplicable;
         }
         let prefix = if options {
-            capabilities.option_prefix
+            backend.option_prefix(slot.typed)
         } else {
             ""
         };
@@ -482,7 +508,7 @@ impl CandidateProvider for NativeCompletion<'_> {
             Ok(items) => {
                 let words: Vec<_> = items
                     .into_iter()
-                    .filter(|i| i.is_option() == options)
+                    .filter(|i| backend.is_option(&context, i) == options)
                     .collect();
                 let resources = if !options {
                     words
@@ -505,6 +531,17 @@ impl CandidateProvider for NativeCompletion<'_> {
                     cached,
                     resources,
                 })
+            }
+            // SDK refusals cover untrusted projects and line shapes its
+            // tokenizer cannot preserve. They do not prove a positional word
+            // is valid, and their reason must remain visible to the user.
+            Err(error @ CompletionError::Unsupported(_)) if backend.id() == "dotnet" => {
+                self.note(format!(
+                    "{} completion after `{}`: {error}",
+                    slot.program,
+                    slot.context.join(" ")
+                ));
+                Answer::Failed(error.to_string())
             }
             // The protocol has no data for this position (gcloud's static
             // tree and positionals): nothing here is a subcommand.
@@ -742,7 +779,7 @@ impl ManPages {
         );
         let options = match output {
             Ok(out) if out.status == Some(0) => super::docs::options(
-                &super::docs::strip_overstrike(&String::from_utf8_lossy(&out.data)),
+                &super::docs::strip_formatting(&String::from_utf8_lossy(&out.data)),
             ),
             _ => Vec::new(),
         };
@@ -812,11 +849,19 @@ impl<'c> HelpText<'c> {
         commands: &[String],
         budget: &mut Budget,
     ) -> Option<&str> {
-        let trusted = self.trusted.iter().any(|t| t == "*" || t == program);
-        if !trusted || !super::probe::is_trusted_location(path) {
+        if !super::probe::is_trusted_location(path) {
             return None;
         }
-        if let Some(why) = self.workspace.refuses(program) {
+        // An entry names the program or, as for completion, the installed
+        // app's identity (`python:oci_cli`), which is read only when needed.
+        let trusted = self.trusted.iter().any(|t| t == "*" || t == program)
+            || self.trusted.iter().any(|t| t.contains(':'))
+                && native::app_identity(path)
+                    .is_some_and(|identity| self.trusted.contains(&identity));
+        if !trusted {
+            return None;
+        }
+        if let Some(why) = self.workspace.refuses_resolved(program, path) {
             let note = format!("{program}: --help not read: {why}");
             if !self.notes.contains(&note) {
                 self.notes.push(note);
@@ -840,7 +885,7 @@ impl<'c> HelpText<'c> {
                     .get(&(path.clone(), commands[..depth - 1].to_vec()))
                     .and_then(|text| text.as_deref())
                     .is_some_and(|text| {
-                        super::docs::subcommands(text)
+                        super::docs::subcommands(text, program)
                             .iter()
                             .any(|item| item.value == commands[depth - 1])
                     });
@@ -909,7 +954,7 @@ impl<'c> HelpText<'c> {
                 return None;
             }
         };
-        Some(super::docs::strip_overstrike(&String::from_utf8_lossy(
+        Some(super::docs::strip_formatting(&String::from_utf8_lossy(
             &output.data,
         )))
     }
@@ -971,7 +1016,7 @@ impl CandidateProvider for HelpText<'_> {
                     words = super::docs::option_values(text, option);
                     break;
                 }
-                _ => super::docs::subcommands(text),
+                _ => super::docs::subcommands(text, slot.program),
             };
             for item in items {
                 if !words
@@ -1241,6 +1286,42 @@ fi
             "the trusted name's memo must not bypass the alias's trust policy"
         );
         assert!(!dir.0.join("ran").exists());
+    }
+
+    /// trusted_help may name the installed app's identity, as
+    /// trusted_completers may: a Python console script's entry module.
+    #[test]
+    fn help_trust_may_name_the_apps_identity() {
+        if crate::utils::which("python3").is_none() {
+            return;
+        }
+        let dir = Dir::new("help-identity");
+        let path = dir.script(
+            "tool",
+            "#!/usr/bin/env python3\nimport sys\nfrom app_mod.cli import main\nsys.exit(main())\n",
+        );
+        dir.script("app_mod/__init__.py", "");
+        dir.script(
+            "app_mod/cli.py",
+            "import sys\ndef main():\n    print('Commands:\\n  build    Build')\n    return 0\n",
+        );
+        let words = |trusted: Vec<String>| {
+            let mut help = HelpText::new(&trusted);
+            match help.vocabulary(&slot(&path, &[]), &mut budget()) {
+                Answer::Words(vocabulary) => vocabulary
+                    .words
+                    .into_iter()
+                    .map(|w| w.value)
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            }
+        };
+        assert_eq!(words(vec!["python:app_mod".into()]), ["build"]);
+        assert!(words(vec!["python:other".into()]).is_empty());
+        assert!(
+            words(vec!["app_mod".into()]).is_empty(),
+            "a name is the program's"
+        );
     }
 
     #[test]

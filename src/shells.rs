@@ -20,6 +20,162 @@ pub enum Shell {
     Powershell,
 }
 
+/// PowerShell code for the integration function: the argument completers
+/// the session registered (`Register-ArgumentCompleter`) for the failed
+/// line's command names and the programs their aliases run. Each completer's
+/// text follows a `#notypo-command <name>` line, after its script's `using
+/// namespace` lines; then a `#notypo-functions` line, those namespaces, and
+/// the function definitions of the scripts that created the completers (the
+/// profile, a dot-sourced file, or `Invoke-Expression`'s text), which are
+/// passed rather than the scripts themselves. PowerShell keeps registrations
+/// in an internal table, read here by reflection; any failure passes nothing.
+/// Windows limits a variable to 32767 characters. Public for the opt-in
+/// installed-app checks, which run it against real generated scripts.
+#[doc(hidden)]
+pub const POWERSHELL_COMPLETERS: &str = r#"$env:NOTYPO_POWERSHELL_COMPLETIONS = try {
+            $notypo_keys = @(foreach ($notypo_ast in [System.Management.Automation.Language.Parser]::ParseInput($history, [ref]$null, [ref]$null).FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
+                $notypo_name = $notypo_ast.GetCommandName();
+                if (-not $notypo_name) { continue }
+                $notypo_name;
+                $notypo_found = Get-Command -Name ([WildcardPattern]::Escape($notypo_name)) -ErrorAction Ignore | Select-Object -First 1;
+                if ($notypo_found -and $notypo_found.CommandType -eq 'Alias') { $notypo_found = $notypo_found.ResolvedCommand }
+                if ($notypo_found -and $notypo_found.CommandType -eq 'Application') { $notypo_found.Name; [System.IO.Path]::GetFileNameWithoutExtension($notypo_found.Name) }
+            });
+            $notypo_flags = [System.Reflection.BindingFlags]'NonPublic,Instance';
+            $notypo_context = $ExecutionContext.GetType().GetField('_context', $notypo_flags).GetValue($ExecutionContext);
+            $notypo_native = $notypo_context.GetType().GetProperty('NativeArgumentCompleters', $notypo_flags).GetValue($notypo_context);
+            $notypo_roots = [System.Collections.Generic.List[object]]::new();
+            $notypo_seen = @{};
+            $notypo_parts = @(foreach ($notypo_key in $notypo_keys) {
+                $notypo_block = $null;
+                if (-not $notypo_native -or $notypo_seen.ContainsKey($notypo_key) -or -not $notypo_native.TryGetValue($notypo_key, [ref]$notypo_block) -or -not $notypo_block) { continue }
+                $notypo_seen[$notypo_key] = 1;
+                $notypo_body = $notypo_block.ToString();
+                if ($notypo_body -match '(?m)^#notypo-') { continue }
+                $notypo_root = $notypo_block.Ast;
+                while ($notypo_root.Parent) { $notypo_root = $notypo_root.Parent }
+                if (-not $notypo_roots.Contains($notypo_root)) { $notypo_roots.Add($notypo_root) }
+                '#notypo-command ' + $notypo_key;
+                foreach ($notypo_using in $notypo_root.UsingStatements) { if ([string]$notypo_using.UsingStatementKind -eq 'Namespace') { $notypo_using.Extent.Text } }
+                $notypo_body
+            });
+            if ($notypo_parts.Count) {
+                $notypo_usings = @(foreach ($notypo_root in $notypo_roots) { foreach ($notypo_using in $notypo_root.UsingStatements) { if ([string]$notypo_using.UsingStatementKind -eq 'Namespace') { $notypo_using.Extent.Text } } }) | Select-Object -Unique;
+                $notypo_functions = @(foreach ($notypo_root in $notypo_roots) { foreach ($notypo_function in $notypo_root.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) { $notypo_function.Extent.Text } });
+                $notypo_text = (@($notypo_parts) + '#notypo-functions' + @($notypo_usings) + $notypo_functions) -join "`n";
+                $notypo_limit = if ([System.Environment]::OSVersion.Platform -eq 'Win32NT') { 32000 } else { 65536 };
+                if ($notypo_text.Length -le $notypo_limit -and -not $notypo_text.Contains([char]0)) { $notypo_text }
+            }
+        } catch { };"#;
+
+/// bash code for the integration function: the definitions of the
+/// functions named in the previous command (and, one level down, in those
+/// definitions), each after a `#notypo-function` line, so a function that
+/// only runs one command with `"$@"` can stand for that command. Only
+/// definitions are printed; none is run.
+const BASH_WRAPPERS: &str = r#"local -x NOTYPO_SHELL_WRAPPERS="$(
+                    set -f
+                    notypo_queue=$(fc -ln -2 2>/dev/null || fc -ln -1 2>/dev/null) notypo_seen=' ' notypo_out=
+                    for notypo_pass in 1 2; do
+                        notypo_next=
+                        for notypo_word in $notypo_queue; do
+                            case $notypo_word in (-*|*[!A-Za-z0-9_.:+@%-]*) continue;; esac
+                            case $notypo_seen in (*" $notypo_word "*) continue;; esac
+                            [ "$notypo_word" = "${FUNCNAME[0]}" ] && continue
+                            declare -F -- "$notypo_word" >/dev/null 2>&1 || continue
+                            notypo_seen="$notypo_seen$notypo_word "
+                            notypo_text=$(declare -f -- "$notypo_word")
+                            [ ${#notypo_text} -le 4096 ] || continue
+                            notypo_out="$notypo_out#notypo-function"$'\n'"$notypo_text"$'\n'
+                            notypo_next="$notypo_next $notypo_text"
+                        done
+                        notypo_queue=$notypo_next
+                    done
+                    [ ${#notypo_out} -le 65536 ] && printf '%s' "$notypo_out"
+                )";"#;
+
+/// zsh's version of [`BASH_WRAPPERS`], with `functions`.
+const ZSH_WRAPPERS: &str = r##"local -x NOTYPO_SHELL_WRAPPERS="$(
+                    local notypo_word notypo_text notypo_out= notypo_pass
+                    local -a notypo_queue notypo_next notypo_seen
+                    notypo_queue=( ${(z)"$(fc -ln -2 2>/dev/null)"} )
+                    for notypo_pass in 1 2; do
+                        notypo_next=()
+                        for notypo_word in $notypo_queue; do
+                            [[ $notypo_word == -* || $notypo_word == ${funcstack[1]} ]] && continue
+                            (( ${notypo_seen[(Ie)$notypo_word]} )) && continue
+                            (( ${+functions[$notypo_word]} )) || continue
+                            notypo_seen+=( $notypo_word )
+                            notypo_text=$(functions -- $notypo_word)
+                            (( ${#notypo_text} <= 4096 )) || continue
+                            notypo_out+="#notypo-function"$'\n'$notypo_text$'\n'
+                            notypo_next+=( ${(z)notypo_text} )
+                        done
+                        notypo_queue=( $notypo_next )
+                    done
+                    (( ${#notypo_out} <= 65536 )) && print -rn -- $notypo_out
+                )";"##;
+
+/// fish code for the integration function: the aliases (`alias g=git`
+/// makes a function described `alias g=git`) among the failed line's words,
+/// and those their values start with, listed as fish's own `alias` prints
+/// them (`alias g git`). Only these names are looked at, so the session's
+/// other functions are neither listed nor autoloaded.
+const FISH_ALIASES: &str = r#"set -lx TF_SHELL_ALIASES
+  set -lx NOTYPO_SHELL_WRAPPERS
+  set -l notypo_names $notypo_wanted
+  set -l notypo_listed
+  while set -q notypo_names[1]; and test (count $notypo_listed) -lt 16
+    set -l notypo_name $notypo_names[1]
+    set -e notypo_names[1]
+    contains -- $notypo_name $notypo_listed (status current-function); and continue
+    functions -q -- $notypo_name; or continue
+    set -a notypo_listed $notypo_name
+    set -l notypo_value (functions --details --verbose -- $notypo_name)[5]
+    if set notypo_value (string replace -r -- '^alias '(string escape --style=regex -- $notypo_name)'[= ]' '' $notypo_value)
+      set -a TF_SHELL_ALIASES "alias $notypo_name "(string escape -- $notypo_value)
+      printf '%s' $notypo_value | read -lat notypo_first
+      set -q notypo_first[1]; and set -a notypo_names $notypo_first[1]
+    else
+      set notypo_value (functions --no-details -- $notypo_name | string collect)
+      test (string length -- "$notypo_value") -le 4096; or continue
+      set -a NOTYPO_SHELL_WRAPPERS '#notypo-function' $notypo_value
+      set -a notypo_names (string split -n ' ' -- (string replace -a \n ' ' -- $notypo_value))
+    end
+  end
+  set TF_SHELL_ALIASES (string join \n -- $TF_SHELL_ALIASES | string collect)
+  set NOTYPO_SHELL_WRAPPERS (string join \n -- $NOTYPO_SHELL_WRAPPERS | string collect)
+  test (string length -- "$NOTYPO_SHELL_WRAPPERS") -le 65536; or set NOTYPO_SHELL_WRAPPERS"#;
+
+/// PowerShell code for the integration function: the session's functions
+/// that only run one command with their arguments (`function gst { git
+/// status @args }`, PowerShell's way of writing an alias with arguments),
+/// as `name<TAB>command` lines. Only literal words and parameters may come
+/// before `$args`/`@args`; anything else is not reported.
+const POWERSHELL_WRAPPERS: &str = r#"$env:NOTYPO_POWERSHELL_WRAPPERS = try {
+            $notypo_wrappers = @(foreach ($notypo_function in Get-ChildItem -Path function:) {
+                $notypo_body = $notypo_function.ScriptBlock.Ast;
+                if ($notypo_body -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                    if ($notypo_body.Parameters) { continue }
+                    $notypo_body = $notypo_body.Body
+                }
+                if ($notypo_body -isnot [System.Management.Automation.Language.ScriptBlockAst] -or $notypo_body.ParamBlock -or $notypo_body.DynamicParamBlock -or $notypo_body.BeginBlock -or $notypo_body.ProcessBlock -or -not $notypo_body.EndBlock -or $notypo_body.EndBlock.Traps -or $notypo_body.EndBlock.Statements.Count -ne 1) { continue }
+                $notypo_pipeline = $notypo_body.EndBlock.Statements[0];
+                if ($notypo_pipeline -isnot [System.Management.Automation.Language.PipelineAst] -or $notypo_pipeline.PipelineElements.Count -ne 1) { continue }
+                $notypo_command = $notypo_pipeline.PipelineElements[0];
+                if ($notypo_command -isnot [System.Management.Automation.Language.CommandAst] -or $notypo_command.Redirections.Count -or [string]$notypo_command.InvocationOperator -notin 'Unknown', 'Ampersand') { continue }
+                $notypo_elements = @($notypo_command.CommandElements);
+                $notypo_last = $notypo_elements[-1];
+                if ($notypo_elements.Count -lt 2 -or $notypo_last -isnot [System.Management.Automation.Language.VariableExpressionAst] -or $notypo_last.VariablePath.UserPath -ne 'args') { continue }
+                $notypo_words = @($notypo_elements[0..($notypo_elements.Count - 2)]);
+                if (@($notypo_words | Where-Object { $_ -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -and $_ -isnot [System.Management.Automation.Language.CommandParameterAst] }).Count) { continue }
+                $notypo_text = ($notypo_words | ForEach-Object { $_.Extent.Text }) -join ' ';
+                if ($notypo_text -match '[\x00-\x1f\x7f]' -or $notypo_function.Name -match '[\x00-\x1f\x7f]') { continue }
+                $notypo_function.Name + "`t" + $notypo_text
+            }) -join "`n";
+            if ($notypo_wrappers.Length -le 16384) { $notypo_wrappers }
+        } catch { };"#;
+
 /// How to install the alias (`Generic.how_to_configure`).
 /// How the parent PowerShell session resolved one command name of the
 /// failed line, with `Get-Command` in that session.
@@ -368,6 +524,31 @@ impl Shell {
             function {name} () {{
                 local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${{PIPESTATUS[*]}}\";
                 local -x NOTYPO_SHELL_FUNCTIONS=\"$(compgen -A function -X '_*')\";
+                {BASH_WRAPPERS}
+                local -x NOTYPO_BASH_COMPLETIONS=\"$(
+                    set -f; shopt -s extdebug
+                    notypo_specs=$(complete -p 2>/dev/null) notypo_found= notypo_files=
+                    for notypo_word in $(fc -ln -2 2>/dev/null || fc -ln -1 2>/dev/null); do
+                        while IFS= read -r notypo_spec; do
+                            case $notypo_spec in (*\" -F \"*\" $notypo_word\") ;; (*) continue;; esac
+                            case $notypo_found in (*\"$notypo_spec\"*) continue;; esac
+                            notypo_found=\"$notypo_found$notypo_spec\"$'\\n'
+                            notypo_function=${{notypo_spec#* -F }}
+                            notypo_file=$(declare -F \"${{notypo_function%% *}}\")
+                            notypo_files=\"$notypo_files ${{notypo_file#* * }}\"$'\\n'
+                        done <<< \"$notypo_specs\"
+                    done
+                    [ -n \"$notypo_found\" ] || exit 0
+                    notypo_names=
+                    while IFS= read -r notypo_line; do
+                        case $notypo_files in
+                            (*\" ${{notypo_line#* * }}\"$'\\n'*) notypo_names=\"$notypo_names ${{notypo_line%% *}}\";;
+                        esac
+                    done <<< \"$(declare -F $(compgen -A function))\"
+                    [ -n \"$notypo_names\" ] || exit 0
+                    notypo_text=\"$notypo_found#notypo-functions\"$'\\n'\"$(declare -f $notypo_names)\"
+                    [ ${{#notypo_text}} -le 65536 ] && printf '%s' \"$notypo_text\"
+                )\";
                 export TF_SHELL=bash;
                 export TF_ALIAS={name};
                 export TF_SHELL_ALIASES=$(alias);
@@ -391,6 +572,25 @@ impl Shell {
                 local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${{pipestatus[*]}}\";
                 local -x NOTYPO_ZSH_FPATH=\"${{(j.:.)fpath}}\";
                 local -x NOTYPO_SHELL_FUNCTIONS=\"${{(k)functions[(I)[^_]*]}}\";
+                {ZSH_WRAPPERS}
+                local -x NOTYPO_ZSH_COMPLETIONS=\"$(
+                    zmodload zsh/parameter 2>/dev/null
+                    local notypo_word notypo_f notypo_src notypo_specs=
+                    local -a notypo_names
+                    for notypo_word in ${{(z)\"$(fc -ln -2 2>/dev/null)\"}}; do
+                        notypo_f=${{_comps[$notypo_word]-}}
+                        [[ -n $notypo_f && $notypo_specs != *\"compdef $notypo_f $notypo_word\"* ]] || continue
+                        [[ -n ${{functions[$notypo_f]-}} && ${{functions[$notypo_f]}} != *'builtin autoload -X'* ]] || continue
+                        notypo_src=${{functions_source[$notypo_f]-}}
+                        [[ ${{notypo_src:t}} == $notypo_f ]] && continue
+                        notypo_specs+=\"compdef $notypo_f $notypo_word\"$'\\n'
+                        notypo_names+=( $notypo_f )
+                        [[ -n $notypo_src ]] && notypo_names+=( ${{(k)functions_source[(R)${{(b)notypo_src}}]}} )
+                    done
+                    [[ -n $notypo_specs ]] || exit 0
+                    notypo_text=\"$notypo_specs#notypo-functions\"$'\\n'\"$(functions -- ${{(u)notypo_names}})\"
+                    (( ${{#notypo_text}} <= 65536 )) && print -rn -- \"$notypo_text\"
+                )\";
                 local -x NOTYPO_CURRENT_COMMAND=\"${{history[$HISTCMD]-}}\";
                 export TF_SHELL=zsh;
                 export TF_ALIAS={name};
@@ -418,6 +618,38 @@ impl Shell {
                  set -lx NOTYPO_PIPESTATUS (string join ' ' -- $notypo_status[2..-1])\n  \
                  set -lx NOTYPO_SHELL_FUNCTIONS (functions --names | string match -v '_*')\n  \
                  set -lx NOTYPO_FISH_COMPLETE_PATH (string join ':' -- $fish_complete_path)\n  \
+                 set -lx NOTYPO_FISH_COMPLETIONS\n  \
+                 set -l notypo_completions\n  \
+                 set -l notypo_wanted\n  \
+                 printf '%s' \"$history[1]\" | read -lat notypo_words\n  \
+                 for notypo_word in $notypo_words[1..16]\n  \
+                   string match -q -- '-*' $notypo_word; and continue\n  \
+                   contains -- $notypo_word $notypo_wanted; and continue\n  \
+                   set -a notypo_wanted $notypo_word\n  \
+                   set -l notypo_spec (complete --command $notypo_word)\n  \
+                   set -q notypo_spec[1]; or continue\n  \
+                   set -a notypo_completions \"#notypo-command $notypo_word\" $notypo_spec\n  \
+                 end\n  \
+                 {FISH_ALIASES}\n  \
+                 set -l notypo_defs\n  \
+                 if set -q notypo_completions[1]\n  \
+                   set -l notypo_text $notypo_completions\n  \
+                   for notypo_pass in 1 2\n  \
+                     for notypo_name in (functions --all --names)\n  \
+                       contains -- $notypo_name $notypo_defs; and continue\n  \
+                       string match -q -- \"*$notypo_name*\" $notypo_text; or continue\n  \
+                       set -l notypo_path (functions --details $notypo_name)\n  \
+                       string match -q -- 'embedded:*' $notypo_path; and continue\n  \
+                       string match -q -- \"$__fish_data_dir/*\" $notypo_path; and continue\n  \
+                       set -a notypo_defs $notypo_name\n  \
+                       set -a notypo_text (functions $notypo_name)\n  \
+                     end\n  \
+                   end\n  \
+                   set -l notypo_memory (string join \\n -- $notypo_completions '#notypo-functions' (test -n \"$notypo_defs[1]\"; and functions $notypo_defs) | string collect)\n  \
+                   if test (string length -- \"$notypo_memory\") -le 65536\n  \
+                     set NOTYPO_FISH_COMPLETIONS \"$notypo_memory\"\n  \
+                   end\n  \
+                 end\n  \
                  set -l notypo_history fish\n  \
                  if set -q fish_history\n    \
                  set notypo_history \"$fish_history\"\n  \
@@ -461,7 +693,8 @@ impl Shell {
             // history entry stand in for an exit status and output: 127 when
             // a command wasn't found, a native program's exit code when only
             // it failed, 1 for other errors. `Get-Command` in the session
-            // reports what each command name of the line resolves to.
+            // reports what each command name of the line resolves to, and
+            // the session's argument completers for them are passed along.
             Shell::Powershell => format!(
                 "function {name} {{\n    \
                  $notypo_succeeded = $?;\n    \
@@ -481,13 +714,15 @@ impl Shell {
                  $notypo_found = Get-Command -Name ([WildcardPattern]::Escape($_)) -ErrorAction Ignore | Select-Object -First 1; \
                  $notypo_runs = if ($notypo_found -and $notypo_found.CommandType -eq 'Alias') {{ $notypo_found.ResolvedCommand }} else {{ $notypo_found }}; \
                  \"$_`t$($notypo_found.CommandType)`t$($notypo_runs.CommandType)`t$(if ($notypo_runs.CommandType -eq 'Application') {{ $notypo_runs.Source }} else {{ $notypo_runs.Name }})\" }}) -join \"`n\";\n        \
+                 {POWERSHELL_COMPLETERS}\n        \
                  $env:NOTYPO_CURRENT_COMMAND = $history;\n        \
                  $env:NOTYPO_POWERSHELL = (Get-Process -Id $PID).Path;\n        \
                  $env:TF_SHELL = 'powershell';\n        \
                  $env:TF_ALIAS = '{name}';\n        \
                  $env:NOTYPO_SHELL_FUNCTIONS = (Get-ChildItem alias:, function: -Name) -join ' ';\n        \
+                 {POWERSHELL_WRAPPERS}\n        \
                  $fuck = $(& {exe} $args);\n        \
-                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
+                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_POWERSHELL_COMPLETIONS, Env:NOTYPO_POWERSHELL_WRAPPERS, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
                  if (-not [string]::IsNullOrWhiteSpace($fuck)) {{\n            \
                  if ($fuck.StartsWith(\"echo\")) {{ $fuck = $fuck.Substring(5); }}\n            \
                  else {{ iex \"$fuck\"; }}\n        }}\n    }}\n    [Console]::ResetColor() \n}}\n"
@@ -572,14 +807,28 @@ impl Shell {
         })
     }
 
-    /// Shell aliases, memoized for the process. Fish functions are supplied
+    /// Shell aliases, memoized for the process. Fish aliases are supplied
     /// by the active parent shell; discovery must not start an interactive
     /// fish that executes the user's configuration.
     pub fn get_aliases(self) -> &'static HashMap<String, String> {
         static ALIASES: OnceLock<HashMap<String, String>> = OnceLock::new();
         ALIASES.get_or_init(|| match self {
-            Shell::Bash | Shell::Zsh => {
-                parse_aliases(self, &env::var("TF_SHELL_ALIASES").unwrap_or_default())
+            Shell::Bash | Shell::Zsh | Shell::Fish => {
+                let mut aliases =
+                    parse_aliases(self, &env::var("TF_SHELL_ALIASES").unwrap_or_default());
+                // An alias of the same name runs instead of the function.
+                let dialect = if self == Shell::Fish {
+                    crate::engine::parser::Dialect::Fish
+                } else {
+                    crate::engine::parser::Dialect::Posix
+                };
+                for (name, command) in crate::engine::aliases::wrappers(
+                    &env::var("NOTYPO_SHELL_WRAPPERS").unwrap_or_default(),
+                    dialect,
+                ) {
+                    aliases.entry(name).or_insert(command);
+                }
+                aliases
             }
             Shell::Tcsh => utils::run_stdout("tcsh", &["-ic", "alias"])
                 .map(|out| {
@@ -589,7 +838,10 @@ impl Shell {
                         .collect()
                 })
                 .unwrap_or_default(),
-            Shell::Generic | Shell::Powershell | Shell::Fish => HashMap::new(),
+            Shell::Powershell => parse_powershell_wrappers(
+                &env::var("NOTYPO_POWERSHELL_WRAPPERS").unwrap_or_default(),
+            ),
+            Shell::Generic => HashMap::new(),
         })
     }
 
@@ -819,8 +1071,12 @@ impl Shell {
     }
 }
 
-/// Parses `alias` output from bash (`alias ll='ls -l'`) or zsh (`ll='ls -l'`).
+/// Parses `alias` output from bash (`alias ll='ls -l'`), zsh (`ll='ls -l'`),
+/// or fish (`alias ll 'ls -l'`, read with fish's quoting).
 pub fn parse_aliases(shell: Shell, raw: &str) -> HashMap<String, String> {
+    if shell == Shell::Fish {
+        return raw.lines().filter_map(parse_fish_alias).collect();
+    }
     raw.split('\n')
         .filter(|line| !line.is_empty() && line.contains('='))
         .filter_map(|line| {
@@ -841,6 +1097,51 @@ pub fn parse_aliases(shell: Shell, raw: &str) -> HashMap<String, String> {
             Some((name.to_owned(), value.to_owned()))
         })
         .collect()
+}
+
+/// `name<TAB>command` lines for the PowerShell session's wrapper functions,
+/// keyed by lowercased name: PowerShell ignores case in command names.
+pub fn parse_powershell_wrappers(text: &str) -> HashMap<String, String> {
+    let mut wrappers = HashMap::new();
+    for line in text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let Some((name, command)) = line.split_once('\t') else {
+            continue;
+        };
+        if name.is_empty()
+            || command.trim().is_empty()
+            || line.chars().any(|c| c.is_control() && c != '\t')
+        {
+            continue;
+        }
+        wrappers
+            .entry(name.to_lowercase())
+            .or_insert_with(|| command.to_owned());
+    }
+    wrappers
+}
+
+/// One `alias <name> <value>` line: three literal words.
+fn parse_fish_alias(line: &str) -> Option<(String, String)> {
+    use crate::engine::parser::{Dialect, parse_with_dialect};
+    let script = parse_with_dialect(line, Dialect::Fish);
+    let [command] = script.commands.as_slice() else {
+        return None;
+    };
+    if !script.is_fully_supported()
+        || !script.compounds.is_empty()
+        || !command.assignments.is_empty()
+        || !command.redirections.is_empty()
+    {
+        return None;
+    }
+    match command.words.as_slice() {
+        [alias, name, value] if alias.literal() == Some("alias") => {
+            let name = name.literal().filter(|name| !name.is_empty())?;
+            Some((name.to_owned(), value.literal()?.to_owned()))
+        }
+        _ => None,
+    }
 }
 
 /// Process name / parent lookup for shell detection (psutil in Python).
@@ -965,6 +1266,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn powershell_wrappers_are_read_by_lowercased_name() {
+        let wrappers = parse_powershell_wrappers(
+            "gst\tgit status\r\nLL\tGet-ChildItem -Force\ngst\tgit log\nbroken\nempty\t \nx\tgit\u{7}\n",
+        );
+        assert_eq!(wrappers["gst"], "git status", "the first line wins");
+        assert_eq!(wrappers["ll"], "Get-ChildItem -Force");
+        assert_eq!(wrappers.len(), 2, "{wrappers:?}");
+    }
+
+    #[test]
     fn powershell_session_reports_are_read_by_lowercased_name() {
         let report = parse_powershell_commands(
             "gci\tAlias\tCmdlet\tGet-ChildItem\r\n\
@@ -1026,6 +1337,21 @@ mod tests {
         let zsh = parse_aliases(Shell::Zsh, "l='ls -CF'\nla='ls -A'\ngst=git status");
         assert_eq!(zsh["gst"], "git status");
         assert_eq!(zsh.len(), 3);
+    }
+
+    /// fish's `alias` listing quotes values with fish's own rules.
+    #[test]
+    fn parses_fish_alias_listings() {
+        let fish = parse_aliases(
+            Shell::Fish,
+            "alias g git\nalias gs 'git status'\nalias e 'echo $HOME'\nalias q 'it\\'s'\n\
+             alias bad (ls)\nalias two words here\nalias\nalias '' x\nnot-alias a b",
+        );
+        assert_eq!(fish["g"], "git");
+        assert_eq!(fish["gs"], "git status");
+        assert_eq!(fish["e"], "echo $HOME", "single quotes keep `$` literal");
+        assert_eq!(fish["q"], "it's");
+        assert_eq!(fish.len(), 4, "{fish:?}");
     }
 
     #[test]

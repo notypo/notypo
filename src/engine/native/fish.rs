@@ -2,6 +2,12 @@
 //! `complete --do-complete`; it never evaluates the failed command. Loading
 //! a script and its callbacks executes code, so discovery requires the
 //! program to be listed in `trusted_completers`.
+//!
+//! Completions the user's session registered in memory (in `config.fish`,
+//! or by `tool completion fish | source`) have no script. The shell
+//! integration passes `complete --command` output for the previous
+//! command's words and the user functions those lines call (two levels
+//! deep, without fish's own helpers), which the driver loads.
 
 use super::{CompletionError, CompletionItem, run_stdout};
 use crate::engine::parser::{self, Dialect};
@@ -15,7 +21,14 @@ const DRIVER: &str = r#"# Older fish releases store the standard helpers on disk
 if test -d $argv[4]
     set -g fish_function_path $argv[4]
 end
-source $argv[1] >/dev/null 2>&1; or exit 3
+switch $argv[5]
+    case file
+        source $argv[1] >/dev/null 2>&1; or exit 3
+    case text
+        printf '%s\n' $argv[1] | source >/dev/null 2>&1; or exit 3
+    case '*'
+        exit 3
+end
 set -l app $argv[2]
 set -l line $argv[3]
 if test (count (complete --command $app)) -eq 0
@@ -123,9 +136,48 @@ pub(super) fn embedded(name: &str, budget: &mut Budget) -> Option<(PathBuf, Path
     }
 }
 
+/// Where the completions come from.
+pub(super) enum Source<'a> {
+    File(&'a Path),
+    /// Registrations and definitions passed by the parent session.
+    Text(&'a str),
+}
+
+/// The variable the fish integration fills: per command, a
+/// `#notypo-command <word>` line and its `complete` lines; then a
+/// `#notypo-functions` line and `functions` output.
+const MEMORY: &str = "NOTYPO_FISH_COMPLETIONS";
+const MEMORY_LIMIT: usize = 64 * 1024;
+
+/// Code that registers the session's completions for `name`.
+pub(super) fn memory_script(name: &str) -> Option<String> {
+    memory_script_in(&std::env::var(MEMORY).ok()?, name)
+}
+
+fn memory_script_in(text: &str, name: &str) -> Option<String> {
+    if text.len() > MEMORY_LIMIT || text.contains('\0') {
+        return None;
+    }
+    let (specs, definitions) = text.split_once("#notypo-functions\n").unwrap_or((text, ""));
+    let header = format!("#notypo-command {name}");
+    let mut lines = specs.lines().skip_while(|line| *line != header).skip(1);
+    let registrations: Vec<&str> = lines
+        .by_ref()
+        .take_while(|line| !line.starts_with("#notypo-command "))
+        .collect();
+    if registrations.is_empty()
+        || !registrations
+            .iter()
+            .all(|line| line.starts_with("complete "))
+    {
+        return None;
+    }
+    Some(format!("{definitions}\n{}\n", registrations.join("\n")))
+}
+
 pub(super) fn complete(
     fish: &Path,
-    script: &Path,
+    source: &Source<'_>,
     name: &str,
     words: &[&str],
     prefix: &str,
@@ -147,6 +199,10 @@ pub(super) fn complete(
         .and_then(Path::parent)
         .map(|prefix| prefix.join("share/fish/functions"))
         .unwrap_or_default();
+    let (mode, code, shown): (&str, OsString, String) = match source {
+        Source::File(script) => ("file", script.into(), script.display().to_string()),
+        Source::Text(text) => ("text", text.into(), "your fish session".into()),
+    };
     let text = run_stdout(
         fish,
         vec![
@@ -154,10 +210,11 @@ pub(super) fn complete(
             "--private".into(),
             "-c".into(),
             DRIVER.into(),
-            script.into(),
+            code,
             name.into(),
             line.into(),
             functions.into(),
+            mode.into(),
         ],
         env,
         budget,
@@ -165,10 +222,7 @@ pub(super) fn complete(
     )
     .map_err(|error| match error {
         CompletionError::Failed(why) if why == "exited with Some(5)" => {
-            CompletionError::Unsupported(format!(
-                "{} registers no completion for {name}",
-                script.display()
-            ))
+            CompletionError::Unsupported(format!("{shown} registers no completion for {name}"))
         }
         other => other,
     })?;
@@ -239,6 +293,43 @@ mod tests {
     use super::super::{Backend, Flavor, NativeCompletionBackend, tests::Dir};
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn session_completions_select_their_command_and_carry_helpers() {
+        let text = "#notypo-command tool\ncomplete tool -l release\ncomplete --no-files tool -a 'build deploy' -n __tool_needs\n#notypo-command other\ncomplete other -l x\n#notypo-functions\nfunction __tool_needs\n return 0\nend\n";
+        let script = memory_script_in(text, "tool").unwrap();
+        assert!(script.starts_with("function __tool_needs"), "{script}");
+        assert!(script.ends_with("-n __tool_needs\n"), "{script}");
+        assert!(!script.contains("complete other"));
+        assert_eq!(memory_script_in(text, "missing"), None);
+        assert_eq!(
+            memory_script_in(
+                "#notypo-command tool\nrm -rf x\n#notypo-functions\n",
+                "tool"
+            ),
+            None,
+            "only complete lines"
+        );
+        let session = memory_script_in(text, "tool").unwrap();
+        let Some(fish) = crate::utils::which("fish") else {
+            return;
+        };
+        let mut budget = Budget::new(Duration::from_secs(20), Duration::from_secs(5), 8);
+        let items = complete(
+            &fish,
+            &Source::Text(&session),
+            "tool",
+            &[],
+            "",
+            Vec::new(),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>(),
+            ["build", "deploy"]
+        );
+    }
 
     #[test]
     fn embedded_scripts_are_materialized_once_per_fish_binary() {

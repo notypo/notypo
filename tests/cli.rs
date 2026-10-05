@@ -51,6 +51,9 @@ impl Workspace {
             .env_remove("NOTYPO_CURRENT_COMMAND")
             .env_remove("NOTYPO_EXIT_STATUS")
             .env_remove("NOTYPO_SHELL_FUNCTIONS")
+            .env_remove("NOTYPO_BASH_COMPLETIONS")
+            .env_remove("NOTYPO_ZSH_COMPLETIONS")
+            .env_remove("NOTYPO_FISH_COMPLETIONS")
             .env_remove("NOTYPO_POWERSHELL")
             .env_remove("NOTYPO_POWERSHELL_COMMANDS")
             .env_remove("NOTYPO_POWERSHELL_ERRORS")
@@ -1495,6 +1498,517 @@ fn shell_aliases_pass_function_names() {
     }
 }
 
+/// A completion function defined in the session (`eval "$(tool
+/// completion bash)"`) has no file; the bash function passes its
+/// definitions, which notypo evaluates without running the session's code.
+#[test]
+fn bash_passes_session_completion_functions_without_running_its_startup() {
+    let Some(bash) = notypo::utils::which("bash") else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let tool = bin.join("tool");
+    fs::write(&tool, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = finish(
+        workspace
+            .command("")
+            .env("TF_SHELL", "bash")
+            .arg("--alias")
+            .spawn()
+            .unwrap(),
+    );
+    let alias = String::from_utf8(output.stdout).unwrap();
+    let marker = workspace.0.join("startup-marker");
+    let generated = "_tool() { case \"${COMP_WORDS[*]}\" in \"tool \") COMPREPLY=(build deploy);; esac; }\ncomplete -F _tool tool";
+    let script = format!(
+        "{alias}\neval \"$(printf '%s\\n' '{generated}')\"\n_unrelated() {{ touch '{}'; }}\nset -o history\nhistory -s 'tool biuld'\nfuck --explain\n",
+        marker.display()
+    );
+    let output = finish(
+        workspace
+            .program(&bash, "")
+            .env("TF_SHELL", "bash")
+            .env("PATH", system_path(&bin))
+            .env("HISTFILE", workspace.0.join("history"))
+            .env("NOTYPO_TRUSTED_COMPLETERS", "tool")
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy")
+            .args(["--norc", "--noprofile", "-i", "-c"])
+            .arg(&script)
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("your bash session's completion function"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1. tool build"), "{stderr}");
+    assert!(!marker.exists(), "only definitions were evaluated");
+}
+
+/// zsh's version: a handler from `source <(tool completion zsh)` is passed
+/// with the other functions from that source, and runs in a real widget.
+#[test]
+fn zsh_passes_session_completion_functions_without_running_its_startup() {
+    let Some(zsh) = notypo::utils::which("zsh") else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let tool = bin.join("tool");
+    fs::write(&tool, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = finish(
+        workspace
+            .command("")
+            .env("TF_SHELL", "zsh")
+            .arg("--alias")
+            .spawn()
+            .unwrap(),
+    );
+    let alias = String::from_utf8(output.stdout).unwrap();
+    let marker = workspace.0.join("startup-marker");
+    let generated = format!(
+        "_tool() {{ _tool_commands; }}; _tool_commands() {{ _arguments '1:command:(build deploy)'; }}; _tool_unrelated() {{ touch '{}'; }}; compdef _tool tool",
+        marker.display()
+    );
+    let script = format!(
+        "autoload -Uz compinit\ncompinit -u -D\n{alias}\nsource <(print -r -- \"{generated}\")\nHISTSIZE=50\nfc -p\nprint -s -- 'tool biuld'\nfuck --explain\n"
+    );
+    let output = finish(
+        workspace
+            .program(&zsh, "")
+            .env("TF_SHELL", "zsh")
+            .env("PATH", system_path(&bin))
+            .env("HISTFILE", workspace.0.join("history"))
+            .env("NOTYPO_TRUSTED_COMPLETERS", "tool")
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy")
+            .args(["-f", "-i", "-c"])
+            .arg(&script)
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("your zsh session's _tool"), "{stderr}");
+    assert!(stderr.contains("1. tool build"), "{stderr}");
+    assert!(!marker.exists(), "only definitions were evaluated");
+}
+
+/// fish's version: completions registered in the session, with the user
+/// function their condition calls, are passed and loaded without config.
+#[test]
+fn fish_passes_session_completions_without_running_its_config() {
+    let Some(fish) = fish_with_history_append() else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    // Probes start the fish found on PATH.
+    std::os::unix::fs::symlink(&fish, bin.join("fish")).unwrap();
+    let tool = bin.join("tool");
+    fs::write(&tool, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let output = finish(
+        workspace
+            .command("")
+            .env("TF_SHELL", "fish")
+            .arg("--alias")
+            .spawn()
+            .unwrap(),
+    );
+    let alias = String::from_utf8(output.stdout).unwrap();
+    let marker = workspace.0.join("startup-marker");
+    let script = format!(
+        "{alias}\nfunction __tool_needs; __tool_inner; end\nfunction __tool_inner; return 0; end\nfunction __tool_unrelated; touch '{}'; end\ncomplete -c tool -f -n __tool_needs -a 'build deploy'\nbuiltin history append -- 'tool biuld'\nfuck --explain\n",
+        marker.display()
+    );
+    let output = finish(
+        workspace
+            .program(&fish, "")
+            .env("TF_SHELL", "fish")
+            .env("PATH", system_path(&bin))
+            .env("NOTYPO_TRUSTED_COMPLETERS", "tool")
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy")
+            .args(["--no-config", "--private", "-c"])
+            .arg(&script)
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("your fish session's completions"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1. tool build"), "{stderr}");
+    assert!(!marker.exists(), "only definitions were loaded");
+}
+
+/// fish aliases are functions. The fish function passes the aliases among
+/// the failed line's words, and those their values lead to, so they select
+/// their target's vocabulary and safety policy as bash and zsh aliases do.
+#[test]
+fn fish_aliases_use_their_target_programs_vocabulary_and_safety_policy() {
+    let Some(fish) = fish_with_history_append() else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let help = "Usage: eza [options] [files...]\n\nOPTIONS\n  --color WHEN    when to use terminal colours\n  --icons         display icons\n";
+    for (name, body) in [
+        (
+            "eza",
+            format!(
+                "printf 'eza:%s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\n[ \"$*\" = --help ] && {{ printf '%s' '{help}'; exit 0; }}\ntouch \"$(dirname \"$0\")/operation-marker\"\n"
+            ),
+        ),
+        (
+            "ls",
+            "printf 'ls:%s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\n".to_owned(),
+        ),
+        (
+            "rm",
+            "touch \"$(dirname \"$0\")/operation-marker\"\n".to_owned(),
+        ),
+    ] {
+        let path = bin.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::create_dir(workspace.0.join("build")).unwrap();
+    let output = finish(
+        workspace
+            .command("")
+            .env("TF_SHELL", "fish")
+            .arg("--alias")
+            .spawn()
+            .unwrap(),
+    );
+    let alias = String::from_utf8(output.stdout).unwrap();
+    // `ll` leads to `l`, which runs eza; `ls` itself is never asked.
+    let script = format!(
+        "{alias}\nalias l 'eza --icons'\nalias ll l\nalias rmf 'rm -rf'\n\
+         builtin history append -- 'll --colro=auto'\nfuck --explain\n\
+         builtin history append -- 'rmf ./buidl'\nfalse; fuck --explain\nfalse; fuck -y\n"
+    );
+    let output = finish(
+        workspace
+            .program(&fish, "")
+            .env("TF_SHELL", "fish")
+            .env("PATH", system_path(&bin))
+            .env("NOTYPO_TRUSTED_COMPLETERS", "")
+            .env("NOTYPO_TRUSTED_HELP", "eza:ls")
+            .env("NOTYPO_DISABLED_SOURCES", "man:history:legacy")
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false")
+            .args(["--no-config", "--private", "-c"])
+            .arg(&script)
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("1. ll --color=auto"), "{stderr}");
+    // `rmf` runs `rm -rf`: a changed target needs approval; -y runs nothing.
+    let (_, rmf) = stderr.split_once("command:     rmf ./buidl").unwrap();
+    assert!(rmf.contains("rmf ./build"), "{stderr}");
+    assert!(rmf.contains("(through an alias)"), "{stderr}");
+    let calls = fs::read_to_string(bin.join("calls")).unwrap_or_default();
+    assert!(calls.contains("eza:--help"), "{calls}\n{stderr}");
+    assert!(!calls.contains("ls:"), "{calls}");
+    assert!(!bin.join("operation-marker").exists(), "{stderr}");
+    assert!(workspace.0.join("build").exists());
+}
+
+/// A shell function that only runs one command with all its arguments
+/// (`l() { eza --icons "$@"; }`) stands for that command, as an alias does:
+/// each shell's function passes the definitions of the functions in the
+/// failed line (two levels deep), and nothing in them runs.
+#[test]
+fn wrapper_functions_use_their_commands_vocabulary_and_safety_policy() {
+    for shell in ["bash", "zsh", "fish"] {
+        let Some(path) = (if shell == "fish" {
+            fish_with_history_append()
+        } else {
+            notypo::utils::which(shell)
+        }) else {
+            continue;
+        };
+        let workspace = Workspace::new();
+        let bin = workspace.0.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let help = "Usage: eza [options] [files...]\n\nOPTIONS\n  --color WHEN    when to use terminal colours\n  --icons         display icons\n";
+        for (name, body) in [
+            (
+                "eza",
+                format!(
+                    "printf 'eza:%s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\n[ \"$*\" = --help ] && {{ printf '%s' '{help}'; exit 0; }}\ntouch \"$(dirname \"$0\")/operation-marker\"\n"
+                ),
+            ),
+            (
+                "rm",
+                "touch \"$(dirname \"$0\")/operation-marker\"\n".to_owned(),
+            ),
+        ] {
+            let path = bin.join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::create_dir(workspace.0.join("build")).unwrap();
+        let marker = workspace.0.join("function-marker");
+        let output = finish(
+            workspace
+                .command("")
+                .env("TF_SHELL", shell)
+                .arg("--alias")
+                .spawn()
+                .unwrap(),
+        );
+        let alias = String::from_utf8(output.stdout).unwrap();
+        let (flags, definitions, seed): (&[&str], _, _) = match shell {
+            "bash" => (
+                &["--norc", "--noprofile", "-i", "-c"],
+                format!(
+                    "l() {{ eza --icons \"$@\"; }}\nll() {{ l \"$@\"; }}\nrmf() {{ rm -rf \"$@\"; }}\nboom() {{ touch '{}'; }}",
+                    marker.display()
+                ),
+                "set -o history\nhistory -s",
+            ),
+            "zsh" => (
+                &["-f", "-i", "-c"],
+                format!(
+                    "l() {{ eza --icons \"$@\" }}\nll() {{ l $@ }}\nrmf() {{ rm -rf \"$@\" }}\nboom() {{ touch '{}' }}",
+                    marker.display()
+                ),
+                "HISTSIZE=50\nfc -p\nprint -s --",
+            ),
+            _ => (
+                &["--no-config", "--private", "-c"],
+                format!(
+                    "function l; eza --icons $argv; end\nfunction ll; l $argv; end\nfunction rmf; rm -rf $argv; end\nfunction boom; touch '{}'; end",
+                    marker.display()
+                ),
+                "builtin history append --",
+            ),
+        };
+        // `boom` is named in the line, so its definition is passed too.
+        let script = format!(
+            "{alias}\n{definitions}\n\
+             {seed} 'll --colro=auto boom'\nfalse; fuck --explain\n\
+             {seed} 'rmf ./buidl'\nfalse; fuck --explain\nfalse; fuck -y\n"
+        );
+        let output = finish(
+            workspace
+                .program(&path, "")
+                .env("TF_SHELL", shell)
+                .env("PATH", system_path(&bin))
+                .env("HISTFILE", workspace.0.join("history"))
+                .env("NOTYPO_TRUSTED_COMPLETERS", "")
+                .env("NOTYPO_TRUSTED_HELP", "eza")
+                .env("NOTYPO_DISABLED_SOURCES", "man:history:legacy")
+                .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false")
+                .args(flags)
+                .arg(&script)
+                .spawn()
+                .unwrap(),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("1. ll --color=auto boom"),
+            "{shell}: {stderr}"
+        );
+        assert!(
+            stderr.contains("`ll` is an alias for `eza --icons`"),
+            "{shell}: {stderr}"
+        );
+        let (_, rmf) = stderr
+            .split_once("command:     rmf ./buidl")
+            .unwrap_or_else(|| panic!("{shell}: {stderr}"));
+        assert!(rmf.contains("rmf ./build"), "{shell}: {stderr}");
+        assert!(rmf.contains("(through an alias)"), "{shell}: {stderr}");
+        let calls = fs::read_to_string(bin.join("calls")).unwrap_or_default();
+        assert_eq!(calls, "eza:--help\n", "{shell}");
+        assert!(!bin.join("operation-marker").exists(), "{shell}: {stderr}");
+        assert!(!marker.exists(), "{shell}: definitions are never run");
+        assert!(workspace.0.join("build").exists());
+    }
+}
+
+/// PowerShell's alias with arguments is a function that runs one command
+/// with `@args`; such a wrapper takes its command's vocabulary, and the
+/// safety gate judges what it runs.
+#[test]
+fn powershell_wrapper_functions_use_their_commands_vocabulary_and_safety_policy() {
+    let Some(pwsh) = std::env::var_os("NOTYPO_TEST_PWSH")
+        .map(PathBuf::from)
+        .or_else(|| notypo::utils::which("pwsh"))
+    else {
+        eprintln!("skipped: PowerShell is not installed");
+        return;
+    };
+    let Some(git) = notypo::utils::which("git") else {
+        eprintln!("skipped: git is not installed");
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir(workspace.0.join("build")).unwrap();
+    // notypo's metadata queries reach git; other runs are recorded.
+    for (name, body) in [
+        (
+            "git",
+            format!(
+                "case \"$*\" in --list-cmds=*|-h|'-C '*|'init -q --template= '*|'status -h') exec {} \"$@\";; esac\nprintf 'git %s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\nexit 1\n",
+                git.display()
+            ),
+        ),
+        (
+            "rm",
+            "printf 'rm %s\\n' \"$*\" >> \"$(dirname \"$0\")/calls\"\nexit 1\n".to_owned(),
+        ),
+    ] {
+        let path = bin.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let input = format!(
+        "$env:TF_SHELL = 'powershell'\n\
+         Invoke-Expression ((& '{}' --alias) -join \"`n\")\n\
+         function gst {{ git status @args }}\n\
+         function rmrf {{ rm -rf @args }}\n\
+         GST --shrot\n\
+         fuck --explain\n\
+         rmrf ./buidl\n\
+         fuck --explain\n\
+         fuck -y\n\
+         exit\n",
+        env!("CARGO_BIN_EXE_notypo")
+    );
+    let mut child = workspace
+        .program(&pwsh, "")
+        .env("PATH", system_path(&bin))
+        .env("NOTYPO_DISABLED_SOURCES", "history:legacy")
+        .args(["-NoProfile", "-NoLogo", "-Command", "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = finish_within(child, Duration::from_secs(60));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`GST` is an alias for `git status`; its words come from git"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1. GST --short"), "{stderr}");
+    let (_, rmrf) = stderr.split_once("command:     rmrf ./buidl").unwrap();
+    assert!(rmrf.contains("1. rmrf ./build"), "{stderr}");
+    assert!(rmrf.contains("uses rm -rf (through an alias)"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(bin.join("calls")).unwrap(),
+        "git status --shrot\nrm -rf ./buidl\n",
+        "only the typed lines ran; -y ran nothing"
+    );
+}
+
+/// PowerShell's version: a completer registered by `Invoke-Expression` of a
+/// generated script is passed with that script's namespaces and functions;
+/// the probe runs it as Tab would, and nothing else from the script runs.
+#[test]
+fn powershell_passes_session_argument_completers_without_running_their_script() {
+    let Some(pwsh) = std::env::var_os("NOTYPO_TEST_PWSH")
+        .map(PathBuf::from)
+        .or_else(|| notypo::utils::which("pwsh"))
+    else {
+        eprintln!("skipped: PowerShell is not installed");
+        return;
+    };
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let tool = bin.join("tool");
+    fs::write(&tool, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = workspace.0.join("script-marker");
+    // What `tool completion powershell` might print: a namespace, helper
+    // functions, a statement that must not run again, and the registration.
+    let generated = workspace.0.join("generated.ps1");
+    fs::write(
+        &generated,
+        format!(
+            "using namespace System.Management.Automation\n\
+             function __tool_words {{ 'build'; 'deploy' }}\n\
+             function __tool_unrelated {{ Set-Content -Path '{marker}' -Value function }}\n\
+             Register-ArgumentCompleter -Native -CommandName tool -ScriptBlock {{\n\
+                 param($wordToComplete, $commandAst, $cursorPosition)\n\
+                 __tool_words | ForEach-Object {{ [CompletionResult]::new($_, $_, [CompletionResultType]::ParameterValue, ('Run ' + $_)) }}\n\
+             }}\n\
+             if (Test-Path '{marker}') {{ Set-Content -Path '{marker}' -Value again }} else {{ Set-Content -Path '{marker}' -Value once }}\n",
+            marker = marker.display()
+        ),
+    )
+    .unwrap();
+    let input = format!(
+        "$env:TF_SHELL = 'powershell'\n\
+         Invoke-Expression ((& '{}' --alias) -join \"`n\")\n\
+         Get-Content -Raw -LiteralPath '{}' | Invoke-Expression\n\
+         tool biuld\n\
+         fuck --explain\n\
+         $env:NOTYPO_TRUSTED_COMPLETERS = 'tool'\n\
+         tool biuld\n\
+         fuck --explain\n\
+         exit\n",
+        env!("CARGO_BIN_EXE_notypo"),
+        generated.display()
+    );
+    let mut child = workspace
+        .program(&pwsh, "")
+        .env("PATH", system_path(&bin))
+        .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy")
+        .env_remove("NOTYPO_TRUSTED_COMPLETERS")
+        .args(["-NoProfile", "-NoLogo", "-Command", "-"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = finish_within(child, Duration::from_secs(60));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (untrusted, trusted) = stderr
+        .split_once("probes:")
+        .unwrap_or_else(|| panic!("{stdout}\n{stderr}"));
+    assert!(
+        untrusted.contains(
+            "tool has an argument completer in your PowerShell session; add it to trusted_completers"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        trusted.contains("your PowerShell session's argument completer"),
+        "{stderr}"
+    );
+    assert!(trusted.contains("1. tool build"), "{stderr}");
+    assert!(trusted.contains("`build`: Run build"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap().trim(),
+        "once",
+        "the generated script ran only when the session loaded it"
+    );
+}
+
 /// The alias hands the failed command's exit status (127) to the engine,
 /// which makes the missing-executable diagnosis strong enough for `-y`.
 #[test]
@@ -1563,7 +2077,8 @@ fn shell_aliases_pass_the_exit_status_to_the_native_engine() {
 }
 
 /// A typo inside a loop is repaired in place through each shell's alias;
-/// the loop around it is unchanged, and the corrected loop runs once.
+/// the loop around it (and fish's block around that) is unchanged, and the
+/// corrected loop runs once.
 #[test]
 fn shell_aliases_repair_commands_inside_loops() {
     for shell in ["bash", "zsh", "fish"] {
@@ -1604,9 +2119,10 @@ fn shell_aliases_repair_commands_inside_loops() {
                 "for repo in a 'b c'; do gti status \"$repo\"; done",
                 "HISTSIZE=50\nfc -p\nprint -s --",
             ),
+            // fish 4's braces around the loop: `}` needs no `;`.
             "fish" => (
                 &["--no-config", "--private", "-c"],
-                "for repo in a 'b c'; gti status $repo; end",
+                "{ for repo in a 'b c'; gti status $repo; end }",
                 "builtin history append --",
             ),
             _ => unreachable!(),
@@ -2368,6 +2884,223 @@ _clickfix_completion_setup;
 }
 
 #[test]
+fn oclif_manifests_decide_repairs_without_running_the_app() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let package = workspace.0.join("lib/node_modules/odemo-cli");
+    fs::create_dir_all(package.join("bin")).unwrap();
+    fs::write(
+        package.join("package.json"),
+        r#"{"name": "odemo-cli", "version": "1.2.3", "bin": {"odemo": "bin/run"}, "oclif": {"bin": "odemo", "dirname": "notypo-cli-test-odemo"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        package.join("oclif.manifest.json"),
+        r#"{"version": "1.2.3", "commands": {
+          "deploy": {"id": "deploy", "description": "Deploy the app", "flags": {
+            "region": {"name": "region", "char": "r", "type": "option", "options": ["eu-west", "us-east"]}}, "args": {}},
+          "deploy:list": {"id": "deploy:list", "flags": {}, "args": {}}}}"#,
+    )
+    .unwrap();
+    let app = package.join("bin/run");
+    fs::write(
+        &app,
+        format!(
+            "#!/bin/sh\ntouch '{}'\n",
+            workspace.0.join("operation-marker").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&app, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&app, bin.join("odemo")).unwrap();
+    let command = || {
+        let mut command = workspace.command("");
+        command
+            .env("PATH", system_path(&bin))
+            .env("XDG_DATA_HOME", workspace.0.join("data"))
+            .env("NOTYPO_TRUSTED_COMPLETERS", "")
+            .env("NOTYPO_TRUSTED_HELP", "")
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy")
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false");
+        command
+    };
+    for (source, expected) in [
+        (
+            "odemo deplyo --region eu-west",
+            "odemo deploy --region eu-west",
+        ),
+        (
+            "odemo deploy --regoin eu-west",
+            "odemo deploy --region eu-west",
+        ),
+        ("odemo deploy:lsit", "odemo deploy:list"),
+    ] {
+        let output = finish(
+            command()
+                .args(["-y", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            expected,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let report = |source: &str| {
+        let output = finish(
+            command()
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let deploy = report("odemo deplyo");
+    assert_eq!(deploy["probes"], 0, "{deploy}");
+    assert_eq!(
+        deploy["candidates"][0]["edits"][0]["via"],
+        "oclif completion"
+    );
+    // Value lists are never treated as complete, so this one is asked.
+    let value = report("odemo deploy -r eu-wset");
+    assert_eq!(value["outcome"]["kind"], "ambiguous", "{value}");
+    assert_eq!(value["candidates"][0]["command"], "odemo deploy -r eu-west");
+    assert!(!workspace.0.join("operation-marker").exists());
+}
+
+#[test]
+fn installed_yargs_script_selects_yargs_completion_without_sourcing_it() {
+    let workspace = Workspace::new();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    // A shell stand-in for a Node bin built on yargs, installed by npm.
+    let package = workspace.0.join("lib/node_modules/ydemo");
+    fs::create_dir_all(package.join("bin")).unwrap();
+    fs::write(
+        package.join("package.json"),
+        r#"{"name": "ydemo", "bin": {"ydemo": "bin/ydemo.js"}, "dependencies": {"yargs": "^18.2.0"}}"#,
+    )
+    .unwrap();
+    let app = package.join("bin/ydemo.js");
+    fs::write(
+        &app,
+        format!(
+            r#"#!/bin/sh
+root='{}'
+printf '%s|' "$ZSH_NAME" >> "$root/calls"
+printf '<%s>' "$@" >> "$root/calls"
+echo >> "$root/calls"
+[ "$1" = --get-yargs-completions ] && [ "$2" = ydemo ] || {{ touch "$root/operation-marker"; exit 2; }}
+[ "$HTTPS_PROXY" = http://127.0.0.1:9 ] || exit 8
+shift 2
+case "$ZSH_NAME|$*" in
+  '|deploy '*) printf 'status\n';;
+  'zsh|deploy '*) printf 'status:Show the status\n';;
+  zsh*) printf 'deploy:Deploy the app\ndb:Database tasks\n';;
+  *) printf 'deploy\ndb\n';;
+esac
+"#,
+            workspace.0.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&app, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&app, bin.join("ydemo")).unwrap();
+    // As yargs 18.2.0 generates it, plus a line that would run if sourced.
+    let completions = workspace.0.join("bash-completion/completions");
+    fs::create_dir_all(&completions).unwrap();
+    fs::write(
+        completions.join("ydemo"),
+        r#"###-begin-ydemo-completions-###
+#
+# yargs command completion script
+#
+touch sourced-marker
+_ydemo_yargs_completions()
+{
+    local cur_word args type_list
+
+    cur_word="${COMP_WORDS[COMP_CWORD]}"
+    args=("${COMP_WORDS[@]}")
+    mapfile -t type_list < <(ydemo --get-yargs-completions "${args[@]}")
+    return 0
+}
+complete -o bashdefault -o default -F _ydemo_yargs_completions ydemo
+###-end-ydemo-completions-###
+"#,
+    )
+    .unwrap();
+    let command = |trusted: &str| {
+        let mut command = workspace.command("");
+        command
+            .env("PATH", system_path(&bin))
+            .env(
+                "BASH_COMPLETION_USER_DIR",
+                workspace.0.join("bash-completion"),
+            )
+            .env("NOTYPO_TRUSTED_COMPLETERS", trusted)
+            .env("NOTYPO_TRUSTED_HELP", "")
+            .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy")
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false");
+        command
+    };
+    let report = |trusted: &str, source: &str| {
+        let output = finish(
+            command(trusted)
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let untrusted = report("", "ydemo deplyo");
+    assert_eq!(untrusted["probes"], 0, "{untrusted}");
+    assert!(!workspace.0.join("calls").exists());
+    for (source, expected) in [
+        ("ydemo deplyo", "ydemo deploy"),
+        ("ydemo deploy statsu", "ydemo deploy status"),
+    ] {
+        let report = report(r#"["npm:ydemo"]"#, source);
+        let candidate = &report["candidates"][0];
+        assert_eq!(candidate["command"], expected, "{report}");
+        assert_eq!(candidate["safety"]["decision"], "allow", "{report}");
+        assert!(
+            candidate["edits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|edit| edit["via"] == "yargs completion"),
+            "{report}"
+        );
+    }
+    let output = finish(
+        command(r#"["npm:ydemo"]"#)
+            .args(["-y", "--force-command", "ydemo deplyo"])
+            .spawn()
+            .unwrap(),
+    );
+    // yargs lists no aliases or hidden commands, so a repair is asked.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.stdout.is_empty(), "{stderr}");
+    assert!(
+        stderr.contains("Not running `ydemo deploy` without confirmation"),
+        "{stderr}"
+    );
+    let calls = fs::read_to_string(workspace.0.join("calls")).unwrap();
+    assert!(
+        calls
+            .lines()
+            .all(|line| line.contains("|<--get-yargs-completions><ydemo>")),
+        "only completion requests, led by the program name: {calls}"
+    );
+    assert!(!workspace.0.join("operation-marker").exists());
+    assert!(!workspace.0.join("sourced-marker").exists());
+}
+
+#[test]
 fn aliases_use_their_target_programs_vocabulary_and_safety_policy() {
     let workspace = Workspace::new();
     let bin = workspace.0.join("bin");
@@ -2550,5 +3283,230 @@ fn powershell_function_repairs_programs_cmdlets_and_parameters() {
         fs::read_to_string(bin.join("calls")).unwrap_or_default(),
         "sttus\nstatus\n",
         "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
+fn dotnet_completion_respects_project_trust_and_blocks_build_and_replay_execution() {
+    let workspace = Workspace::new();
+    let sdk = workspace.0.join("sdk-install");
+    let version = sdk.join("sdk/10.0.401");
+    fs::create_dir_all(&version).unwrap();
+    fs::write(version.join(".version"), "commit\n10.0.401\n").unwrap();
+    fs::write(
+        version.join("dotnet.deps.json"),
+        r#"{"libraries":{"dotnet.deps.json/10.0.401":{}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        version.join("dotnet.dll"),
+        "CompleteCommand GetCompletions PrintCliSchemaAction",
+    )
+    .unwrap();
+    fs::write(sdk.join("schema"), r#"{
+      "name":"dotnet","arguments":{"subcommand":{"hidden":true}},"options":{},"subcommands":{
+        "build":{"arguments":{"project":{}},"subcommands":{},"options":{
+          "--configuration":{"aliases":["-c"],"arity":{"minimum":1,"maximum":1}},
+          "--verbosity":{"aliases":["/verbosity"],"arity":{"minimum":1,"maximum":1}},
+          "--self-contained":{"valueType":"System.Boolean","arity":{"minimum":0,"maximum":1}}
+        }},
+        "nuget":{"arguments":{},"options":{},"subcommands":{"locals":{"arguments":{"folders":{}},"options":{},"subcommands":{}}}},
+        "new":{"arguments":{"template":{}},"subcommands":{},"options":{"--name":{"arity":{"minimum":1,"maximum":1}}}}
+      }
+    }"#).unwrap();
+    let host = sdk.join("dotnet");
+    fs::write(&host, r#"#!/bin/sh
+actual=$(readlink "$0" 2>/dev/null || printf '%s' "$0")
+root=$(dirname "$actual")
+[ "$HTTPS_PROXY" = http://127.0.0.1:9 ] && [ "$DOTNET_CLI_TELEMETRY_OPTOUT" = 1 ] || exit 8
+touch "$DOTNET_CLI_HOME/probe-write"
+printf '<%s>' "$@" >> "$root/calls"
+printf '\n' >> "$root/calls"
+case "$1" in
+  --version) printf '10.0.401\n';;
+  --info) printf 'Base Path: %s/sdk/10.0.401/\n' "$root";;
+  --cli-schema) cat "$root/schema";;
+  complete)
+    [ "$2" = --position ] && [ "$#" = 4 ] || exit 8
+    case "$4" in
+      'dotnet new '*)
+        [ -f "$DOTNET_CLI_HOME/.templateengine/installed-state" ] || exit 8
+        touch "$DOTNET_CLI_HOME/.templateengine/completion-write"
+        printf 'fixture\n--name\n';;
+      'dotnet build -'|'dotnet build --self-contained true -') printf -- '--configuration\n--verbosity\n--self-contained\n-c\n';;
+      'dotnet build /') printf '/verbosity\n';;
+      'dotnet build --configuration '| 'dotnet build -c ') printf 'Debug\nRelease\n';;
+      'dotnet build --verbosity '|'dotnet build /verbosity ') printf 'quiet\nnormal\n';;
+      'dotnet nuget ') printf 'locals\n';;
+      *) printf 'build\nnuget\nnew\n';;
+    esac;;
+  *) touch "$root/operation-marker"; exit 9;;
+esac
+"#).unwrap();
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = workspace.0.join("bin");
+    fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(&host, bin.join("sdk-host")).unwrap();
+    let home = workspace.0.join("user-home");
+    fs::create_dir_all(home.join(".templateengine")).unwrap();
+    fs::write(
+        home.join(".templateengine/installed-state"),
+        "original template state",
+    )
+    .unwrap();
+    fs::write(workspace.0.join("app.csproj"), "<Project />").unwrap();
+    let command = |trusted: bool, project: bool| {
+        let mut command = workspace.command("");
+        command
+            .env("PATH", system_path(&bin))
+            .env("DOTNET_CLI_HOME", &home)
+            .env(
+                "NOTYPO_TRUSTED_COMPLETERS",
+                if trusted { r#"["dotnet:sdk"]"# } else { "" },
+            )
+            .env(
+                "NOTYPO_TRUSTED_WORKSPACES",
+                if project {
+                    workspace.0.to_str().unwrap()
+                } else {
+                    ""
+                },
+            )
+            .env("NOTYPO_TRUSTED_HELP", "")
+            .env(
+                "NOTYPO_DISABLED_SOURCES",
+                "help:man:history:filesystem:legacy",
+            )
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false");
+        command
+    };
+    for (trusted, project) in [(false, true), (true, false)] {
+        let output = finish(
+            command(trusted, project)
+                .args(["--json", "--force-command", "sdk-host biuld"])
+                .spawn()
+                .unwrap(),
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            report["candidates"].as_array().unwrap().is_empty(),
+            "{report}"
+        );
+        assert!(
+            !sdk.join("calls").exists(),
+            "refused workspace or SDK trust still probed"
+        );
+    }
+    // Help trust does not bypass workspace trust through a renamed host.
+    let output = finish(
+        command(false, false)
+            .env("NOTYPO_TRUSTED_HELP", "sdk-host")
+            .env(
+                "NOTYPO_DISABLED_SOURCES",
+                "native:man:history:filesystem:legacy",
+            )
+            .args(["--json", "--force-command", "sdk-host biuld"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(output.status.success());
+    assert!(!sdk.join("calls").exists());
+    for (source, expected) in [
+        ("sdk-host biuld", "sdk-host build"),
+        ("sdk-host new fixtur", "sdk-host new fixture"),
+        ("sdk-host nuget loclas", "sdk-host nuget locals"),
+        (
+            "sdk-host build --configuraton Release",
+            "sdk-host build --configuration Release",
+        ),
+        (
+            "sdk-host build --configuration Releae",
+            "sdk-host build --configuration Release",
+        ),
+        (
+            "sdk-host build --configuration=Releae",
+            "sdk-host build --configuration=Release",
+        ),
+        (
+            "sdk-host build --configuration:Releae",
+            "sdk-host build --configuration:Release",
+        ),
+        (
+            "sdk-host build /verbosoty:quiet",
+            "sdk-host build /verbosity:quiet",
+        ),
+        (
+            "sdk-host build /verbosity:quie",
+            "sdk-host build /verbosity:quiet",
+        ),
+        (
+            "sdk-host build --self-contained --configuraton Release",
+            "sdk-host build --self-contained --configuration Release",
+        ),
+        (
+            "sdk-host build --configuration Releae -- '$(touch operation-marker)'",
+            "sdk-host build --configuration Release -- '$(touch operation-marker)'",
+        ),
+    ] {
+        let output = finish(
+            command(true, true)
+                .args(["--json", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["candidates"][0]["command"], expected,
+            "{source}: {report}"
+        );
+        assert_eq!(
+            report["candidates"][0]["safety"]["decision"], "confirm",
+            "{report}"
+        );
+        assert!(
+            report["candidates"][0]["edits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|edit| edit["via"] == "dotnet completion"),
+            "{report}"
+        );
+        let output = finish(
+            command(true, true)
+                .args(["-y", "--force-command", source])
+                .spawn()
+                .unwrap(),
+        );
+        assert!(
+            !output.status.success() && output.stdout.is_empty(),
+            "{source}"
+        );
+    }
+    let output = finish(
+        command(false, false)
+            .env("NOTYPO_REPLAY_FOR_DIAGNOSIS", "true")
+            .env(
+                "NOTYPO_DISABLED_SOURCES",
+                "native:help:man:history:filesystem:legacy",
+            )
+            .args(["-y", "--force-command", "sdk-host build"])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(!output.status.success());
+    assert!(!sdk.join("operation-marker").exists());
+    assert!(!workspace.0.join("operation-marker").exists());
+    assert!(!home.join("probe-write").exists());
+    assert_eq!(
+        fs::read_to_string(home.join(".templateengine/installed-state")).unwrap(),
+        "original template state"
+    );
+    let calls = fs::read_to_string(sdk.join("calls")).unwrap();
+    assert!(
+        calls.lines().all(|line| line.starts_with("<--version>")
+            || line.starts_with("<--info>")
+            || line.starts_with("<--cli-schema>")
+            || line.starts_with("<complete><--position>")),
+        "{calls}"
     );
 }

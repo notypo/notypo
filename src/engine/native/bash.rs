@@ -7,15 +7,25 @@
 //! command words are passed as arguments, never spliced into shell code.
 //! Sourcing a script and calling its function run its code, so this is only
 //! used for programs listed in `trusted_completers`.
+//!
+//! A function the user's bash session defined in memory (inline in an rc
+//! file, or by `eval "$(tool completion bash)"`) has no file to source. The
+//! shell integration passes its `complete -p` registration and the
+//! definitions of the functions from the same file (`extdebug` names it),
+//! which the driver evaluates; the rc file itself is never run.
 
 use super::{CompletionError, CompletionItem, run_stdout};
 use crate::engine::probe::Budget;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-const DRIVER: &str = r#"source "$1" >/dev/null 2>&1 || exit 3
-command=$2
-shift 2
+const DRIVER: &str = r#"case $1 in
+  file) source "$2" >/dev/null 2>&1 || exit 3;;
+  text) eval "$2" >/dev/null 2>&1 || exit 3;;
+  *) exit 3;;
+esac
+command=$3
+shift 3
 spec=$(complete -p "$command" 2>/dev/null) || exit 4
 [[ $spec =~ -F\ ([^ ]+) ]] || exit 5
 function=${BASH_REMATCH[1]}
@@ -95,9 +105,50 @@ fn registering_script(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
+/// Where the registering code comes from.
+pub(super) enum Source<'a> {
+    File(&'a Path),
+    /// Definitions and a registration passed by the parent session.
+    Text(&'a str),
+}
+
+/// The variable the bash integration fills: `complete -p` lines for the
+/// previous commands' words, a `#notypo-functions` line, then `declare -f`
+/// output for the functions defined in the same files.
+const MEMORY: &str = "NOTYPO_BASH_COMPLETIONS";
+const SEPARATOR: &str = "#notypo-functions\n";
+const MEMORY_LIMIT: usize = 64 * 1024;
+
+/// Code that registers the session's completion function for `name`: the
+/// session's function definitions and the one `complete -F` line naming it.
+pub(super) fn memory_script(name: &str) -> Option<String> {
+    let text = std::env::var(MEMORY).ok()?;
+    memory_script_in(&text, name)
+}
+
+fn memory_script_in(text: &str, name: &str) -> Option<String> {
+    if text.len() > MEMORY_LIMIT || text.contains('\0') {
+        return None;
+    }
+    let (specs, functions) = text.split_once(SEPARATOR)?;
+    let spec = specs.lines().find(|line| {
+        crate::shlex::split(line).is_ok_and(|words| {
+            words.first().is_some_and(|word| word == "complete")
+                && words
+                    .windows(2)
+                    .any(|pair| pair[0] == "-F" && !pair[1].is_empty())
+                && words.last().is_some_and(|word| word == name)
+        })
+    })?;
+    if functions.trim().is_empty() {
+        return None;
+    }
+    Some(format!("{functions}\n{spec}\n"))
+}
+
 pub(super) fn complete(
     bash: &Path,
-    script: &Path,
+    source: &Source<'_>,
     name: &str,
     words: &[&str],
     prefix: &str,
@@ -106,13 +157,18 @@ pub(super) fn complete(
 ) -> Result<Vec<CompletionItem>, CompletionError> {
     // Noninteractive bash reads BASH_ENV even with --norc/--noprofile.
     env.extend(["BASH_ENV", "ENV"].map(|name| (name.into(), None)));
+    let (mode, code, shown): (&str, OsString, String) = match source {
+        Source::File(script) => ("file", script.into(), script.display().to_string()),
+        Source::Text(text) => ("text", text.into(), "your bash session".into()),
+    };
     let mut args: Vec<OsString> = vec![
         "--norc".into(),
         "--noprofile".into(),
         "-c".into(),
         DRIVER.into(),
         "notypo".into(),
-        script.into(),
+        mode.into(),
+        code,
         name.into(),
     ];
     args.extend(words.iter().map(OsString::from));
@@ -122,8 +178,7 @@ pub(super) fn complete(
             if ["exited with Some(4)", "exited with Some(5)"].contains(&why.as_str()) =>
         {
             CompletionError::Unsupported(format!(
-                "{} registers no usable completion function for {name}",
-                script.display()
+                "{shown} registers no usable completion function for {name}"
             ))
         }
         other => other,
@@ -157,6 +212,63 @@ mod tests {
         for name in ["gsutil-old", "words-only", "complete", "missing"] {
             assert_eq!(registering_script(name, &dirs), None, "{name}");
         }
+    }
+
+    #[test]
+    fn session_registrations_select_their_command_and_carry_its_definitions() {
+        let text = "complete -o default -F _tool tool\ncomplete -F _other 'other tool'\ncomplete -W 'a b' words\n#notypo-functions\n_tool () \n{ \n    COMPREPLY=(build)\n}\n";
+        let script = memory_script_in(text, "tool").unwrap();
+        assert!(script.starts_with("_tool () "), "{script}");
+        assert!(
+            script.ends_with("complete -o default -F _tool tool\n"),
+            "{script}"
+        );
+        assert_eq!(
+            memory_script_in(text, "other"),
+            None,
+            "names must match exactly"
+        );
+        assert_eq!(
+            memory_script_in(text, "words"),
+            None,
+            "only -F registrations"
+        );
+        assert_eq!(memory_script_in(text, "missing"), None);
+        assert_eq!(
+            memory_script_in("complete -F _tool tool\n#notypo-functions\n", "tool"),
+            None,
+            "no definitions"
+        );
+        assert_eq!(memory_script_in("complete -F _tool tool\n", "tool"), None);
+        let huge = format!("{text}{}", "#".repeat(MEMORY_LIMIT));
+        assert_eq!(memory_script_in(&huge, "tool"), None);
+    }
+
+    #[test]
+    fn evaluates_session_definitions_without_a_file() {
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let script = "_tool () \n{ \n    case \"${COMP_WORDS[*]}\" in \"tool \") COMPREPLY=(build deploy);; esac\n}\ncomplete -F _tool tool\n";
+        let mut budget = Budget::new(Duration::from_secs(10), Duration::from_secs(5), 8);
+        let words = complete(
+            &bash,
+            &Source::Text(script),
+            "tool",
+            &[],
+            "",
+            Vec::new(),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            words.iter().map(|w| w.value.as_str()).collect::<Vec<_>>(),
+            ["build", "deploy"]
+        );
+        assert!(matches!(
+            complete(&bash, &Source::Text("true\n"), "tool", &[], "", Vec::new(), &mut budget),
+            Err(CompletionError::Unsupported(why)) if why.contains("your bash session")
+        ));
     }
 
     #[test]
@@ -222,12 +334,21 @@ complete -F _tool tool
         );
         let mut budget = Budget::new(Duration::from_secs(10), Duration::from_secs(3), 4);
         let env = vec![("BASH_ENV".into(), Some(config.into()))];
-        let result = complete(&bash, &script, "tool", &[], "", env, &mut budget).unwrap();
+        let result = complete(
+            &bash,
+            &Source::File(&script),
+            "tool",
+            &[],
+            "",
+            env,
+            &mut budget,
+        )
+        .unwrap();
         assert_eq!(result.len(), 3);
         assert!(!marker.exists());
         budget.max_output = 4;
         assert!(
-            matches!(complete(&bash, &script, "tool", &[], "", Vec::new(), &mut budget), Err(CompletionError::Failed(why)) if why.contains("probe limit"))
+            matches!(complete(&bash, &Source::File(&script), "tool", &[], "", Vec::new(), &mut budget), Err(CompletionError::Failed(why)) if why.contains("probe limit"))
         );
     }
 }

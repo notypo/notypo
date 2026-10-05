@@ -43,6 +43,16 @@ fn simple_words(text: &str, dialect: Dialect) -> Option<usize> {
     .then_some(command.words.len())
 }
 
+/// How `aliases` names a command: PowerShell ignores case, and its
+/// wrappers are keyed in lowercase.
+fn key(name: &str, dialect: Dialect) -> String {
+    if dialect == Dialect::PowerShell {
+        name.to_lowercase()
+    } else {
+        name.to_owned()
+    }
+}
+
 /// `source` with every alias in command position expanded.
 pub fn expand(source: &str, dialect: Dialect, aliases: &HashMap<String, String>) -> Expansion {
     if aliases.is_empty() {
@@ -66,9 +76,8 @@ pub fn expand(source: &str, dialect: Dialect, aliases: &HashMap<String, String>)
             };
         };
         let alias = current.words.get(word).filter(|w| !w.quoted).and_then(|w| {
-            let name = w.literal()?;
-            (aliases.contains_key(name) && !seen.iter().any(|s| s == name))
-                .then_some((name, w.span))
+            let name = key(w.literal()?, dialect);
+            (aliases.contains_key(&name) && !seen.contains(&name)).then_some((name, w.span))
         });
         let Some((name, span)) = alias else {
             if blank && after < current.words.len() {
@@ -80,15 +89,14 @@ pub fn expand(source: &str, dialect: Dialect, aliases: &HashMap<String, String>)
             }
             continue;
         };
-        let value = &aliases[name];
+        let value = &aliases[&name];
         // tcsh aliases place arguments with history references.
         if dialect == Dialect::Tcsh && value.contains('!') {
-            return Expansion::Unanalyzable(name.to_owned());
+            return Expansion::Unanalyzable(name);
         }
         let Some(count) = simple_words(value, dialect) else {
-            return Expansion::Unanalyzable(name.to_owned());
+            return Expansion::Unanalyzable(name);
         };
-        let name = name.to_owned();
         text.replace_range(span.start..span.end, value.trim_end());
         if count == 0 {
             // An empty alias leaves the next word in command position.
@@ -107,6 +115,67 @@ pub fn expand(source: &str, dialect: Dialect, aliases: &HashMap<String, String>)
             .unwrap_or_default()
             .to_owned(),
     )
+}
+
+/// Separates the function definitions the shell integration passes.
+pub const WRAPPER_SEPARATOR: &str = "#notypo-function";
+
+/// Shell functions that only run one command with all their arguments
+/// (`g() { git "$@"; }`, fish's `function g; git $argv; end`), read from
+/// their definitions as the shell prints them (`declare -f`, `functions`),
+/// one per [`WRAPPER_SEPARATOR`] section. Each maps to the command it runs,
+/// in the shell's own syntax, which expands like an alias's value: the
+/// arguments follow it. Definitions are parsed, never run.
+pub fn wrappers(definitions: &str, dialect: Dialect) -> HashMap<String, String> {
+    definitions
+        .split(WRAPPER_SEPARATOR)
+        .filter_map(|definition| wrapper(definition, dialect))
+        .collect()
+}
+
+fn wrapper(definition: &str, dialect: Dialect) -> Option<(String, String)> {
+    let script = parser::parse_with_dialect(definition, dialect);
+    if !script.is_fully_supported() {
+        return None;
+    }
+    // The definition, and in POSIX shells the `{ ... }` body it prints.
+    let (function, body) = match script.compounds.as_slice() {
+        [function] if dialect == Dialect::Fish => (function, None),
+        [function, body] if dialect != Dialect::Fish => (function, Some(body)),
+        _ => return None,
+    };
+    if function.kind != parser::CompoundKind::Function
+        || !function.redirections.is_empty()
+        || body.is_some_and(|b| b.kind != parser::CompoundKind::Group || !b.redirections.is_empty())
+    {
+        return None;
+    }
+    let name = function.words.first()?.literal()?;
+    // fish options on the header line (`--wraps=git`) don't change the body.
+    if name.is_empty() || name.starts_with('-') {
+        return None;
+    }
+    let [command] = script.commands.as_slice() else {
+        return None;
+    };
+    if !command.assignments.is_empty() || !command.redirections.is_empty() {
+        return None;
+    }
+    let [words @ .., arguments] = command.words.as_slice() else {
+        return None;
+    };
+    let forwards = match dialect {
+        Dialect::Fish => ["$argv"].as_slice(),
+        _ => ["\"$@\"", "$@"].as_slice(),
+    };
+    if words.is_empty()
+        || !forwards.contains(&arguments.span.of(definition))
+        || words.iter().any(|word| word.literal().is_none())
+    {
+        return None;
+    }
+    let value = &definition[words[0].span.start..words[words.len() - 1].span.end];
+    Some((name.to_owned(), value.to_owned()))
 }
 
 /// The installed program `name` runs when it is an alias for one simple
@@ -222,6 +291,61 @@ mod tests {
             expand("a", Dialect::Posix, &cycle),
             Expansion::Expanded(_)
         ));
+    }
+
+    /// PowerShell wrapper functions are keyed in lowercase and found
+    /// whatever the case of the typed name, as PowerShell finds them.
+    #[test]
+    fn powershell_wrappers_expand_without_regard_to_case() {
+        let set = aliases(&[("gst", "git status"), ("g", "git"), ("gs", "g status")]);
+        for (source, expected) in [
+            ("GST --short", "git status --short"),
+            ("gs -s; Gst", "git status -s; git status"),
+            ("& gst", "& gst"),
+        ] {
+            let result = expand(source, Dialect::PowerShell, &set);
+            let text = match result {
+                Expansion::Expanded(text) => text,
+                Expansion::Unchanged => source.to_owned(),
+                other => panic!("{source}: {other:?}"),
+            };
+            assert_eq!(text, expected, "{source}");
+        }
+        assert_eq!(
+            expand("GST", Dialect::Posix, &set),
+            Expansion::Unchanged,
+            "other shells compare names exactly"
+        );
+    }
+
+    /// Definitions as bash's `declare -f`, zsh's `functions`, and fish's
+    /// `functions` print them.
+    #[test]
+    fn wrapper_functions_are_read_from_their_printed_definitions() {
+        let bash = "#notypo-function\ng () \n{ \n    git \"$@\"\n}\n\
+                    #notypo-function\ngs () \n{ \n    g status \"$@\"\n}\n\
+                    #notypo-function\nx () \n{ \n    echo a;\n    git \"$@\"\n}\n\
+                    #notypo-function\nq () \n{ \n    git log \"$*\"\n}\n\
+                    #notypo-function\nr () \n{ \n    git \"$@\" > log\n}\n\
+                    #notypo-function\nv () \n{ \n    \"$EDITOR\" \"$@\"\n}\n\
+                    #notypo-function\nl () \n{ \n    ls -la 'my dir' \"$@\"\n}\n";
+        let found = wrappers(bash, Dialect::Posix);
+        assert_eq!(found["g"], "git");
+        assert_eq!(found["gs"], "g status");
+        assert_eq!(found["l"], "ls -la 'my dir'", "quoting is kept");
+        assert_eq!(found.len(), 3, "{found:?}");
+        let zsh = "#notypo-function\ng () {\n\tgit \"$@\"\n}\n#notypo-function\ngs () {\n\tg status $@\n}\n";
+        let found = wrappers(zsh, Dialect::Posix);
+        assert_eq!(found["gs"], "g status");
+        assert_eq!(found.len(), 2);
+        let fish = "#notypo-function\n# Defined interactively\nfunction g\n     git $argv; \nend\n\
+                    #notypo-function\nfunction gs --wraps=git\n     g status $argv; \nend\n\
+                    #notypo-function\nfunction two\n     git status; git log $argv\nend\n";
+        let found = wrappers(fish, Dialect::Fish);
+        assert_eq!(found["g"], "git");
+        assert_eq!(found["gs"], "g status");
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(wrappers(bash, Dialect::Fish).is_empty());
     }
 
     #[test]

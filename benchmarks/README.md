@@ -45,12 +45,13 @@ python3 benchmarks/structured.py --shell-fixtures --case shell --samples 11 --ou
 counts, and RSS. Partial shell handlers keep answers within one request, so
 reusing a disk cache directory does not reduce their probe count.
 
-The newer protocol bridges (pip, npm, Cargo, clap, urfave/cli, user-trusted
+The newer protocol bridges (pip, npm, Cargo, .NET SDK, clap, urfave/cli, user-trusted
 cobra, and a bash handler) are measured against the apps installed on this
 machine, each with the trust it needs. Missing apps are skipped, and every
 suggestion is checked without being run. PowerShell cases run when `pwsh` is
 on `PATH` or `NOTYPO_BENCH_PWSH` names a PowerShell executable; they measure
-a misspelled parameter and a misspelled cmdlet name.
+a misspelled parameter, a misspelled cmdlet name, and, when mdbook or rustup
+is installed, its generated PowerShell completer registered in a session.
 
 ```sh
 cargo build --locked --release

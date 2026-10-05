@@ -98,12 +98,17 @@ impl Word {
     pub fn option_name_span_with(&self, src: &str, separator: char) -> Option<Span> {
         let raw = self.span.of(src);
         let end = raw.find(separator).unwrap_or(raw.len());
-        let name = &raw[..end];
+        self.option_name_span_to(src, end)
+    }
+
+    pub fn option_name_span_to(&self, src: &str, end: usize) -> Option<Span> {
+        let raw = self.span.of(src);
+        let name = raw.get(..end)?;
         (name.len() > 1
-            && name.starts_with('-')
-            && name
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.')))
+            && name.starts_with(['-', '/'])
+            && name.bytes().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, b'-' | b'/' | b'_' | b'.' | b'?' | b':')
+            }))
         .then(|| Span::new(self.span.start, self.span.start + end))
     }
 }
@@ -428,6 +433,8 @@ enum State {
     FishSwitch,
     FishCasePatterns,
     FishCaseBody,
+    /// fish 4's `{ ... }` block.
+    FishBrace,
 }
 
 impl State {
@@ -556,10 +563,17 @@ impl Parser<'_> {
                 }
                 b'(' => self.open_paren(start),
                 b')' => self.close_paren(start),
+                // fish 4: `{` in command position opens a block (`{echo,hi}`
+                // runs `echo,hi`), and a `}` token closes the innermost one.
                 b'{' if self.fish() && self.command_position() => {
-                    self.diagnose(start, start + 1, DiagnosticKind::CompoundCommand);
+                    self.open(
+                        CompoundKind::Group,
+                        Span::new(start, start + 1),
+                        State::FishBrace,
+                    );
                     self.i += 1;
                 }
+                b'}' if self.fish_brace_open() => self.close_fish_brace(start),
                 b'>' if self.fish() && self.peek(1) == Some(b'|') => {
                     self.end_command(Connector::PipeFd(1), 2)
                 }
@@ -634,6 +648,34 @@ impl Parser<'_> {
         // An empty line keeps the pending operator: `ls &&<newline>ls`.
         if !empty {
             self.connector = Some((connector, span));
+        }
+    }
+
+    /// The innermost open compound is a fish `{ ... }` block.
+    fn fish_brace_open(&self) -> bool {
+        self.fish()
+            && self
+                .stack
+                .last()
+                .is_some_and(|frame| frame.state == State::FishBrace)
+    }
+
+    /// fish's `}` ends the command before it (no `;` is needed) and the
+    /// innermost block. It takes no arguments: `{ echo a }x` is an error.
+    fn close_fish_brace(&mut self, start: usize) {
+        let span = Span::new(start, start + 1);
+        if !self.current.is_empty() {
+            self.push_current();
+        } else if self.closed.is_none() && (self.dangling_operator() || self.expect_command) {
+            self.diagnose(start, start + 1, DiagnosticKind::UnexpectedOperator);
+        }
+        self.i = start + 1;
+        self.close_frame(span);
+        if self
+            .peek(0)
+            .is_some_and(|c| !is_meta(c) && !matches!(c, b'}' | b'#'))
+        {
+            self.diagnose(self.i, self.i + 1, DiagnosticKind::UnexpectedKeyword);
         }
     }
 
@@ -722,6 +764,8 @@ impl Parser<'_> {
                 true
             }
             c if is_blank(c) || c == b'#' || c == b'\\' && self.peek(1) == Some(b'\n') => false,
+            // Arithmetic `for ((...))`, diagnosed as a whole by open_paren.
+            b'(' if state == State::LoopName && self.peek(1) == Some(b'(') => false,
             // zsh's `for x (a b)` and other forms we don't read.
             c if is_meta(c) => {
                 self.diagnose(start, start + 1, DiagnosticKind::CompoundCommand);
@@ -1092,9 +1136,55 @@ impl Parser<'_> {
             .map_or(self.b.len(), |k| self.i + 1 + k + 1)
     }
 
+    /// The offset just past the `))` closing arithmetic opened at `start`,
+    /// or the end of the source.
+    fn arithmetic_end(&self, start: usize) -> usize {
+        let mut depth = 0usize;
+        let mut quote = None;
+        for (k, &c) in self.b[start..].iter().enumerate() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), _) => {}
+                (None, b'\'' | b'"') => quote = Some(c),
+                (None, b'(') => depth += 1,
+                (None, b')') => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return start + k + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.b.len()
+    }
+
     /// A subshell, or `name()` starting a function definition.
     fn open_paren(&mut self, start: usize) {
         let span = Span::new(start, start + 1);
+        // Arithmetic `(( ... ))` is unsupported as a whole: its contents are
+        // not commands. After `for`, it is the loop's whole header.
+        if self.peek(1) == Some(b'(') {
+            let end = self.arithmetic_end(start);
+            self.diagnose(start, end, DiagnosticKind::CompoundCommand);
+            self.i = end;
+            if self
+                .stack
+                .last()
+                .is_some_and(|f| f.state == State::LoopName)
+            {
+                self.set_state(State::LoopIn);
+            } else {
+                // One opaque word: a command stands here, unread.
+                self.current.words.push(Word {
+                    span: Span::new(start, end),
+                    value: None,
+                    quoted: false,
+                });
+                self.expect_command = false;
+            }
+            return;
+        }
         if self.command_position() && self.peek(1) != Some(b'(') {
             self.i += 1;
             self.open(CompoundKind::Subshell, span, State::Subshell);
@@ -1118,7 +1208,7 @@ impl Parser<'_> {
             }
             return;
         }
-        // Arithmetic `((...))`, zsh glob qualifiers, and the like.
+        // zsh glob qualifiers and the like.
         self.diagnose(start, start + 1, DiagnosticKind::CompoundCommand);
         self.i += 1;
     }
@@ -1405,6 +1495,33 @@ impl Parser<'_> {
         }
     }
 
+    /// Whether `(` after the text scanned since `start` opens an array
+    /// value: the text is `name=` or `name+=`, in an assignment prefix or an
+    /// argument of a declaration builtin, as bash and zsh read them.
+    fn array_value_allowed(&self, start: usize) -> bool {
+        const DECLARATIONS: &[&str] = &[
+            "declare", "typeset", "local", "export", "readonly", "integer", "float",
+        ];
+        let text = &self.src[start..self.i];
+        let Some(name) = text.strip_suffix('=') else {
+            return false;
+        };
+        let name = name.strip_suffix('+').unwrap_or(name);
+        self.dialect == Dialect::Posix
+            && !name.is_empty()
+            && !name.as_bytes()[0].is_ascii_digit()
+            && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            && !self
+                .stack
+                .last()
+                .is_some_and(|f| f.state.takes_words() || f.state.expects_keyword())
+            && self.current.words.first().is_none_or(|first| {
+                first
+                    .literal()
+                    .is_some_and(|w| !first.quoted && DECLARATIONS.contains(&w))
+            })
+    }
+
     fn scan_word(&mut self) -> Word {
         let start = self.i;
         let mut value = Some(String::new());
@@ -1431,6 +1548,11 @@ impl Parser<'_> {
                     while self.peek(0) == Some(b'[') {
                         self.substitution(b'[', b']');
                     }
+                    value = None;
+                }
+                // A bash/zsh array value, `name=( ... )`: one opaque word.
+                b'(' if !quoted && self.array_value_allowed(start) => {
+                    self.substitution(b'(', b')');
                     value = None;
                 }
                 c if is_meta(c) && !self.literal_ampersand() => break,
@@ -1493,6 +1615,16 @@ impl Parser<'_> {
                     fish_delimiters.push((c, self.i));
                     push(&mut value, &self.src[self.i..self.i + 1]);
                     self.i += 1;
+                }
+                // `{echo a; echo b}`: an unmatched `}` before a separator
+                // closes the block, ending this word.
+                b'}' if fish_delimiters.is_empty()
+                    && self.fish_brace_open()
+                    && self
+                        .peek(1)
+                        .is_none_or(|next| is_meta(next) || next == b'}') =>
+                {
+                    break;
                 }
                 b']' | b'}' if self.fish() => {
                     let expected = if c == b']' { b'[' } else { b'{' };
@@ -2651,6 +2783,26 @@ mod tests {
                 &["true", "echo"],
                 &[],
             ),
+            // fish 4's braces: `}` needs no `;` and ends a word before it.
+            ("{ echo a; echo b }", &[Group], &["echo", "echo"], &[]),
+            ("{echo a; git sttus}", &[Group], &["echo", "git"], &[]),
+            ("{ echo a; } | cat", &[Group], &["echo", "cat"], &[]),
+            ("{ git sttus } > out", &[Group], &["git"], &[]),
+            ("{ }", &[Group], &[], &[]),
+            ("{}", &[Group], &[], &[]),
+            ("not { false }", &[Negation, Group], &["false"], &[]),
+            ("{ { echo a } }", &[Group, Group], &["echo"], &[]),
+            ("{ echo {a,b}}", &[Group], &["echo"], &[]),
+            ("{ echo a }; and git sttus", &[Group], &["echo", "git"], &[]),
+            ("{ echo a } && echo b #c", &[Group], &["echo", "echo"], &[]),
+            ("{ echo a\n  git sttus\n}", &[Group], &["echo", "git"], &[]),
+            (
+                "if true; { echo a }; end",
+                &[If, Group],
+                &["true", "echo"],
+                &[],
+            ),
+            ("{echo,hi}", &[Group], &["echo,hi"], &[]),
         ]
     };
 
@@ -2669,8 +2821,16 @@ mod tests {
             "begin; git sttus",
             "if a; else; if b; end",
             "end",
+            "{ echo a",
+            "echo }",
+            "echo a;}",
+            "{ echo a }x",
+            "{ echo a}b }",
+            "{ begin; echo a }",
+            "{ echo a && }",
+            "{ echo a; end",
         ],
-        &["{ echo a; }"],
+        &[],
     );
 
     #[test]
@@ -2706,6 +2866,61 @@ mod tests {
     /// every form it reads parses there, and every form it calls malformed
     /// is a syntax error there too.
     #[cfg(unix)]
+    #[test]
+    fn arithmetic_is_one_unsupported_span_and_arrays_are_opaque_assignments() {
+        for src in [
+            "for ((i=0; i<3; i++)); do :; done",
+            "for ((i=0;i<3;i++)) do echo \"$i\"; done",
+            "(( i++ )) && git sttus",
+        ] {
+            let s = parse(src);
+            assert!(
+                !s.diagnostics.is_empty()
+                    && s.diagnostics
+                        .iter()
+                        .all(|d| d.kind == DiagnosticKind::CompoundCommand),
+                "{src:?}: {:?}",
+                s.diagnostics
+            );
+            #[cfg(unix)]
+            assert_ne!(shell_accepts("bash", src), Some(false), "{src:?}");
+        }
+        let s = parse("(( i++ )) && git sttus");
+        assert_eq!(
+            s.diagnostics[0].span.of("(( i++ )) && git sttus"),
+            "(( i++ ))"
+        );
+        assert_eq!(values(&s, 1), [Some("git"), Some("sttus")]);
+        for src in [
+            "a=( one two ); echo ${a[1]}",
+            "declare -a a=(x \"y z\") && git sttus",
+            "arr+=(x) git sttus",
+            "local -a list=( $(ls) 'b c' )",
+        ] {
+            let s = parse(src);
+            assert!(s.is_fully_supported(), "{src:?}: {:?}", s.diagnostics);
+            #[cfg(unix)]
+            assert_ne!(shell_accepts("bash", src), Some(false), "{src:?}");
+        }
+        let s = parse("arr+=(x) git sttus");
+        assert_eq!(
+            s.commands[0].assignments[0].span.of("arr+=(x) git sttus"),
+            "arr+=(x)"
+        );
+        assert_eq!(
+            s.commands[0].assignments[0].literal(),
+            None,
+            "array values are opaque"
+        );
+        assert_eq!(values(&s, 0), [Some("git"), Some("sttus")]);
+        // Only assignments and declaration builtins take array values.
+        for src in ["echo a=(x)", "for x in a=(b); do :; done"] {
+            assert!(!parse(src).is_fully_supported(), "{src:?}");
+            #[cfg(unix)]
+            assert_ne!(shell_accepts("bash", src), Some(true), "{src:?}");
+        }
+    }
+
     #[test]
     fn compound_syntax_agrees_with_installed_shells() {
         for (src, ..) in POSIX_COMPOUNDS {

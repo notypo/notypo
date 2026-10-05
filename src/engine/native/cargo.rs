@@ -559,7 +559,7 @@ impl Protocol {
         let mut text = self.help_text(backend, &args, &path, budget)?;
         for word in scope.args {
             if word.starts_with('-')
-                || !docs::subcommands(&text)
+                || !docs::subcommands(&text, "cargo")
                     .iter()
                     .any(|item| item.value == *word)
             {
@@ -689,7 +689,7 @@ impl Protocol {
             }
             items
         } else {
-            docs::subcommands(&self.help(backend, &scope, budget)?)
+            docs::subcommands(&self.help(backend, &scope, budget)?, "cargo")
         };
         items.retain(|item| item.value.starts_with(prefix));
         items.truncate(budget.max_candidates);
