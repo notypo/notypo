@@ -21,6 +21,10 @@ pub struct Args {
     pub yes: bool,
     pub repeat: bool,
     pub debug: bool,
+    /// Print how the structured engine diagnosed the command; run nothing.
+    pub explain: bool,
+    /// The same report as JSON on stdout, for automation; run nothing.
+    pub json: bool,
     pub force_command: Option<String>,
     pub command: Vec<String>,
 }
@@ -35,6 +39,8 @@ enum Opt {
     Yes,
     Repeat,
     Debug,
+    Explain,
+    Json,
     ForceCommand,
 }
 
@@ -50,6 +56,8 @@ impl Opt {
         ("hard", Opt::Yes),
         ("repeat", Opt::Repeat),
         ("debug", Opt::Debug),
+        ("explain", Opt::Explain),
+        ("json", Opt::Json),
         ("force-command", Opt::ForceCommand),
     ];
 
@@ -98,6 +106,8 @@ impl Opt {
             Opt::Yes => "-y/--yes/--yeah/--hard",
             Opt::Repeat => "-r/--repeat",
             Opt::Debug => "-d/--debug",
+            Opt::Explain => "--explain",
+            Opt::Json => "--json",
             Opt::ForceCommand => "--force-command",
         }
     }
@@ -200,6 +210,8 @@ pub fn parse<S: AsRef<str>>(argv: &[S], default_alias: &str) -> Result<Args, Str
                 Opt::InstantMode => args.instant_mode = true,
                 Opt::Help => args.help = true,
                 Opt::Debug => args.debug = true,
+                Opt::Explain => args.explain = true,
+                Opt::Json => args.json = true,
                 Opt::Alias => {
                     // nargs='?': consume the next argument unless it's an option.
                     let value = inline.or_else(|| {
@@ -241,7 +253,7 @@ pub fn parse<S: AsRef<str>>(argv: &[S], default_alias: &str) -> Result<Args, Str
 pub fn usage(prog: &str) -> String {
     let pad = " ".repeat(prog.len() + 8);
     format!(
-        "usage: {prog} [-v] [-a [ALIAS]] [-l SHELL_LOGGER]\n{pad}[--enable-experimental-instant-mode] [-h] [-y | -r] [-d]\n{pad}[command ...]\n"
+        "usage: {prog} [-v] [-a [ALIAS]] [-l SHELL_LOGGER]\n{pad}[--enable-experimental-instant-mode] [-h] [-y | -r] [-d]\n{pad}[--explain | --json] [command ...]\n"
     )
 }
 
@@ -268,6 +280,14 @@ pub fn help(prog: &str) -> String {
         ),
         ("-r, --repeat", "repeat on failure"),
         ("-d, --debug", "enable debug output"),
+        (
+            "--explain",
+            "show how the structured engine diagnoses the command, without running anything",
+        ),
+        (
+            "--json",
+            "print the structured engine's report as JSON on stdout, without running anything",
+        ),
     ];
     s.push_str("\npositional arguments:\n  command               command that should be fixed\n\noptions:\n");
     for (flags, text) in rows {
@@ -323,6 +343,9 @@ mod tests {
         assert!(p(&["--hard"]).yes);
         assert!(p(&["--rep"]).repeat);
         assert!(p(&["-l", "/tmp/log"]).shell_logger.is_some());
+        assert!(p(&["--explain", "--", "gti"]).explain);
+        assert!(p(&["gti", PLACEHOLDER, "--expl"]).explain);
+        assert!(p(&["--json", "--", "gti"]).json);
     }
 
     #[test]

@@ -226,6 +226,10 @@ pub(super) const RULES: &[Rule] = &[
             capture(regex!(r"Task '(\w+)' is not in your gulpfile"), c.output()).map_or_else(
                 Vec::new,
                 |broken| {
+                    // Listing tasks loads the gulpfile.
+                    if !crate::workspace::allows("gulp", &c.settings().trusted_workspaces) {
+                        return Vec::new();
+                    }
                     let commands =
                         utils::cached("gulp-tasks", &[PathBuf::from("gulpfile.js")], || {
                             run_stdout("gulp", &["--tasks-simple"])
@@ -408,6 +412,10 @@ pub(super) const RULES: &[Rule] = &[
         |c| c.is_app(&["react-native"]) && react_command(c).is_some(),
         |c| {
             react_command(c).map_or_else(Vec::new, |broken| {
+                // Its help loads the CLI installed in the project.
+                if !crate::workspace::allows("react-native", &c.settings().trusted_workspaces) {
+                    return Vec::new();
+                }
                 let commands = utils::cached(
                     "react-native-commands",
                     &[PathBuf::from("package.json")],
@@ -719,6 +727,10 @@ fn gradle_fix(c: &Command) -> Vec<String> {
     let Some(broken) = gradle_task(c) else {
         return Vec::new();
     };
+    // `gradle tasks` runs the build scripts, and `./gradlew` is the project's.
+    if !crate::workspace::allows(c.part(0), &c.settings().trusted_workspaces) {
+        return Vec::new();
+    }
     let help = run_stdout(c.part(0), &["tasks"]).unwrap_or_default();
     let mut listing = false;
     let mut tasks = Vec::new();
@@ -741,6 +753,10 @@ fn grunt_fix(c: &Command) -> Vec<String> {
     let Some(broken) = grunt_task(c).and_then(|task| task.split(':').next()) else {
         return Vec::new();
     };
+    // Its help loads the Gruntfile.
+    if !crate::workspace::allows("grunt", &c.settings().trusted_workspaces) {
+        return Vec::new();
+    }
     let tasks = utils::cached("grunt-tasks", &[PathBuf::from("Gruntfile.js")], || {
         let help = run_stdout("grunt", &["--help"]).unwrap_or_default();
         let mut listing = false;

@@ -218,6 +218,23 @@ fn emulate_cd(target: &str) -> Option<String> {
     }
 }
 
+/// Output already recorded for `script` by the shell logger or the instant
+/// mode log. Never runs anything.
+pub fn captured_output(
+    script: &str,
+    settings: &Settings,
+) -> Option<(String, crate::engine::OutputOrigin)> {
+    use crate::engine::OutputOrigin;
+    if let Some(socket) = captured::logger_socket() {
+        return captured::from_logger(script, &socket)
+            .map(|text| (text, OutputOrigin::ShellLogger));
+    }
+    if settings.instant_mode {
+        return captured::from_log(script).map(|text| (text, OutputOrigin::InstantModeLog));
+    }
+    None
+}
+
 /// `rerun.get_output(script, expanded)`; `None` when it timed out.
 pub fn get_output(script: &str, expanded: &str, settings: &Settings) -> Option<String> {
     if let Some(socket) = captured::logger_socket() {

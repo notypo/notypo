@@ -1,6 +1,6 @@
 # Python versus Rust benchmark
 
-Measured 2026-10-04T12:41:24.227893+00:00 on Apple M1 (arm64, macOS-27.0.1-arm64-arm-64bit-Mach-O).
+Measured 2026-10-04T16:20:16.541215+00:00 on Apple M1 (arm64, macOS-27.0.1-arm64-arm-64bit-Mach-O).
 Original local thefuck 3.32; Python 3.14.8; rustc 1.98.1 (48a229cea 2026-09-01); Rust release build with thin LTO.
 
 ## End-to-end CLI
@@ -13,17 +13,16 @@ Filesystem and bytecode caches are warm. Rust's PATH cache is enabled except in 
 
 | Case | Python ms (p95) | Rust ms (p95) | Speedup |
 |---|---:|---:|---:|
-| help_startup | 136.94 (140.45) | 4.03 (4.24) | 34.0× |
-| cd_parent_captured | 177.48 (184.43) | 6.08 (6.34) | 29.2× |
-| cd_parent_rerun | 179.76 (185.93) | 4.62 (4.85) | 38.9× |
-| mkdir_p_captured | 178.29 (184.57) | 6.38 (6.62) | 27.9× |
-| mkdir_p_rerun | 181.78 (191.20) | 6.28 (6.50) | 29.0× |
-| git_not_command_captured | 178.41 (188.33) | 6.55 (6.86) | 27.2× |
-| git_not_command_rerun | 189.02 (199.51) | 13.94 (14.94) | 13.6× |
-| sudo_captured | 179.12 (191.01) | 7.18 (7.38) | 25.0× |
-| no_command_captured | 182.32 (189.04) | 7.96 (8.23) | 22.9× |
-| no_command_rerun | 184.06 (193.51) | 6.39 (6.77) | 28.8× |
-| no_command_rerun_no_path_cache | 184.47 (191.75) | 8.65 (8.92) | 21.3× |
+| help_startup | 135.93 (139.89) | 4.09 (4.36) | 33.2× |
+| cd_parent_captured | 176.09 (180.98) | 10.25 (10.64) | 17.2× |
+| cd_parent_rerun | 178.23 (189.48) | 8.78 (9.46) | 20.3× |
+| mkdir_p_captured | 176.36 (182.36) | 10.08 (10.56) | 17.5× |
+| mkdir_p_rerun | 180.47 (186.63) | 9.92 (10.35) | 18.2× |
+| git_not_command_captured | 176.46 (187.36) | 24.71 (25.74) | 7.1× |
+| git_not_command_rerun | 187.56 (192.16) | 31.57 (32.61) | 5.9× |
+| no_command_captured | 180.15 (186.84) | 25.61 (26.46) | 7.0× |
+| no_command_rerun | 182.93 (195.15) | 24.03 (25.18) | 7.6× |
+| no_command_rerun_no_path_cache | 182.91 (194.46) | 27.13 (28.80) | 6.7× |
 
 ## Warm engine
 
@@ -33,15 +32,15 @@ Each iteration creates a fresh Command and requests the first correction. Rule d
 
 | Case | Python µs | Rust µs | Speedup |
 |---|---:|---:|---:|
-| cd_parent | 3.39 | 0.14 | 23.9× |
-| mkdir_p | 18.28 | 0.56 | 32.6× |
-| git_not_command | 28.77 | 1.19 | 24.2× |
-| sudo | 24.10 | 0.39 | 62.4× |
-| no_command | 689.97 | 67.17 | 10.3× |
+| cd_parent | 3.37 | 0.11 | 29.9× |
+| mkdir_p | 17.87 | 0.56 | 31.8× |
+| git_not_command | 28.62 | 1.19 | 24.0× |
+| sudo | 23.99 | 0.39 | 61.8× |
+| no_command | 690.10 | 67.75 | 10.2× |
 
 ## Memory
 
-Median peak resident memory for cd_parent_rerun over five separate `/usr/bin/time -l` runs: Python 40.58 MiB; Rust 3.84 MiB.
+Median peak resident memory for cd_parent_rerun over five separate `/usr/bin/time -l` runs: Python 40.50 MiB; Rust 6.80 MiB.
 This measures the correction process, not aggregate memory of its child processes.
 
 Results describe warm local macOS runs, not cold disk startup or other platforms. CLI gains include native startup, rule loading, PATH handling, terminal parsing and rerun optimizations; they do not isolate language execution speed.

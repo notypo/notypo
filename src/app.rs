@@ -2,13 +2,17 @@
 
 use crate::args::{self, Args};
 use crate::corrector::Corrector;
+use crate::engine::safety::{self, Decision, DeclaredEffect};
+use crate::engine::{self, CapturedOutput, FailureContext, Outcome, OutputOrigin, Report};
 use crate::settings::Settings;
 #[cfg(unix)]
 use crate::shell_logger;
 use crate::shells::{DEFAULT_ALIASES, Shell};
 use crate::types::{Command, Context, CorrectedCommand};
+use crate::ui::{Choice, Suggestions};
 use crate::{difflib, logs, output_readers, ui, utils};
 use std::env;
+use std::fmt::Write as _;
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +56,7 @@ pub fn main(argv: &[String]) -> ExitCode {
     } else if args.force_command.is_some()
         || !args.command.is_empty()
         || env::var_os("TF_HISTORY").is_some()
+        || env::var_os("NOTYPO_CURRENT_COMMAND").is_some()
     {
         return fix_command(&args);
     } else if let Some(path) = &args.shell_logger {
@@ -115,10 +120,36 @@ fn print_alias(args: &Args, alias: &str) {
 }
 
 /// `_get_raw_command`: explicit arguments, or the newest `TF_HISTORY`
-/// entry that isn't (a typo of) our own alias.
-fn raw_command(args: &Args, ctx: &Context) -> Vec<String> {
+/// entry that isn't (a typo of) our own alias. The flag tells whether the
+/// exit status the shell function captured belongs to that command: only
+/// when nothing but this correction call ran after it.
+fn raw_command(args: &Args, ctx: &Context) -> (Vec<String>, bool) {
     if let Some(command) = &args.force_command {
-        return vec![command.clone()];
+        return (vec![command.clone()], false);
+    }
+    if ctx.shell == Shell::Fish
+        && let Ok(current) = env::var("NOTYPO_CURRENT_COMMAND")
+        && !current.trim().is_empty()
+    {
+        return (vec![current], true);
+    }
+    // tcsh's alias exports the previous event (and its status) for the
+    // duration of the call; a command given explicitly still wins.
+    if ctx.shell == Shell::Tcsh
+        && args.command.is_empty()
+        && let Ok(current) = env::var("NOTYPO_CURRENT_COMMAND")
+        && !current.trim().is_empty()
+    {
+        return (vec![current], true);
+    }
+    // PowerShell's function passes its last history entry (and its status
+    // and error records) the same way.
+    if ctx.shell == Shell::Powershell
+        && args.command.is_empty()
+        && let Ok(current) = env::var("NOTYPO_CURRENT_COMMAND")
+        && !current.trim().is_empty()
+    {
+        return (vec![current], true);
     }
     // Zsh's `fc -ln -10` omits a multiline paste while it is executing.
     // The shell function supplies that event separately, with real newlines.
@@ -126,11 +157,11 @@ fn raw_command(args: &Args, ctx: &Context) -> Vec<String> {
         && let Ok(current) = env::var("NOTYPO_CURRENT_COMMAND")
         && let Some(command) = command_before_alias(&current, ctx)
     {
-        return vec![command];
+        return (vec![command], true);
     }
     let history = env::var("TF_HISTORY").unwrap_or_default();
     if history.is_empty() {
-        return args.command.clone();
+        return (args.command.clone(), false);
     }
     let is_executable = |name: &str| {
         // Our alias is never among the executables (it's filtered out), so
@@ -138,15 +169,23 @@ fn raw_command(args: &Args, ctx: &Context) -> Vec<String> {
         !(name == ctx.alias && ["fuck", "thefuck"].contains(&name))
             && ctx.executables().iter().any(|e| e == name)
     };
-    history
+    let mut later_calls = 0;
+    let mut skipped = false;
+    for line in history
         .split('\n')
         .rev()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter(|line| !is_alias_invocation(line, ctx))
-        .find(|line| difflib::ratio(&ctx.alias, line) < 0.5 || is_executable(line))
-        .map(|line| vec![line.to_owned()])
-        .unwrap_or_default()
+    {
+        if is_alias_invocation(line, ctx) {
+            later_calls += 1;
+        } else if difflib::ratio(&ctx.alias, line) < 0.5 || is_executable(line) {
+            return (vec![line.to_owned()], later_calls <= 1 && !skipped);
+        } else {
+            skipped = true;
+        }
+    }
+    (Vec::new(), false)
 }
 
 fn is_alias_invocation(script: &str, ctx: &Context) -> bool {
@@ -179,33 +218,648 @@ pub fn fix_command(args: &Args) -> ExitCode {
     logs::debug(format_args!("Run with settings: {settings:#?}"));
     let ctx = Context::new(settings, Shell::detect(), utils::get_alias());
 
-    let script = utils::format_raw_script(&raw_command(args, &ctx));
+    let (raw, status_applies) = raw_command(args, &ctx);
+    let script = utils::format_raw_script(&raw);
     if script.is_empty() {
         logs::debug("Empty command, nothing to do");
         return ExitCode::SUCCESS;
     }
     let expanded = ctx.shell.from_shell(&script);
-    let output = output_readers::get_output(&script, &expanded, &ctx.settings);
-    let command = Command::new(expanded, output.as_deref(), &ctx);
-
-    let mut corrector = Corrector::new(&command);
-    let code = match ui::select_command(
-        &mut corrector,
-        ctx.settings.require_confirmation,
-        &ctx.alias,
-    ) {
-        Some(selected) => {
-            run_corrected(&command, &selected);
-            ExitCode::SUCCESS
-        }
-        None => ExitCode::FAILURE,
-    };
+    let code = fix_with_engine(args, &ctx, &script, &expanded, status_applies);
     logs::debug(format_args!("Total took: {:?}", started.elapsed()));
     code
 }
 
+/// Captured output only (the command is rerun just when
+/// `replay_for_diagnosis` allows it and the safety gate agrees), then the
+/// engine's candidates and the legacy rules' suggestions, all gated.
+fn fix_with_engine(
+    args: &Args,
+    ctx: &Context,
+    script: &str,
+    expanded: &str,
+    status_applies: bool,
+) -> ExitCode {
+    let (exit_status, pipe_status) = if status_applies {
+        engine::status_from_env()
+    } else {
+        (None, None)
+    };
+    let mut output = match output_readers::captured_output(script, &ctx.settings) {
+        Some((text, origin)) => CapturedOutput::Combined { text, origin },
+        None => CapturedOutput::Unknown,
+    };
+    // PowerShell's error records for the history entry, when its function
+    // passed them along with the entry.
+    if output == CapturedOutput::Unknown
+        && status_applies
+        && ctx.shell == Shell::Powershell
+        && let Ok(text) = env::var("NOTYPO_POWERSHELL_ERRORS")
+        && !text.trim().is_empty()
+    {
+        output = CapturedOutput::Combined {
+            text: text.chars().take(16384).collect(),
+            origin: OutputOrigin::ShellErrors,
+        };
+    }
+    let inspecting = args.explain || args.json;
+    if output == CapturedOutput::Unknown
+        && ctx.settings.replay_for_diagnosis
+        && !inspecting
+        && let Some(dialect) = engine::parser::Dialect::for_shell(ctx.shell)
+    {
+        let gate = safety::assess_replay_with_context(expanded, dialect, ctx);
+        if gate.decision == Decision::Allow {
+            if let Some(text) = output_readers::get_output(script, expanded, &ctx.settings) {
+                output = CapturedOutput::Combined {
+                    text,
+                    origin: OutputOrigin::Replay,
+                };
+            }
+        } else {
+            logs::debug(format_args!(
+                "Not replaying the command: {}",
+                gate.reasons.join("; ")
+            ));
+        }
+    }
+    // The engine reads aliases itself: it takes vocabulary from an alias's
+    // target, judges safety through the expansion, and keeps the word the
+    // user typed. Legacy rules and replay still see thefuck's expansion.
+    let failure = FailureContext {
+        source: script.to_owned(),
+        cwd: env::current_dir().ok(),
+        exit_status,
+        pipe_status,
+        output,
+    };
+    let report = logs::debug_time("Structured engine", || engine::correct(&failure, ctx));
+    for note in &report.notes {
+        logs::debug(note);
+    }
+    logs::debug(format_args!(
+        "Outcome: {} ({} probes)",
+        report.outcome.describe(),
+        report.probes
+    ));
+    if args.json {
+        println!("{}", report_json(&failure, &report));
+        return ExitCode::SUCCESS;
+    }
+    if args.explain {
+        eprint!("{}", explain(&failure, &report));
+        return ExitCode::SUCCESS;
+    }
+    if engine::parser::Dialect::for_shell(ctx.shell).is_none() {
+        logs::failed(&report.outcome.describe());
+        return ExitCode::FAILURE;
+    }
+    let command = Command::new(expanded, failure.output.diagnostic_text(), ctx);
+    let mut suggestions = EngineSuggestions::new(&report, &command);
+    match ui::select_command(
+        &mut suggestions,
+        ctx.settings.require_confirmation,
+        &ctx.alias,
+    ) {
+        Some(selected) => match revalidate(ctx, &failure, &report, &selected) {
+            Ok(()) => {
+                run_corrected(&command, &selected);
+                ExitCode::SUCCESS
+            }
+            Err(why) => {
+                logs::failed(&format!("Not running `{}`: {why}", selected.script));
+                ExitCode::FAILURE
+            }
+        },
+        None => ExitCode::FAILURE,
+    }
+}
+
+/// Rechecks a selected engine correction right before the shell runs it
+/// (see [`engine::revalidate`]). Legacy rule suggestions carry no facts to
+/// recheck; their effects were declared to the safety gate instead.
+fn revalidate(
+    ctx: &Context,
+    failure: &FailureContext,
+    report: &Report,
+    selected: &Choice,
+) -> Result<(), String> {
+    match report
+        .outcome
+        .candidates()
+        .iter()
+        .find(|c| c.script == selected.script)
+    {
+        Some(candidate) => engine::revalidate(candidate, failure, ctx),
+        None => Ok(()),
+    }
+}
+
+/// Engine candidates and legacy rule suggestions, each with the reason it
+/// is offered and what needs approval. A decisive engine suggestion comes
+/// first; otherwise a matching rule does (rules encode specific fixes the
+/// engine can't always see without output), followed by the engine's.
+/// Rules are evaluated only when needed.
+struct EngineSuggestions<'c, 'a> {
+    context: &'a Context,
+    native: Vec<Choice>,
+    /// The engine's first candidate was chosen on its own evidence.
+    decisive: bool,
+    /// A rule's suggestion was offered first.
+    led_by_legacy: bool,
+    legacy: Option<Corrector<'c, 'a>>,
+    /// The legacy suggestion already taken from the corrector.
+    legacy_first: Option<CorrectedCommand>,
+    legacy_done: bool,
+    pending: Vec<Choice>,
+    original: engine::parser::Script,
+}
+
+impl<'c, 'a> EngineSuggestions<'c, 'a> {
+    fn new(report: &Report, command: &'c Command<'a>) -> Self {
+        let candidates = report.outcome.candidates();
+        let ambiguous = matches!(report.outcome, Outcome::Ambiguous(_));
+        let native = candidates
+            .iter()
+            .enumerate()
+            .map(|(n, c)| {
+                let mut concerns = Vec::new();
+                if c.safety.decision == Decision::Confirm {
+                    concerns.extend(c.safety.reasons.iter().cloned());
+                }
+                if n == 0 && ambiguous {
+                    concerns.push(if c.weak {
+                        "the shell did not report the command as missing".into()
+                    } else if candidates.len() > 1 {
+                        format!("{} close alternatives", candidates.len() - 1)
+                    } else {
+                        "low confidence".into()
+                    });
+                }
+                Choice {
+                    script: c.script.clone(),
+                    side_effect: None,
+                    reason: Some(c.reason()),
+                    concerns,
+                }
+            })
+            .collect();
+        let legacy = command
+            .settings()
+            .is_source_enabled(engine::Source::LegacyRule.setting_name())
+            .then(|| Corrector::new(command));
+        EngineSuggestions {
+            context: command.ctx(),
+            native,
+            decisive: matches!(report.outcome, Outcome::Suggestion(_)),
+            led_by_legacy: false,
+            legacy,
+            legacy_first: None,
+            legacy_done: false,
+            pending: Vec::new(),
+            original: engine::parser::parse_with_dialect(
+                &command.script,
+                engine::parser::Dialect::for_shell(command.shell()).unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// The safety gate for a legacy rule's whole-command replacement.
+    fn gate(&self, corrected: CorrectedCommand) -> Option<Choice> {
+        let effects: Vec<DeclaredEffect> = corrected
+            .side_effect
+            .map(|_| DeclaredEffect::for_rule(corrected.rule))
+            .into_iter()
+            .collect();
+        let assessment =
+            safety::assess_with_context(&self.original, &corrected.script, &effects, self.context);
+        if assessment.decision == Decision::Refuse {
+            logs::debug(format_args!(
+                "Refused {}: {}",
+                corrected.script,
+                assessment.reasons.join("; ")
+            ));
+            return None;
+        }
+        Some(Choice {
+            reason: Some(format!("legacy rule {}", corrected.rule)),
+            concerns: if assessment.decision == Decision::Confirm {
+                assessment.reasons
+            } else {
+                Vec::new()
+            },
+            script: corrected.script,
+            side_effect: corrected.side_effect,
+        })
+    }
+
+    /// Every legacy suggestion not taken yet.
+    fn legacy_rest(&mut self) -> Vec<CorrectedCommand> {
+        if self.legacy_done {
+            return Vec::new();
+        }
+        self.legacy_done = true;
+        let Some(legacy) = self.legacy.as_mut() else {
+            return Vec::new();
+        };
+        match self.legacy_first.take() {
+            Some(first) => legacy.rest(&first),
+            None => match legacy.first() {
+                Some(first) => {
+                    let rest = legacy.rest(&first);
+                    std::iter::once(first).chain(rest).collect()
+                }
+                None => Vec::new(),
+            },
+        }
+    }
+}
+
+impl EngineSuggestions<'_, '_> {
+    /// The first legacy suggestion the safety gate doesn't refuse.
+    fn legacy_first(&mut self) -> Option<Choice> {
+        let first = self.legacy.as_mut()?.first()?;
+        self.legacy_first = Some(first.clone());
+        if let Some(choice) = self.gate(first) {
+            return Some(choice);
+        }
+        let mut acceptable = self
+            .legacy_rest()
+            .into_iter()
+            .filter_map(|c| self.gate(c))
+            .collect::<Vec<_>>()
+            .into_iter();
+        let choice = acceptable.next()?;
+        self.pending = acceptable.collect();
+        Some(choice)
+    }
+}
+
+impl Suggestions for EngineSuggestions<'_, '_> {
+    fn first(&mut self) -> Option<Choice> {
+        if self.decisive
+            && let Some(first) = self.native.first()
+        {
+            return Some(first.clone());
+        }
+        if let Some(choice) = self.legacy_first() {
+            self.led_by_legacy = true;
+            return Some(choice);
+        }
+        self.native.first().cloned()
+    }
+
+    fn rest(&mut self, first: &Choice) -> Vec<Choice> {
+        let skip = usize::from(!self.led_by_legacy);
+        let mut all: Vec<Choice> = self.native.iter().skip(skip).cloned().collect();
+        all.append(&mut self.pending);
+        let legacy: Vec<Choice> = self
+            .legacy_rest()
+            .into_iter()
+            .filter_map(|c| self.gate(c))
+            .collect();
+        all.extend(legacy);
+        let mut unique: Vec<Choice> = Vec::with_capacity(all.len());
+        for choice in all {
+            if choice != *first && !unique.contains(&choice) {
+                unique.push(choice);
+            }
+        }
+        unique
+    }
+}
+
+/// Passwords typed on a command line, which reports never show: archive
+/// passwords (7-Zip's and rar's `-p<pwd>`, rar's `-hp<pwd>`, zip's and
+/// unzip's `-P <pwd>`, unar/lsar's `-p`/`-password`, ouch's and dtrx's
+/// `-p`), MySQL's attached `-p<pwd>`, sshpass's `-p`,
+/// openssl's `pass:` values, curl's `-u user:password`, and any
+/// `--password`/`--passphrase` value, or that of an option named like an
+/// API key, token, or secret (`--anthropic-api-key`, `--api-key
+/// provider=KEY`, and aider's `--set-env NAME=VALUE`).
+fn secrets<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for line in lines {
+        let Ok(words) = crate::shlex::split(line) else {
+            continue;
+        };
+        let words: Vec<String> = words.into_iter().map(|word| word.into_owned()).collect();
+        let program = words
+            .first()
+            .map(|word| word.rsplit(['/', '\\']).next().unwrap_or(word).to_owned())
+            .unwrap_or_default();
+        let attached = |word: &str, flag: &str| {
+            word.strip_prefix(flag)
+                .filter(|rest| !rest.is_empty() && !word.starts_with("--"))
+                .map(str::to_owned)
+        };
+        // `--api-key provider=KEY` and `--set-env NAME=VALUE` hold the
+        // secret after `=`.
+        let keyed = |name: &str| matches!(name, "--api-key" | "--set-env");
+        let secret_option = |name: &str| {
+            let name = name.to_ascii_lowercase();
+            name.starts_with("--")
+                && ["api-key", "api_key", "apikey", "-token", "-secret"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+                || keyed(&name)
+        };
+        let mut words = words.iter().skip(1);
+        while let Some(word) = words.next() {
+            let mut take = |value: Option<String>| {
+                if let Some(value) = value.filter(|value| !value.is_empty()) {
+                    found.push(value);
+                }
+            };
+            if let Some((name, value)) = word.split_once('=')
+                && secret_option(name)
+            {
+                take(Some(value.to_owned()));
+                if keyed(name) {
+                    take(value.split_once('=').map(|(_, key)| key.to_owned()));
+                }
+                continue;
+            }
+            if secret_option(word) {
+                let value = words.next().cloned();
+                if keyed(word) {
+                    take(
+                        value
+                            .as_deref()
+                            .and_then(|value| value.split_once('='))
+                            .map(|(_, key)| key.to_owned()),
+                    );
+                }
+                take(value);
+                continue;
+            }
+            if let Some((name, value)) = word.split_once('=')
+                && ["--password", "--passphrase", "--passwd", "--pass"].contains(&name)
+            {
+                take(Some(value.to_owned()));
+                continue;
+            }
+            if ["--password", "--passphrase", "--passwd"].contains(&word.as_str()) {
+                take(words.next().cloned());
+                continue;
+            }
+            match program.as_str() {
+                "7z" | "7za" | "7zr" | "7zz" => take(attached(word, "-p")),
+                "rar" | "unrar" => take(attached(word, "-hp").or_else(|| attached(word, "-p"))),
+                "zip" | "unzip" | "zipcloak" | "funzip" if word == "-P" => {
+                    take(words.next().cloned())
+                }
+                "mysql" | "mariadb" | "mysqldump" | "mysqladmin" | "mysqlimport" => {
+                    take(attached(word, "-p"))
+                }
+                "sshpass" | "ouch" | "dtrx" if word == "-p" => take(words.next().cloned()),
+                "sshpass" | "ouch" | "dtrx" => take(attached(word, "-p")),
+                // XADMaster's options are whole words with separate values.
+                "unar" | "lsar" if word == "-p" || word == "-password" => {
+                    take(words.next().cloned())
+                }
+                "openssl" => take(word.strip_prefix("pass:").map(str::to_owned)),
+                "curl" if word == "-u" || word == "--user" => take(
+                    words
+                        .next()
+                        .and_then(|user| user.split_once(':'))
+                        .map(|(_, password)| password.to_owned()),
+                ),
+                "curl" => take(
+                    attached(word, "-u")
+                        .and_then(|user| user.split_once(':').map(|(_, p)| p.to_owned())),
+                ),
+                _ => {}
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    // Mask longer secrets first, so one containing another stays hidden.
+    found.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    found
+}
+
+/// `text` with every secret that stands as a whole word (not inside a
+/// longer word) replaced by `***`.
+fn mask(text: &str, secrets: &[String]) -> String {
+    let mut text = text.to_owned();
+    for secret in secrets {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(secret.as_str()) {
+            let before = rest[..at].chars().next_back();
+            let after = rest[at + secret.len()..].chars().next();
+            let inside = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric());
+            out.push_str(&rest[..at]);
+            // An attached flag (`-psecret`) still masks its value.
+            let attached_flag = before.is_some_and(|c| c.is_alphabetic())
+                && rest[..at]
+                    .rsplit(' ')
+                    .next()
+                    .is_some_and(|w| w.starts_with('-'));
+            if (!inside(before) || attached_flag) && !inside(after) {
+                out.push_str("***");
+            } else {
+                out.push_str(secret);
+            }
+            rest = &rest[at + secret.len()..];
+        }
+        out.push_str(rest);
+        text = out;
+    }
+    text
+}
+
+fn mask_json(value: &mut serde_json::Value, secrets: &[String]) {
+    match value {
+        serde_json::Value::String(text) => *text = mask(text, secrets),
+        serde_json::Value::Array(items) => {
+            items.iter_mut().for_each(|item| mask_json(item, secrets))
+        }
+        serde_json::Value::Object(map) => {
+            map.values_mut().for_each(|item| mask_json(item, secrets))
+        }
+        _ => {}
+    }
+}
+
+/// The secrets on the failed line and on every candidate a report lists.
+fn report_secrets(failure: &FailureContext, report: &Report) -> Vec<String> {
+    let listed = match &report.outcome {
+        Outcome::Unsafe(c) => c.as_slice(),
+        other => other.candidates(),
+    };
+    secrets(
+        std::iter::once(failure.source.as_str())
+            .chain(listed.iter().map(|candidate| candidate.script.as_str())),
+    )
+}
+
+/// The `--explain` report: what was known, what each source found, and why
+/// candidates were ranked and gated as they were. Passwords are masked.
+fn explain(failure: &FailureContext, report: &Report) -> String {
+    let secrets = report_secrets(failure, report);
+    mask(&explain_unmasked(failure, report), &secrets)
+}
+
+fn explain_unmasked(failure: &FailureContext, report: &Report) -> String {
+    let mut out = String::new();
+    let unknown = || "unknown".to_owned();
+    let _ = writeln!(out, "command:     {}", failure.source);
+    let _ = writeln!(
+        out,
+        "exit status: {}",
+        failure.exit_status.map_or_else(unknown, |s| s.to_string())
+    );
+    if let Some(pipe) = &failure.pipe_status {
+        let _ = writeln!(out, "pipe status: {pipe:?}");
+    }
+    let _ = writeln!(
+        out,
+        "output:      {}",
+        match &failure.output {
+            CapturedOutput::Unknown => "not captured (the command is not rerun)".to_owned(),
+            CapturedOutput::Combined {
+                origin: OutputOrigin::ShellErrors,
+                ..
+            } => "ShellErrors (the shell's error records only)".to_owned(),
+            CapturedOutput::Combined { origin, .. } =>
+                format!("{origin:?} (stdout and stderr combined)"),
+            CapturedOutput::Separate { .. } => "stdout and stderr".to_owned(),
+        }
+    );
+    for suspicion in &report.suspicions {
+        let _ = writeln!(
+            out,
+            "suspect:     {:?} `{}` (strength {:.2})",
+            suspicion.role, suspicion.token, suspicion.score
+        );
+        for evidence in &suspicion.evidence {
+            let _ = writeln!(
+                out,
+                "   evidence ({}): {}",
+                evidence.source.setting_name(),
+                evidence.detail
+            );
+        }
+    }
+    let _ = writeln!(out, "outcome:     {}", report.outcome.describe());
+    let listed = match &report.outcome {
+        Outcome::Unsafe(c) => c.as_slice(),
+        other => other.candidates(),
+    };
+    for (n, candidate) in listed.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "{}. {}  [score {:.2}, {:?}]",
+            n + 1,
+            candidate.script,
+            candidate.score,
+            candidate.safety.decision
+        );
+        for edit in &candidate.edits {
+            let _ = writeln!(
+                out,
+                "   {:?} `{}` → `{}` via {} (similarity {:.2}, distance {}, hint {:.2})",
+                edit.role,
+                edit.from,
+                edit.to,
+                edit.via,
+                edit.score.similarity,
+                edit.score.distance,
+                edit.score.hint
+            );
+            if let Some(description) = &edit.description {
+                let _ = writeln!(out, "      `{}`: {description}", edit.to);
+            }
+        }
+        for evidence in &candidate.evidence {
+            let _ = writeln!(
+                out,
+                "   evidence ({}): {}",
+                evidence.source.setting_name(),
+                evidence.detail
+            );
+        }
+        for reason in &candidate.safety.reasons {
+            let _ = writeln!(out, "   safety: {reason}");
+        }
+    }
+    for note in &report.notes {
+        let _ = writeln!(out, "note: {note}");
+    }
+    let _ = writeln!(out, "probes:      {}", report.probes);
+    out
+}
+
+/// The `--json` report. Field names are part of the CLI's interface.
+/// Passwords are masked.
+fn report_json(failure: &FailureContext, report: &Report) -> serde_json::Value {
+    let mut value = report_json_unmasked(failure, report);
+    mask_json(&mut value, &report_secrets(failure, report));
+    value
+}
+
+fn report_json_unmasked(failure: &FailureContext, report: &Report) -> serde_json::Value {
+    use serde_json::json;
+    let (kind, listed) = match &report.outcome {
+        Outcome::Suggestion(c) => ("suggestion", c.as_slice()),
+        Outcome::Ambiguous(c) => ("ambiguous", c.as_slice()),
+        Outcome::Unsafe(c) => ("unsafe", c.as_slice()),
+        Outcome::UnsupportedSyntax(_) => ("unsupported_syntax", &[][..]),
+        Outcome::InsufficientEvidence(_) => ("insufficient_evidence", &[][..]),
+        Outcome::NoCorrection(_) => ("no_correction", &[][..]),
+    };
+    let evidence = |e: &[engine::Evidence]| -> Vec<serde_json::Value> {
+        e.iter()
+            .map(|e| json!({"source": e.source.setting_name(), "detail": e.detail}))
+            .collect()
+    };
+    json!({
+        "command": failure.source,
+        "exit_status": failure.exit_status,
+        "pipe_status": failure.pipe_status,
+        "output": match &failure.output {
+            CapturedOutput::Unknown => serde_json::Value::Null,
+            CapturedOutput::Combined { origin, .. } => json!({"streams": "combined", "origin": format!("{origin:?}")}),
+            CapturedOutput::Separate { .. } => json!({"streams": "separate"}),
+        },
+        "outcome": {"kind": kind, "description": report.outcome.describe()},
+        "candidates": listed.iter().map(|c| json!({
+            "command": c.script,
+            "score": c.score,
+            "weak": c.weak,
+            "safety": {
+                "decision": format!("{:?}", c.safety.decision).to_lowercase(),
+                "reasons": c.safety.reasons,
+            },
+            "edits": c.edits.iter().map(|e| json!({
+                "role": format!("{:?}", e.role),
+                "from": e.from,
+                "to": e.to,
+                "via": e.via,
+                "description": e.description,
+                "start": e.span.start,
+                "end": e.span.end,
+                "similarity": e.score.similarity,
+                "distance": e.score.distance,
+            })).collect::<Vec<_>>(),
+            "evidence": evidence(&c.evidence),
+        })).collect::<Vec<_>>(),
+        "suspicions": report.suspicions.iter().map(|s| json!({
+            "role": format!("{:?}", s.role),
+            "token": s.token,
+            "strength": s.score,
+            "evidence": evidence(&s.evidence),
+        })).collect::<Vec<_>>(),
+        "notes": report.notes,
+        "probes": report.probes,
+    })
+}
+
 /// `CorrectedCommand.run`: side effect, history, then print for the alias to eval.
-fn run_corrected(old: &Command, corrected: &CorrectedCommand) {
+fn run_corrected(old: &Command, corrected: &Choice) {
     let ctx = old.ctx();
     if let Some(side_effect) = corrected.side_effect {
         side_effect(old, &corrected.script);
@@ -306,6 +960,100 @@ mod tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_mask_passwords_typed_on_the_command_line() {
+        let found = secrets([
+            "7z x -psecret1 a.7z",
+            "zip -P hunter2 out.zip file",
+            "rar x -hpveiled a.rar",
+            "mysql -pdbpass -u root",
+            "mysql -p -u root",
+            "openssl enc -pass pass:sslpass -in f",
+            "curl -u alice:curlpass https://example.com",
+            "tool --password=eqpass --passphrase phrase9",
+            "unar -password unarpass a.rar",
+            "lsar -p lsarpass a.rar",
+            "ouch -p ouchpass decompress a.7z",
+            "dtrx -pdtrxpass a.zip",
+            "aider --anthropic-api-key sk-ant-1 --openai-api-key=sk-2 x.py",
+            "aider --api-key deepseek=sk-3 --set-env AZURE_API_KEY=sk-4",
+            "gh --GITHUB-TOKEN tok5",
+        ]);
+        for secret in [
+            "secret1", "hunter2", "veiled", "dbpass", "sslpass", "curlpass", "eqpass", "phrase9",
+            "unarpass", "lsarpass", "ouchpass", "dtrxpass", "sk-ant-1", "sk-2", "sk-3", "sk-4",
+            "tok5",
+        ] {
+            assert!(found.iter().any(|s| s == secret), "{secret}: {found:?}");
+        }
+        assert!(!found.iter().any(|s| s == "-u" || s == "root"), "{found:?}");
+        // Option names and prompt text are not secrets.
+        let found_aider = secrets(["aider --thinking-tokens 5 --message token x.py"]);
+        assert!(found_aider.is_empty(), "{found_aider:?}");
+        let masked = mask(
+            "command: 7z x -psecret1 a.7z; `hunter2x` stays; zip -P hunter2 out.zip",
+            &found,
+        );
+        assert_eq!(
+            masked,
+            "command: 7z x -p*** a.7z; `hunter2x` stays; zip -P *** out.zip"
+        );
+        let mut value =
+            serde_json::json!({"command": "zip -P hunter2 o.zip", "notes": ["after `-P hunter2`"]});
+        mask_json(&mut value, &found);
+        assert_eq!(value["command"], "zip -P *** o.zip");
+        assert_eq!(value["notes"][0], "after `-P ***`");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_choices_keep_package_identity_policy_without_native_completion() {
+        let dir = engine::native::tests::Dir::new("legacy-package-policy");
+        let executable = dir.script(
+            "package-tool",
+            "#!/usr/bin/env python3\nfrom pip._internal.cli.main import main\n",
+        );
+        let settings = Settings {
+            disabled_sources: [
+                "native",
+                "help",
+                "man",
+                "history",
+                "executables",
+                "filesystem",
+                "stderr",
+                "legacy",
+            ]
+            .map(String::from)
+            .into(),
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("package-tool", Some(executable.to_str().unwrap()));
+        let failure = FailureContext {
+            source: "package-tool instal example".into(),
+            ..FailureContext::default()
+        };
+        let report = engine::correct(&failure, &ctx);
+        assert_eq!(report.probes, 0);
+        let command = Command::new(&failure.source, None, &ctx);
+        let suggestions = EngineSuggestions::new(&report, &command);
+        let choice = suggestions
+            .gate(CorrectedCommand {
+                script: "package-tool install example".into(),
+                side_effect: None,
+                priority: 1,
+                rule: "test-rule",
+            })
+            .unwrap();
+        assert!(
+            choice
+                .concerns
+                .iter()
+                .any(|reason| reason.contains("changes installed packages"))
+        );
+    }
 
     #[test]
     fn selects_failed_command_from_pasted_zsh_event() {
