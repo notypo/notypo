@@ -83,9 +83,21 @@ pub fn score_token_as(
 ) -> ScoreBreakdown {
     let (a, dashes_a) = comparison.split(typed);
     let (b, dashes_b) = comparison.split(candidate);
-    let distance = osa_chars(&a, &b, usize::MAX, &mut Rows::default())
+    let mut distance = osa_chars(&a, &b, usize::MAX, &mut Rows::default())
         .map_or(usize::MAX, |d| d + usize::from(dashes_a != dashes_b));
+    if other_letter_case(comparison, &typed[dashes_a..], &candidate[dashes_b..]) {
+        distance = distance.max(1);
+    }
     breakdown(typed, candidate, &a, &b, distance, hinted, uses)
+}
+
+/// One-letter options are distinct in either case: zip's `-P` sets a
+/// password, `-p` stores paths. Neither spells the other.
+fn other_letter_case(comparison: Comparison, typed: &str, candidate: &str) -> bool {
+    comparison == Comparison::OptionName
+        && typed.chars().count() == 1
+        && candidate.chars().count() == 1
+        && typed != candidate
 }
 
 fn breakdown(
@@ -227,6 +239,11 @@ pub fn rank_tokens_as<'v>(
         let Some(distance) = osa_chars(&a, &b, bound, &mut rows) else {
             continue;
         };
+        let distance = if other_letter_case(comparison, &typed[dashes_a..], &word[dashes..]) {
+            distance.max(1)
+        } else {
+            distance
+        };
         let score = breakdown(typed, word, &a, &b, distance + restyled, hinted, used);
         if score.total >= FLOOR {
             scored.push((n, word, score));
@@ -298,6 +315,18 @@ mod tests {
         let restyled = score_token_as(Comparison::OptionName, "-region", "--region", false, 0);
         assert_eq!(restyled.distance, 1, "a different dash style is one edit");
         assert_eq!(restyled.case, 0.0);
+        // A one-letter option in the other case is another option.
+        let other = score_token_as(Comparison::OptionName, "-P", "-p", false, 0);
+        assert_eq!((other.distance, other.similarity), (1, 0.0));
+        let ranked = rank_tokens_as(
+            Comparison::OptionName,
+            "-P",
+            ["-p", "--paths"],
+            &[],
+            &|_| 0,
+            5,
+        );
+        assert!(ranked.iter().all(|(word, _)| *word != "-p"), "{ranked:?}");
         assert!(restyled.total >= ACCEPT);
         let swapped = score_token_as(Comparison::OptionName, "--regoin", "--region", false, 0);
         assert!(swapped.similarity < score_token("--regoin", "--region", false, 0).similarity);

@@ -179,6 +179,9 @@ fn run_inner(
             None => process.env_remove(key),
         };
     }
+    if let Some(path) = super::native::startup_stubs(probe.program, &probe.env) {
+        process.env("PATH", path);
+    }
     // The child inherits the extra descriptor at fork; the parent's copy must
     // close right after the spawn so the reader sees EOF.
     let mut extra_writer = None;
@@ -233,7 +236,7 @@ fn run_inner(
         crate::platform::unix::controlling_terminal(&mut process);
         Some(master)
     } else {
-        process.process_group(0);
+        crate::platform::unix::new_session(&mut process);
         None
     };
     #[cfg(not(unix))]
@@ -323,6 +326,23 @@ mod tests {
 
     fn budget() -> Budget {
         Budget::new(Duration::from_secs(10), Duration::from_secs(5), 8)
+    }
+
+    /// A probe that asked for a passphrase (borg, ssh, gpg open /dev/tty)
+    /// would print on the user's terminal and stall there. Run from a
+    /// terminal, this proves probes have none.
+    #[cfg(unix)]
+    #[test]
+    fn probes_have_no_controlling_terminal() {
+        let (program, args) = sh("if (: </dev/tty) 2>/dev/null; then echo tty; else echo none; fi");
+        let probe = Probe {
+            program: &program,
+            args,
+            env: Vec::new(),
+            capture: Capture::Stdout,
+        };
+        let output = run(&probe, &mut budget()).unwrap();
+        assert_eq!(output.data, b"none\n");
     }
 
     #[test]

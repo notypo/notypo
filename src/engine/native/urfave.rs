@@ -411,6 +411,8 @@ impl Protocol {
                         .into(),
                 ));
             }
+            // Asked now, so judging resources later needs no probe.
+            self.callback_level(backend, &walk.path, &level, &mut mode);
             level.words
         };
         items.retain(|item| item.value.starts_with(prefix));
@@ -456,9 +458,41 @@ impl Protocol {
         match self.walk(backend, words, &mut mode) {
             Ok(walk) if !walk.positional => self
                 .level(backend, &walk.path, &mut mode)
-                .map_or(true, |level| level.custom),
+                .map_or(true, |level| {
+                    self.callback_level(backend, &walk.path, &level, &mut mode)
+                }),
             _ => true,
         }
+    }
+
+    /// Whether a level's words come from the command's own callback (gopass
+    /// lists secret names after `show`) rather than naming subcommands: a
+    /// listed subcommand answers differently, while after a callback word the
+    /// same command answers the same words again. The root lists commands.
+    fn callback_level(
+        &self,
+        backend: &Backend,
+        path: &[&str],
+        level: &Level,
+        mode: &mut Mode<'_>,
+    ) -> bool {
+        if level.custom {
+            return true;
+        }
+        let Some(first) = level
+            .words
+            .iter()
+            .find(|item| !matches!(item.value.as_str(), "help" | "h"))
+        else {
+            return false;
+        };
+        if path.is_empty() {
+            return false;
+        }
+        let mut child = path.to_vec();
+        child.push(&first.value);
+        self.level(backend, &child, mode)
+            .is_ok_and(|answer| answer == *level)
     }
 }
 
@@ -521,6 +555,8 @@ case "$words" in
   ' deploy status -'|' d status -') cat "$root/status-flags";;
   ' deploy status'|' d status') cat "$root/status";;
   ' hooks'|' hooks -') printf -- '--force\npre-commit\npre-push\n';;
+  ' secrets -') cat "$root/deploy-flags";;
+  ' secrets'|' secrets '*) printf 'bank\nweb/site\n';;
   *) cat "$root/root";;
 esac
 "#
@@ -530,8 +566,8 @@ esac
         dir.script(
             "bin/root",
             text(
-                "deploy\nd\nhooks\nhelp\nh\n",
-                "deploy:Deploy an app\nhooks:Run hooks\nhelp:Shows help\n",
+                "deploy\nd\nhooks\nsecrets\nhelp\nh\n",
+                "deploy:Deploy an app\nhooks:Run hooks\nsecrets:Show a secret\nhelp:Shows help\n",
             ),
         );
         dir.script(
@@ -704,7 +740,7 @@ esac
         let mut budget = budget();
         assert_eq!(
             values(&backend.complete(&[], "", &mut budget).unwrap()),
-            ["deploy", "d", "hooks", "help", "h"]
+            ["deploy", "d", "hooks", "secrets", "help", "h"]
         );
         assert_eq!(
             values(&backend.complete(&[], "-", &mut budget).unwrap()),
@@ -796,7 +832,7 @@ esac
         );
         let backend = self::backend(path.clone(), V3, "v3.14.0", &["fixture"]);
         let root = backend.complete(&[], "", &mut budget).unwrap();
-        assert_eq!(values(&root), ["deploy", "hooks", "help"]);
+        assert_eq!(values(&root), ["deploy", "hooks", "secrets", "help"]);
         assert_eq!(root[0].description.as_deref(), Some("Deploy an app"));
         // `d` is not listed, but its answer differs from the root's.
         assert_eq!(
@@ -832,6 +868,30 @@ esac
         // A level this request never asked about is judged conservatively.
         let fresh = self::backend(app(&dir, V2), V2, "v2.27.7", &[]);
         assert!(fresh.candidate_is_resource(&["deploy"], &hooks[0]));
+    }
+
+    #[test]
+    fn callback_levels_answering_the_same_words_again_are_resources() {
+        // gopass lists secret names after `show`, and the same names after
+        // any of them: they name no subcommand.
+        for (library, version) in [(V2, "v2.27.7"), (V3, "v3.14.0")] {
+            let dir = Dir::new("urfave-secrets");
+            let backend = backend(app(&dir, library), library, version, &["fixture"]);
+            let mut budget = budget();
+            let secrets = backend.complete(&["secrets"], "", &mut budget).unwrap();
+            assert_eq!(values(&secrets), ["bank", "web/site"]);
+            assert!(
+                backend.candidate_is_resource(&["secrets"], &secrets[0]),
+                "{library}"
+            );
+            let deploy = backend.complete(&["deploy"], "", &mut budget).unwrap();
+            assert!(
+                !backend.candidate_is_resource(&["deploy"], &deploy[0]),
+                "{library}"
+            );
+            let root = backend.complete(&[], "", &mut budget).unwrap();
+            assert!(!backend.candidate_is_resource(&[], &root[0]), "{library}");
+        }
     }
 
     #[test]

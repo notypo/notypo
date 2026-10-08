@@ -240,7 +240,7 @@ pub(super) fn parse(
 }
 
 /// The one argument `code` passes to a native program, when it is literal.
-fn literal(code: &str) -> Option<String> {
+pub(super) fn literal(code: &str) -> Option<String> {
     let source = format!("x {code}");
     let script = parser::parse_with_dialect(&source, Dialect::PowerShell);
     if !script.is_fully_supported() || script.commands.len() != 1 {

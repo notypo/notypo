@@ -14,7 +14,9 @@
 //! as a fallback in [`crate::app`].
 
 pub mod aliases;
+mod archives;
 pub mod cache;
+mod data_help;
 pub mod diagnosis;
 pub mod docs;
 pub mod native;
@@ -70,6 +72,8 @@ pub enum TokenRole {
     OptionName,
     /// An option's value, such as a region or an output format.
     OptionValue,
+    /// A positional value or resource selector, such as an archive member.
+    ArgumentValue,
     Path,
     /// A missing space: `cd..` is `cd ..`, `gitstatus` is `git status`.
     Split,
@@ -426,6 +430,10 @@ struct State {
     path: Option<PathBuf>,
     /// The words after the program, as corrected so far.
     context: Vec<String>,
+    /// Quoted dash-prefixed data in PowerShell's argument mode.
+    literal_arguments: Vec<usize>,
+    /// At least one earlier argument contains an unevaluated expansion.
+    opaque_context: bool,
     /// The subcommands among them.
     command_path: Vec<String>,
     /// A corrected program's completer accepted the word after it.
@@ -445,6 +453,8 @@ impl State {
             program: program.to_owned(),
             path,
             context: Vec::new(),
+            literal_arguments: Vec::new(),
+            opaque_context: false,
             command_path: Vec::new(),
             confirmed: false,
             edits: Vec::new(),
@@ -497,6 +507,85 @@ enum Check {
     /// Nothing here is a subcommand: arguments follow.
     Arguments,
     Unknown,
+}
+
+/// Whether an option takes the next word as its value: one known to take
+/// a value always does; one of unknown arity doesn't take a word that is
+/// itself option-shaped (`yq -P --prettyPrint`), which values rarely are.
+fn takes_next(takes_value: Option<bool>, next: Option<&str>) -> bool {
+    match takes_value {
+        Some(known) => known,
+        None => !next.is_some_and(|next| {
+            next.len() > 1
+                && next.starts_with('-')
+                && !next[1..].starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        }),
+    }
+}
+
+/// Whether `typed` extends a listed word that ends where a hierarchical
+/// completion continues: a remote or scheme (`web:`), a directory (`src/`),
+/// or a key (`name=`). Apps complete such words one level at a time.
+fn continues_listed_word(vocabulary: &providers::Vocabulary, typed: &str) -> bool {
+    vocabulary.words.iter().any(|word| {
+        // A bare operator is a fragment too: zsh's _file_modes offers `+`,
+        // `-`, and `=` for chmod's `+x`.
+        (word.value.ends_with([':', '/', '=']) || matches!(word.value.as_str(), "+" | "-"))
+            && typed.len() > word.value.len()
+            && typed.starts_with(&word.value)
+    })
+}
+
+/// A listed word that ends where its completion continues (`web:`) repairs
+/// the typed word's head and keeps the rest: `wbe:b` becomes `web:b`, not
+/// `web:`.
+/// The name of a listed `Name=` alone, or ssh's `Name value` form.
+fn names_listed_key(vocabulary: &providers::Vocabulary, typed: &str) -> bool {
+    vocabulary.words.iter().any(|word| {
+        word.value.strip_suffix('=').is_some_and(|name| {
+            !name.is_empty()
+                && (typed == name
+                    || typed
+                        .strip_prefix(name)
+                        .is_some_and(|rest| rest.starts_with(' ')))
+        })
+    })
+}
+
+fn keep_hierarchical_tails(
+    mut vocabulary: providers::Vocabulary,
+    typed: &str,
+) -> providers::Vocabulary {
+    for word in &mut vocabulary.words {
+        let Some(separator) = word
+            .value
+            .chars()
+            .last()
+            .filter(|c| matches!(c, ':' | '/' | '='))
+        else {
+            continue;
+        };
+        // ssh's `-o 'Name value'` keeps its space.
+        let spaced = (separator == '=' && !typed.contains('='))
+            .then(|| typed.find(' '))
+            .flatten();
+        if let Some(at) = spaced {
+            let extended = format!("{}{}", &word.value[..word.value.len() - 1], &typed[at..]);
+            if vocabulary.resources.contains(&word.value) {
+                vocabulary.resources.push(extended.clone());
+            }
+            word.value = extended;
+        } else if let Some(at) = typed.find(separator)
+            && at + separator.len_utf8() < typed.len()
+        {
+            let extended = format!("{}{}", word.value, &typed[at + separator.len_utf8()..]);
+            if vocabulary.resources.contains(&word.value) {
+                vocabulary.resources.push(extended.clone());
+            }
+            word.value = extended;
+        }
+    }
+    vocabulary
 }
 
 impl<'a> Run<'a> {
@@ -561,7 +650,9 @@ impl<'a> Run<'a> {
             }),
             man: enabled(Source::ManPage).then(|| providers::ManPages::new(ctx.which("man"))),
             help: (enabled(Source::Help) && !settings.trusted_help.is_empty()).then(|| {
-                providers::HelpText::new(&settings.trusted_help).with_workspace(workspace.clone())
+                providers::HelpText::new(&settings.trusted_help)
+                    .with_workspace(workspace.clone())
+                    .with_man(enabled(Source::ManPage).then(|| ctx.which("man")).flatten())
             }),
             filesystem: enabled(Source::Filesystem),
             diagnosis,
@@ -757,6 +848,20 @@ impl<'a> Run<'a> {
 
     fn resolve(&self, name: &str) -> Resolution {
         if name.contains('/') {
+            // An existing explicit executable has its own vocabulary too
+            // (`./artisan`, `bin/console`). Workspace/probe trust is checked
+            // by the providers before it is started. Missing paths still
+            // go through filesystem correction.
+            let cwd = self
+                .failure
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok());
+            if let Some(path) = cwd.and_then(|cwd| std::fs::canonicalize(cwd.join(name)).ok())
+                && crate::utils::is_executable_file(&path)
+            {
+                return Resolution::Executable(path);
+            }
             return Resolution::ExplicitPath;
         }
         if self.ctx.shell == Shell::Powershell
@@ -942,6 +1047,36 @@ impl<'a> Run<'a> {
         let Some(name) = words[p].literal() else {
             return Vec::new();
         };
+        // PHP's argument immediately after the interpreter can be a console
+        // application. Its script token remains untouched; edits start after
+        // it, and completion uses this interpreter rather than a shebang.
+        if runner.is_none()
+            && native::is_php_interpreter_name(name)
+            && let Resolution::Executable(interpreter) = self.resolve(name)
+            && let Some(program) = words
+                .get(p + 1)
+                .and_then(|word| word.literal())
+                .filter(|word| !word.starts_with('-'))
+            && let Some(cwd) = self
+                .failure
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+            && let Ok(path) = std::fs::canonicalize(cwd.join(program))
+            && native::is_php_file(&path)
+        {
+            let registered = self.native.as_mut().and_then(|native| {
+                native.register_php_script(program, &path, &interpreter, &mut self.budget)
+            });
+            if let Some(program) = registered {
+                return self
+                    .walk(script, index, p + 1, State::new(&program, Some(path)))
+                    .into_iter()
+                    .filter(|state| !state.edits.is_empty())
+                    .collect();
+            }
+            return Vec::new();
+        }
         if let Some(ecosystem) = runner {
             return match self.resolve_package(name, ecosystem) {
                 Some(start) => self.walk(script, index, p, start),
@@ -1002,17 +1137,283 @@ impl<'a> Run<'a> {
                 return finished;
             }
         };
+        // Compressor operands remain host paths when their syntax is
+        // declined (`gzip -r`), so only a parsed layout replaces the
+        // generic path provider for them.
+        let archive_command = starts.iter().any(|start| {
+            archives::tool(&start.program).is_some_and(|tool| {
+                !archives::host_paths_only(tool) || {
+                    let words = &script.commands[index].words;
+                    let args: Vec<Option<&str>> = start
+                        .context
+                        .iter()
+                        .map(|s| Some(s.as_str()))
+                        .chain(words[p + 1..].iter().map(|word| word.literal()))
+                        .collect();
+                    archives::layout(tool, &args).is_some()
+                }
+            })
+        });
         let mut finished = Vec::new();
         for start in starts {
             let native = self.has_native(&start);
             let original = start.edits.is_empty();
+            finished.extend(self.archive_candidates(script, index, p, &start));
             finished.extend(self.walk(script, index, p, start.clone()));
             if !native && original {
                 finished.extend(self.hint_candidates(script, index, p, start));
             }
         }
-        finished.extend(self.path_candidates(script, index, p, None));
+        // Archive members and newly created archive names are not host paths.
+        if !archive_command {
+            finished.extend(self.path_candidates(script, index, p, None));
+        }
         finished.retain(|s| !s.edits.is_empty());
+        finished
+    }
+
+    fn archive_candidates(
+        &mut self,
+        script: &Script,
+        index: usize,
+        p: usize,
+        start: &State,
+    ) -> Vec<State> {
+        let Some(tool) = archives::tool(&start.program) else {
+            return Vec::new();
+        };
+        let words = &script.commands[index].words;
+        let alias_words = start.context.len();
+        let args: Vec<Option<&str>> = start
+            .context
+            .iter()
+            .map(|s| Some(s.as_str()))
+            .chain(words[p + 1..].iter().map(|word| word.literal()))
+            .collect();
+        let Some(layout) = archives::layout(tool, &args) else {
+            return Vec::new();
+        };
+        let Some(cwd) = self
+            .failure
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+        else {
+            return Vec::new();
+        };
+        let failed = self.failure.exit_status.is_some_and(|status| status != 0)
+            || self.failure.output.diagnostic_text().is_some();
+        let mut states = vec![start.clone()];
+        if self.filesystem {
+            for argument in &layout.paths {
+                if argument.index < alias_words {
+                    continue;
+                }
+                let i = p + 1 + argument.index - alias_words;
+                let raw = args[argument.index].unwrap_or_default();
+                let typed = raw.strip_prefix(&argument.prefix).unwrap_or_default();
+                if argument.directory
+                    && tool != archives::Tool::Tar
+                    && !self.diagnosis.mentions(ProblemKind::MissingPath, typed)
+                {
+                    // unzip/7-Zip create their output directory if it is absent.
+                    continue;
+                }
+                if typed.is_empty()
+                    || typed.starts_with('-')
+                    || typed.contains("://")
+                    || std::fs::symlink_metadata(cwd.join(typed)).is_ok()
+                    || !(failed || self.diagnosis.mentions(ProblemKind::MissingPath, typed))
+                {
+                    continue;
+                }
+                let extension = std::path::Path::new(typed).extension();
+                if !argument.directory
+                    && extension.is_none()
+                    && !self.diagnosis.mentions(ProblemKind::MissingPath, typed)
+                {
+                    continue;
+                }
+                let repairs =
+                    providers::repair_path_filtered(typed, &cwd, argument.directory, extension);
+                // An attached value written after an unquoted prefix
+                // (`-Path:x`, `-xfx.tar`, `--file=x`) is replaced by itself,
+                // so the dialect quotes only the value: a quoted
+                // `'-Path:x'` is a PowerShell string, not a parameter.
+                let value_only = !argument.prefix.is_empty()
+                    && words[i]
+                        .span
+                        .of(&script.source)
+                        .starts_with(&argument.prefix);
+                for (to, score) in repairs {
+                    let mut state = start.clone();
+                    state.score *= score.total;
+                    state.evidence.push(Evidence {
+                        source: Source::Filesystem,
+                        detail: format!("archive argument `{typed}` does not exist"),
+                    });
+                    state.edits.push(TokenEdit {
+                        command: index,
+                        word: i,
+                        span: if value_only {
+                            parser::Span::new(
+                                words[i].span.start + argument.prefix.len(),
+                                words[i].span.end,
+                            )
+                        } else {
+                            words[i].span
+                        },
+                        role: if argument.prefix.is_empty() {
+                            TokenRole::Path
+                        } else {
+                            TokenRole::OptionValue
+                        },
+                        from: if value_only { typed.into() } else { raw.into() },
+                        to: if value_only {
+                            to
+                        } else {
+                            format!("{}{to}", argument.prefix)
+                        },
+                        via: "filesystem".into(),
+                        description: None,
+                        resource: true,
+                        score,
+                    });
+                    states.push(state);
+                }
+            }
+        }
+        let name = std::path::Path::new(&start.program)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&start.program);
+        let trusted = self
+            .ctx
+            .settings
+            .trusted_completers
+            .iter()
+            .any(|entry| entry == "*" || entry == name || entry == &start.program);
+        if self.native.is_none() || !trusted || !layout.reads_members || layout.members.is_empty() {
+            return states;
+        }
+        let Some(program) = start.path.as_ref() else {
+            return states;
+        };
+        let mut finished = Vec::new();
+        for state in states {
+            let at = layout.archive.index;
+            let raw = if at >= alias_words {
+                let i = p + 1 + at - alias_words;
+                state
+                    .edits
+                    .iter()
+                    .find(|edit| edit.word == i)
+                    .map(|edit| {
+                        // A value-only edit starts after the attached prefix.
+                        if edit.span.start > words[i].span.start {
+                            format!("{}{}", layout.archive.prefix, edit.to)
+                        } else {
+                            edit.to.clone()
+                        }
+                    })
+                    .or(args[at].map(str::to_owned))
+                    .unwrap_or_default()
+            } else {
+                args[at].unwrap_or_default().to_owned()
+            };
+            let archive = raw.strip_prefix(&layout.archive.prefix).unwrap_or_default();
+            if !cwd.join(archive).is_file() {
+                finished.push(state);
+                continue;
+            }
+            let listing = match archives::Listing::open(
+                tool,
+                program,
+                &cwd.join(archive),
+                &mut self.budget,
+            ) {
+                Ok(listing) => listing,
+                Err(error) => {
+                    self.note(format!("{name} archive members: {error}"));
+                    finished.push(state);
+                    continue;
+                }
+            };
+            // A repaired archive must hold what the command names.
+            let archive_repaired = at >= alias_words
+                && state
+                    .edits
+                    .iter()
+                    .any(|edit| edit.command == index && edit.word == p + 1 + at - alias_words);
+            let mut frontier = vec![state];
+            for &at in &layout.members {
+                if at < alias_words {
+                    continue;
+                }
+                let i = p + 1 + at - alias_words;
+                let typed = args[at].unwrap_or_default();
+                if !archives::literal_member(typed) || archives::contains(&listing.members, typed) {
+                    continue;
+                }
+                let ranked = ranking::rank_tokens(
+                    typed,
+                    listing.members.iter().map(String::as_str),
+                    &[],
+                    &|_| 0,
+                    BEAM,
+                );
+                let names: Vec<String> = ranked
+                    .into_iter()
+                    .filter_map(|(name, _)| {
+                        listing
+                            .verifies(name, &mut self.budget)
+                            .then(|| name.to_owned())
+                    })
+                    .collect();
+                if names.is_empty() {
+                    if archive_repaired {
+                        frontier.clear();
+                        break;
+                    }
+                    continue;
+                }
+                let vocabulary = providers::Vocabulary {
+                    words: names
+                        .iter()
+                        .map(|name| native::CompletionItem {
+                            value: name.clone(),
+                            takes_value: None,
+                            description: None,
+                        })
+                        .collect(),
+                    authoritative: false,
+                    via: format!("{name} archive listing"),
+                    source: Source::NativeCompletion,
+                    cached: false,
+                    resources: names,
+                };
+                let mut next = Vec::new();
+                for state in frontier {
+                    match self.branch(
+                        &state,
+                        (index, i),
+                        TokenRole::ArgumentValue,
+                        (typed, ""),
+                        words[i].span,
+                        &vocabulary,
+                    ) {
+                        Branching::Branches(branches) => {
+                            next.extend(branches.into_iter().map(|(state, _)| state))
+                        }
+                        _ => next.push(state),
+                    }
+                }
+                next.sort_by(|a, b| b.score.total_cmp(&a.score));
+                next.truncate(BEAM);
+                frontier = next;
+            }
+            finished.extend(frontier);
+        }
         finished
     }
 
@@ -1058,6 +1459,25 @@ impl<'a> Run<'a> {
             n.backend(&state.program, state.path.as_ref(), &mut self.budget)
                 .is_some_and(|b| b.arguments_end_options())
         })
+    }
+
+    /// The `git-<name>` program `git <name>` runs, when it has a native
+    /// completer of its own (git-lfs's cobra); git's bridge probes only
+    /// builtins.
+    fn git_helper(&mut self, state: &State, word: &str) -> Option<(String, PathBuf)> {
+        if state.program != "git"
+            || !word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
+        {
+            return None;
+        }
+        let program = format!("git-{word}");
+        let path = self.ctx.which(&program)?;
+        self.native
+            .as_mut()?
+            .backend(&program, Some(&path), &mut self.budget)
+            .map(|_| (program, path))
     }
 
     fn has_native(&mut self, state: &State) -> bool {
@@ -1388,7 +1808,21 @@ impl<'a> Run<'a> {
             && let Check::Invalid(vocabulary) = &check
             && let Some(resolved) = short_cluster(typed, vocabulary)
         {
-            check = resolved;
+            // A partial list may omit the single-dash long option the word
+            // is close to (ffmpeg's basic `-h`, which zsh's _ffmpeg reads,
+            // omits `-hide_banner`). The app's documentation decides before
+            // the word becomes a short option with an attached value.
+            check = match resolved {
+                Check::Valid { .. } if !vocabulary.authoritative && self.has_native(state) => {
+                    match self.fallback_check(state, role, typed) {
+                        Check::Invalid(documented) if near_long_option(typed, &documented) => {
+                            Check::Invalid(documented)
+                        }
+                        _ => resolved,
+                    }
+                }
+                resolved => resolved,
+            };
         }
         if matches!(check, Check::Valid { .. } | Check::Invalid(_)) {
             self.checked += 1;
@@ -1426,6 +1860,14 @@ impl<'a> Run<'a> {
                         takes_value: word.takes_value,
                         confirmed: vocabulary.authoritative,
                     }
+                } else if role != TokenRole::OptionName && continues_listed_word(&vocabulary, typed)
+                {
+                    // `web:a` goes on from rclone's listed remote `web:`, as a
+                    // path goes on from a listed directory: not a misspelling.
+                    Check::Valid {
+                        takes_value: None,
+                        confirmed: false,
+                    }
                 } else if let Some(word) = (role == TokenRole::OptionName)
                     .then(|| native.resolve_option(&slot, &mut self.budget))
                     .flatten()
@@ -1452,7 +1894,8 @@ impl<'a> Run<'a> {
                         Check::Arguments
                     }
                 } else if role == TokenRole::Subcommand
-                    && !vocabulary.authoritative
+                    && (!vocabulary.authoritative
+                        || native.lists_omit_aliases(&slot, &mut self.budget))
                     && native.confirms(&slot, &mut self.budget)
                 {
                     // A partial list omits it, but the app accepts it.
@@ -1461,7 +1904,30 @@ impl<'a> Run<'a> {
                         confirmed: true,
                     }
                 } else {
-                    Check::Invalid(vocabulary)
+                    let listed: Vec<&str> = vocabulary
+                        .words
+                        .iter()
+                        .map(|word| word.value.as_str())
+                        .collect();
+                    match (role == TokenRole::Subcommand)
+                        .then(|| native.lists_arguments(&slot, &listed, &mut self.budget))
+                        .flatten()
+                    {
+                        // The app predicted arguments here; it never judges them.
+                        Some(native::ArgumentList::Unjudged) => Check::Arguments,
+                        // Values (make targets, mtr's placeholders): another
+                        // one is a resource the user approves.
+                        Some(native::ArgumentList::Resources) => {
+                            let mut vocabulary = vocabulary;
+                            vocabulary.resources = vocabulary
+                                .words
+                                .iter()
+                                .map(|word| word.value.clone())
+                                .collect();
+                            Check::Invalid(keep_hierarchical_tails(vocabulary, typed))
+                        }
+                        None => Check::Invalid(keep_hierarchical_tails(vocabulary, typed)),
+                    }
                 }
             }
             // A broken completer is reported; documentation still applies.
@@ -1547,6 +2013,40 @@ impl<'a> Run<'a> {
     fn walk(&mut self, script: &Script, index: usize, p: usize, start: State) -> Vec<State> {
         let src = &script.source;
         let words = &script.commands[index].words;
+        let direct_arguments = start.context.is_empty();
+        let archive_arguments: Vec<_> = start
+            .context
+            .iter()
+            .map(|s| Some(s.as_str()))
+            .chain(words[p + 1..].iter().map(|word| word.literal()))
+            .collect();
+        let archive_words = archives::tool(&start.program)
+            .and_then(|tool| {
+                archives::layout(tool, &archive_arguments).map(|layout| {
+                    let mut protected = layout.members;
+                    protected.push(layout.archive.index);
+                    protected.extend(layout.paths.iter().map(|argument| argument.index));
+                    // A tar, jar, or ar mode without a dash is an old-style
+                    // option cluster (`tf`, `rcs`), not a subcommand.
+                    if matches!(
+                        tool,
+                        archives::Tool::Tar | archives::Tool::Jar | archives::Tool::Ar
+                    ) && archive_arguments
+                        .first()
+                        .copied()
+                        .flatten()
+                        .is_some_and(|word| !word.starts_with('-'))
+                    {
+                        protected.push(0);
+                    }
+                    protected
+                        .into_iter()
+                        .filter(|&at| at >= start.context.len())
+                        .map(|at| p + 1 + at - start.context.len())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
         let mut done = Vec::new();
         // (interpretation, next word, level, the previous option takes a value)
         let mut frontier = vec![(start, p + 1, Level::Commands, false)];
@@ -1565,13 +2065,33 @@ impl<'a> Run<'a> {
                         level = Level::Arguments;
                     }
                     pending_value = false;
+                    state.opaque_context = true;
                     state.context.push("x".into());
                     i += 1;
                     continue;
                 };
+                if archive_words.contains(&i)
+                    || i == p + 1
+                        && direct_arguments
+                        && archives::tool(&state.program) == Some(archives::Tool::Tar)
+                        && archives::old_style_flags(text)
+                {
+                    state.context.push(text.to_owned());
+                    pending_value = false;
+                    level = Level::Arguments;
+                    i += 1;
+                    continue;
+                }
+                if state.powershell
+                    && text.starts_with('-')
+                    && word.option_name_span_with(src, ':').is_none()
+                {
+                    state.literal_arguments.push(state.context.len());
+                }
                 if pending_value {
                     pending_value = false;
-                    if let Some(vocabulary) = self.check_value(&state, &[], text)
+                    if let Some(vocabulary) =
+                        self.check_value(&state, &[], text, &words[i + 1..], false, src)
                         && let Branching::Branches(mut branches) = self.branch(
                             &state,
                             (index, i),
@@ -1596,6 +2116,28 @@ impl<'a> Run<'a> {
                 if text == "--" {
                     break;
                 }
+                if text == "then"
+                    && !state.opaque_context
+                    && !self.has_native(&state)
+                    && self.help.as_mut().is_some_and(|help| {
+                        help.chain_ready(
+                            &state.program,
+                            state.path.as_ref(),
+                            &state.command_path,
+                            &state.context,
+                            &mut self.budget,
+                        )
+                    })
+                {
+                    // Miller starts another verb here. Only fixed help for
+                    // that verb is queried; the preceding data stays in the
+                    // original source and is never forwarded to discovery.
+                    state.command_path.clear();
+                    state.context.clear();
+                    level = Level::Commands;
+                    i += 1;
+                    continue;
+                }
                 // PowerShell parameters start with a letter (`-5` is a
                 // number) and take attached values after `:`.
                 let backend = self.native.as_mut().and_then(|native| {
@@ -1609,7 +2151,8 @@ impl<'a> Run<'a> {
                         && text.starts_with('-')
                         && (!state.powershell
                             || text[1..]
-                                .starts_with(|c: char| c.is_alphabetic() || "_?".contains(c))));
+                                .starts_with(|c: char| c.is_alphabetic() || "_?".contains(c))))
+                        && (!state.powershell || word.option_name_span_with(src, ':').is_some());
                 let separator =
                     protocol_separator.unwrap_or(if state.powershell { ':' } else { '=' });
                 let name_len = backend
@@ -1617,6 +2160,34 @@ impl<'a> Run<'a> {
                     .and_then(|backend| backend.option_name_len(text))
                     .unwrap_or_else(|| text.find(separator).unwrap_or(text.len()));
                 let attached = is_option && name_len < text.len();
+                if !is_option
+                    && backend
+                        .as_ref()
+                        .is_some_and(|b| b.supports_positional_values())
+                {
+                    level = Level::Arguments;
+                    if let Some(vocabulary) =
+                        self.check_value(&state, &[], text, &words[i + 1..], true, src)
+                        && let Branching::Branches(mut branches) = self.branch(
+                            &state,
+                            (index, i),
+                            TokenRole::ArgumentValue,
+                            (text, ""),
+                            word.span,
+                            &vocabulary,
+                        )
+                    {
+                        let (first, _) = branches.remove(0);
+                        for (other, _) in branches.into_iter().rev() {
+                            frontier.push((other, i + 1, level, false));
+                        }
+                        state = first;
+                    } else {
+                        state.context.push(text.to_owned());
+                    }
+                    i += 1;
+                    continue;
+                }
                 if !is_option && level == Level::Arguments {
                     state.context.push(text.to_owned());
                     i += 1;
@@ -1654,20 +2225,35 @@ impl<'a> Run<'a> {
                                     &context,
                                     typed,
                                     words.get(i + 1).and_then(|word| word.literal()),
+                                    &mut self.budget,
                                 )
                             })
                             .or(takes_value);
-                        pending_value = is_option && !attached && takes_value != Some(false);
+                        pending_value = is_option
+                            && !attached
+                            && takes_next(takes_value, words.get(i + 1).and_then(|w| w.literal()));
                         if !is_option {
                             state.command_path.push(text.to_owned());
                         }
                         state.context.push(text.to_owned());
+                        // `git lfs track` runs git-lfs: its own completer
+                        // checks the words that follow.
+                        if !is_option
+                            && state.command_path.len() == 1
+                            && let Some((program, path)) = self.git_helper(&state, text)
+                        {
+                            state.program = program;
+                            state.path = Some(path);
+                            state.context.clear();
+                            state.command_path.clear();
+                            level = Level::Commands;
+                        }
                         if attached && takes_value != Some(false) {
                             let mut branches = self.repair_attached_value(
                                 state,
                                 (index, i),
                                 word,
-                                (src, separator),
+                                (src, separator, &words[i + 1..]),
                                 typed,
                             );
                             state = branches.remove(0);
@@ -1715,14 +2301,45 @@ impl<'a> Run<'a> {
                         .unwrap_or(word.span),
                     _ => word.span,
                 };
-                match self.branch(
+                // A partial native list omits words the app accepts (zsh's
+                // _ffmpeg reads only ffmpeg's basic `-h`: no `-pix_fmt` or
+                // `-loglevel`; _swift lists files where swift's help lists
+                // `build`). The app's documentation keeps a word it lists,
+                // and judges a word far from everything the list has.
+                let documented = (!vocabulary.authoritative && self.has_native(&state))
+                    .then(|| self.fallback_check(&state, role, typed));
+                if let Some(Check::Valid { takes_value, .. }) = documented {
+                    pending_value = is_option
+                        && !attached
+                        && takes_next(takes_value, words.get(i + 1).and_then(|w| w.literal()));
+                    if !is_option {
+                        state.command_path.push(text.to_owned());
+                    }
+                    state.context.push(text.to_owned());
+                    i += 1;
+                    continue;
+                }
+                let mut branching = self.branch(
                     &state,
                     (index, i),
                     role,
                     (typed, &text[typed.len()..]),
                     span,
                     &vocabulary,
-                ) {
+                );
+                if matches!(branching, Branching::NotSuspicious)
+                    && let Some(Check::Invalid(documented)) = documented
+                {
+                    branching = self.branch(
+                        &state,
+                        (index, i),
+                        role,
+                        (typed, &text[typed.len()..]),
+                        span,
+                        &documented,
+                    );
+                }
+                match branching {
                     Branching::NotSuspicious => {
                         // A partial list says nothing about a word far from it.
                         pending_value = is_option && !attached;
@@ -1755,16 +2372,22 @@ impl<'a> Run<'a> {
                                         &context,
                                         name?,
                                         words.get(i + 1).and_then(|word| word.literal()),
+                                        &mut self.budget,
                                     )
                                 })
                                 .or(takes_value);
-                            let pending = is_option && !attached && takes_value != Some(false);
+                            let pending = is_option
+                                && !attached
+                                && takes_next(
+                                    takes_value,
+                                    words.get(i + 1).and_then(|word| word.literal()),
+                                );
                             let values = if attached && takes_value != Some(false) {
                                 self.repair_attached_value(
                                     branch,
                                     (index, i),
                                     word,
-                                    (src, separator),
+                                    (src, separator, &words[i + 1..]),
                                     typed,
                                 )
                             } else {
@@ -1794,7 +2417,7 @@ impl<'a> Run<'a> {
         mut state: State,
         position: (usize, usize),
         word: &parser::Word,
-        (source, separator): (&str, char),
+        (source, separator, following): (&str, char, &[parser::Word]),
         original_name: &str,
     ) -> Vec<State> {
         let Some(span) = attached_value_span(word, source, original_name, separator) else {
@@ -1806,7 +2429,7 @@ impl<'a> Run<'a> {
         let value = suffix
             .strip_prefix(separator)
             .expect("an attached option value");
-        if let Some(vocabulary) = self.check_value(&state, &[name], value)
+        if let Some(vocabulary) = self.check_value(&state, &[name], value, following, false, source)
             && let Branching::Branches(branches) = self.branch(
                 &state,
                 position,
@@ -1837,6 +2460,9 @@ impl<'a> Run<'a> {
         state: &State,
         extra: &[&str],
         typed: &str,
+        following: &[parser::Word],
+        positional: bool,
+        source: &str,
     ) -> Option<providers::Vocabulary> {
         if typed.is_empty() {
             return None;
@@ -1844,10 +2470,41 @@ impl<'a> Run<'a> {
         let mut context = state.context.clone();
         context.extend(extra.iter().map(|w| w.to_string()));
         let vocabulary = if self.has_native(state) {
-            self.native.as_mut()?.values(
+            if state.opaque_context || following.iter().any(|w| w.literal().is_none()) {
+                let backend = self.native.as_mut()?.backend(
+                    &state.program,
+                    state.path.as_ref(),
+                    &mut self.budget,
+                )?;
+                let words: Vec<&str> = context.iter().map(String::as_str).collect();
+                if positional || backend.values_require_literal_context(&words) {
+                    self.note("parameter completion requires literal context arguments".into());
+                    return None;
+                }
+            }
+            let mut following_values = Vec::new();
+            let mut following_literals = Vec::new();
+            for word in following {
+                if let Some(value) = word.literal() {
+                    if state.powershell
+                        && value.starts_with('-')
+                        && word.option_name_span_with(source, ':').is_none()
+                    {
+                        following_literals.push(following_values.len());
+                    }
+                    following_values.push(value);
+                }
+            }
+            let words: Vec<&str> = context.iter().map(String::as_str).collect();
+            self.native.as_mut()?.values_in_context(
                 &state.program,
                 state.path.as_ref(),
-                &context,
+                native::ValueContext {
+                    words: &words,
+                    following: &following_values,
+                    literal_arguments: (&state.literal_arguments, &following_literals),
+                    positional,
+                },
                 typed,
                 &mut self.budget,
             )?
@@ -1869,7 +2526,12 @@ impl<'a> Run<'a> {
                 _ => return None,
             }
         };
-        (!vocabulary.contains(typed)).then_some(vocabulary)
+        // `Name=value` goes on from a listed `Name=` (ssh's -o): only the
+        // name is judged, and a repaired name keeps the typed value.
+        (!vocabulary.contains(typed)
+            && !continues_listed_word(&vocabulary, typed)
+            && !names_listed_key(&vocabulary, typed))
+        .then(|| keep_hierarchical_tails(vocabulary, typed))
     }
 
     /// `typed` (followed by `suffix`, such as `=value`) is not listed in
@@ -1897,9 +2559,29 @@ impl<'a> Run<'a> {
         ));
         if !vocabulary.authoritative {
             // A word a partial list omits may be valid. One only as close as
-            // the floor (`x` and `MX`: half the letters differ) is no
-            // evidence against it.
-            ranked.retain(|(_, score)| score.total > ranking::FLOOR);
+            // the floor (`x` and `MX`: half the letters differ), or more than
+            // a typo away (zsh's _whois lists `whois.gb.com` for `-h`, seven
+            // edits from `whois.example.com`), is no evidence against it,
+            // unless the app's own output names it.
+            // An abbreviation with one slip at its end (`--no-inferr` for
+            // `--no-inference`) is a typo too.
+            let typo = 2 + typed.chars().count() / 10;
+            let abbreviates = |candidate: &str| {
+                let typed: Vec<char> = typed.chars().collect();
+                typed.len() >= 4
+                    && candidate.chars().count() > typed.len()
+                    && candidate
+                        .chars()
+                        .zip(&typed)
+                        .take_while(|(a, b)| a == *b)
+                        .count()
+                        + 1
+                        >= typed.len()
+            };
+            ranked.retain(|(candidate, score)| {
+                score.total > ranking::FLOOR
+                    && (score.distance <= typo || score.hint > 0.0 || abbreviates(candidate))
+            });
         }
         if ranked.is_empty() && !vocabulary.authoritative {
             return Branching::NotSuspicious;
@@ -2122,6 +2804,13 @@ impl<'a> Run<'a> {
                         .map(|word| parser::quote_word_with_dialect(word, script.dialect))
                         .collect::<Vec<_>>()
                         .join(" ")
+                } else if script.dialect == parser::Dialect::PowerShell
+                    && matches!(e.role, TokenRole::OptionValue | TokenRole::ArgumentValue)
+                    && e.to.starts_with('-')
+                {
+                    // An unquoted dash value becomes a parameter token to
+                    // PowerShell, even though its literal bytes are right.
+                    format!("'{}'", e.to.replace('\'', "''"))
                 } else {
                     parser::quote_word_with_dialect(&e.to, script.dialect)
                 },
@@ -2175,6 +2864,18 @@ fn program_name(path: &std::path::Path) -> String {
     name
 }
 
+/// ffmpeg's `-hide_baner` is not `-h` with a value: a listed single-dash
+/// long option sharing its head is the likelier word. gcc's `-Iinclude`
+/// shares no head with `-include`.
+fn near_long_option(typed: &str, vocabulary: &providers::Vocabulary) -> bool {
+    vocabulary.words.iter().any(|w| {
+        w.value.len() > 4
+            && !w.value.starts_with("--")
+            && w.value.get(..4) == typed.get(..4)
+            && ranking::osa_distance(&w.value, typed) <= 2
+    })
+}
+
 fn short_cluster(typed: &str, vocabulary: &providers::Vocabulary) -> Option<Check> {
     let letters = typed
         .strip_prefix('-')
@@ -2187,7 +2888,7 @@ fn short_cluster(typed: &str, vocabulary: &providers::Vocabulary) -> Option<Chec
             .iter()
             .find(|w| w.value.strip_prefix('-') == Some(c.encode_utf8(&mut [0; 4])))
     };
-    if letters.chars().next().and_then(short).is_some() {
+    if letters.chars().next().and_then(short).is_some() && !near_long_option(typed, vocabulary) {
         let takes_value = match letters.chars().map(short).collect::<Option<Vec<_>>>() {
             // The last option of a cluster may take the next word.
             Some(options) => options.last().and_then(|o| o.takes_value),
@@ -2727,6 +3428,418 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
     }
 
     #[test]
+    fn explicit_executables_use_native_completion_only_in_trusted_workspaces() {
+        let fake = fake_aws();
+        let mut failure = failure("bin/aws ec2 describ-instances");
+        failure.cwd = Some(fake.dir.0.clone());
+        let refused = correct(&failure, &context(&fake));
+        assert!(
+            refused.outcome.candidates().is_empty(),
+            "{:?}",
+            refused.outcome
+        );
+        assert_eq!(refused.probes, 0);
+        assert!(
+            refused
+                .notes
+                .iter()
+                .any(|note| note.contains("trusted_workspaces"))
+        );
+        let ctx = context_with(
+            &fake,
+            Settings {
+                trusted_workspaces: vec![fake.dir.0.to_string_lossy().into_owned()],
+                ..Settings::default()
+            },
+        );
+        let report = correct(&failure, &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "bin/aws ec2 describe-instances",
+            "{:?}",
+            report.notes
+        );
+        failure.source = format!("{} ec2 describ-instances", fake.aws.display());
+        let report = correct(&failure, &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            format!("{} ec2 describe-instances", fake.aws.display())
+        );
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn php_scripts_use_the_resolved_interpreter_and_require_all_three_trust_settings() {
+        let dir = Dir::new("php-script");
+        fs::write(
+            dir.0.join("console"),
+            "<?php\nfile_put_contents('operation-marker', 'executed');\n",
+        )
+        .unwrap();
+        let php = dir.script("bin/php", r#"#!/bin/sh
+root=$(cd "$(dirname "$(dirname "$0")")" && pwd -P)
+printf '%s\n' "$0" >> "$root/interpreters"
+printf '<%s>' "$@" >> "$root/queries"
+printf '\n' >> "$root/queries"
+[ "$1" = "$root/console" ] || exit 8
+shift
+case "$1" in
+  --help)
+    printf 'Options:\n  -h, --help  Display help for the given command. When no command is given display help for the list command\n  -n, --no-interaction  Do not ask any interactive question\n';;
+  help)
+    [ "$2" = _complete ] || exit 8
+    printf '%s\n' '{"name":"_complete","hidden":true,"definition":{"options":{"shell":{"name":"--shell","accept_value":true,"is_multiple":false},"input":{"name":"--input","accept_value":true,"is_multiple":true},"current":{"name":"--current","accept_value":true,"is_multiple":false}}}}';;
+  _complete) printf 'help\nlist\nstatus\n';;
+  *) touch "$root/operation-marker"; exit 9;;
+esac
+"#);
+        let context = |completer, help, workspace| {
+            Context::new(
+                Settings {
+                    trusted_completers: if completer {
+                        vec!["console".into()]
+                    } else {
+                        vec![]
+                    },
+                    trusted_help: if help { vec!["console".into()] } else { vec![] },
+                    trusted_workspaces: if workspace {
+                        vec![dir.0.to_string_lossy().into_owned()]
+                    } else {
+                        vec![]
+                    },
+                    disabled_sources: vec!["help".into(), "man".into(), "history".into()],
+                    ..Settings::default()
+                },
+                Shell::Bash,
+                "fuck".into(),
+            )
+            .with_which("php", Some(php.to_str().unwrap()))
+        };
+        let mut failed = failure("php console stauts");
+        failed.cwd = Some(dir.0.clone());
+        for (completer, help, workspace) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let report = correct(&failed, &context(completer, help, workspace));
+            assert!(report.outcome.candidates().is_empty(), "{:?}", report.notes);
+            assert_eq!(report.probes, 0);
+        }
+        let report = correct(&failed, &context(true, true, true));
+        assert!(
+            !report.outcome.candidates().is_empty(),
+            "{:?} {:?}",
+            report.outcome,
+            report.notes
+        );
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "php console status",
+            "{:?}",
+            report.notes
+        );
+        assert!(
+            report.outcome.candidates()[0]
+                .edits
+                .iter()
+                .all(|edit| edit.word == 2 && edit.via == "symfony completion")
+        );
+        let queries = fs::read_to_string(dir.0.join("queries")).unwrap();
+        assert!(queries.lines().all(|line| line.starts_with(&format!(
+            "<{}>",
+            fs::canonicalize(dir.0.join("console")).unwrap().display()
+        ))));
+        assert!(!dir.0.join("operation-marker").exists());
+        let second = dir.script("bin/php8.5", &fs::read_to_string(&php).unwrap());
+        let trusted = vec!["console".into()];
+        let workspaces = vec![dir.0.to_string_lossy().into_owned()];
+        let mut provider = providers::NativeCompletion::new(&trusted, false)
+            .with_trusted_help(&trusted)
+            .with_workspace(providers::Workspace {
+                cwd: Some(dir.0.clone()),
+                trusted: &workspaces,
+            });
+        let script = fs::canonicalize(dir.0.join("console")).unwrap();
+        let first_key = provider
+            .register_php_script("console", &script, &php, &mut Budget::for_timeout(3.0))
+            .unwrap();
+        let second_key = provider
+            .register_php_script("console", &script, &second, &mut Budget::for_timeout(3.0))
+            .unwrap();
+        assert_ne!(first_key, second_key);
+        assert!(!provider.has_backend("console"));
+        assert!(
+            fs::read_to_string(dir.0.join("interpreters"))
+                .unwrap()
+                .lines()
+                .any(|line| line == second.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn archive_input_paths_need_a_failure_and_matching_extension() {
+        let fake = fake_aws();
+        let root = fake.dir.0.join("work");
+        fs::create_dir_all(root.join("output")).unwrap();
+        for name in [
+            "backup.tar.gz",
+            "photos.zip",
+            "data.7z",
+            "backpu.tar.txt",
+            "backpu.tar.xz",
+            "backpu.tar.bz2",
+            "dir/report.txt",
+        ] {
+            if let Some(parent) = root.join(name).parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(root.join(name), "").unwrap();
+        }
+        let ctx = context_with(
+            &fake,
+            Settings {
+                disabled_sources: vec![
+                    "native".into(),
+                    "help".into(),
+                    "man".into(),
+                    "history".into(),
+                    "stderr".into(),
+                ],
+                ..Settings::default()
+            },
+        )
+        .with_which("tar", Some("/usr/bin/tar"))
+        .with_which("unzip", Some("/usr/bin/unzip"))
+        .with_which("7z", Some("/opt/homebrew/bin/7z"));
+        for (source, expected) in [
+            ("tar xvzf backpu.tar.gz", "tar xvzf backup.tar.gz"),
+            ("tar -xfbackpu.tar.gz", "tar -xfbackup.tar.gz"),
+            (
+                "tar --extract --file=backpu.tar.gz",
+                "tar --extract --file=backup.tar.gz",
+            ),
+            ("unzip photso.zip", "unzip photos.zip"),
+            ("7z x dat.7z -t7z -mx=9", "7z x data.7z -t7z -mx=9"),
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            assert!(
+                correct(&f, &ctx).outcome.candidates().is_empty(),
+                "{source}"
+            );
+            f.exit_status = Some(1);
+            let report = correct(&f, &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first(),
+                Some(&expected),
+                "{report:?}"
+            );
+            assert_eq!(report.probes, 0);
+            assert_eq!(
+                report.outcome.candidates()[0].safety.decision,
+                Decision::Confirm
+            );
+        }
+        for source in [
+            "tar cf backpu.tar.gz notes",
+            "7z a dat.7z notes",
+            "unzip photos.zip dir/reprot.txt",
+            "tar xf backup.tar.gz dir/reprot.txt",
+            "7z x data.7z dir/reprot.txt",
+            "7z d data.7z dir/reprot.txt",
+            "7z x data.7z -ooutpt",
+            "unzip photos.zip -doutpt",
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = Some(1);
+            assert!(
+                correct(&f, &ctx).outcome.candidates().is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn compressor_and_archiver_inputs_follow_each_tools_syntax() {
+        let fake = fake_aws();
+        let root = fake.dir.0.join("work");
+        for name in [
+            "backup.txt.gz",
+            "backup.txt.zst",
+            "backup.txt.lz4",
+            "backup.txt.br",
+            "notes.txt",
+            "photos.zip",
+            "libfoo.a",
+            "archive.pax",
+            "archive.cpio",
+            "dir/a.txt",
+        ] {
+            if let Some(parent) = root.join(name).parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(root.join(name), "").unwrap();
+        }
+        let mut ctx = context_with(
+            &fake,
+            Settings {
+                disabled_sources: vec![
+                    "native".into(),
+                    "help".into(),
+                    "man".into(),
+                    "history".into(),
+                    "stderr".into(),
+                ],
+                ..Settings::default()
+            },
+        );
+        for program in [
+            "gzip", "gunzip", "zcat", "zstd", "lz4", "brotli", "zipinfo", "ar", "pax", "cpio",
+            "ditto",
+        ] {
+            ctx = ctx.with_which(program, Some(&format!("/usr/bin/{program}")));
+        }
+        for (source, expected) in [
+            ("gunzip backpu.txt.gz", "gunzip backup.txt.gz"),
+            ("zcat -S .gz backpu.txt.gz", "zcat -S .gz backup.txt.gz"),
+            ("gzip notse.txt", "gzip notes.txt"),
+            (
+                "zstd -d backpu.txt.zst -o out",
+                "zstd -d backup.txt.zst -o out",
+            ),
+            ("lz4 -d backpu.txt.lz4 otu", "lz4 -d backup.txt.lz4 otu"),
+            (
+                "brotli -q 5 -d backpu.txt.br",
+                "brotli -q 5 -d backup.txt.br",
+            ),
+            ("zipinfo -1 photso.zip", "zipinfo -1 photos.zip"),
+            ("ar -t -v libfo.a", "ar -t -v libfoo.a"),
+            ("pax -rvf archve.pax", "pax -rvf archive.pax"),
+            ("cpio -it -F archve.cpio", "cpio -it -F archive.cpio"),
+            ("ditto -xk photso.zip out", "ditto -xk photos.zip out"),
+            // Declined syntax leaves operands to the generic path provider.
+            ("gzip -r dri/a.txt", "gzip -r dir/a.txt"),
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            assert!(
+                correct(&f, &ctx).outcome.candidates().is_empty(),
+                "{source}"
+            );
+            f.exit_status = Some(1);
+            let report = correct(&f, &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first(),
+                Some(&expected),
+                "{report:?}"
+            );
+            assert_eq!(report.probes, 0);
+            assert_eq!(
+                report.outcome.candidates()[0].safety.decision,
+                Decision::Confirm
+            );
+        }
+        for source in [
+            // Outputs, option values, and patterns are not inputs.
+            "zstd -d backup.txt.zst -o outptu.txt",
+            "lz4 -d backup.txt.lz4 notse.txt",
+            "brotli -o notse.txt backup.txt.br",
+            "gzip -S .gzz backup.txt.gz",
+            "pax -w -f archve.pax notes.txt",
+            "cpio -o -F archve.cpio",
+            "ditto -c -k notes.txt photso.zip",
+            "zstd -r backpu.txt.zst",
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = Some(1);
+            assert!(
+                correct(&f, &ctx).outcome.candidates().is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_members_use_trusted_listings_and_preserve_aliases() {
+        let fake = fake_aws();
+        let tar = fake.dir.script("bin/tar", "#!/bin/sh\ncase $1 in\n--version) printf 'bsdtar 3.5.3 - libarchive 3.7.4\\n';;\n-tf) [ $# = 2 ] || exit 9; printf 'docs/report.txt\\nnotes.txt\\n';;\n*) touch \"$(dirname \"$0\")/extracted\"; exit 9;;\nesac\n");
+        fs::write(fake.dir.0.join("backup.tar"), "").unwrap();
+        fs::create_dir_all(fake.dir.0.join("docs")).unwrap();
+        fs::write(fake.dir.0.join("docs/reports.txt"), "unrelated local file").unwrap();
+        let settings = Settings {
+            trusted_completers: vec!["tar".into()],
+            disabled_sources: vec!["help".into(), "man".into(), "history".into()],
+            ..Settings::default()
+        };
+        let ctx = context_with(&fake, settings)
+            .with_which("tar", Some(tar.to_str().unwrap()))
+            .with_aliases(&[("untar", "tar xf")]);
+        for (source, expected) in [
+            (
+                "tar xf backup.tar docs/reprot.txt",
+                "tar xf backup.tar docs/report.txt",
+            ),
+            (
+                "untar backup.tar docs/reprot.txt",
+                "untar backup.tar docs/report.txt",
+            ),
+            (
+                "tar xf backpu.tar docs/reprot.txt",
+                "tar xf backup.tar docs/report.txt",
+            ),
+            (
+                "tar xf backup.tar docs/reprot.txt notse.txt",
+                "tar xf backup.tar docs/report.txt notes.txt",
+            ),
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(fake.dir.0.clone());
+            f.exit_status = Some(1);
+            let report = correct(&f, &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first(),
+                Some(&expected),
+                "{report:?}"
+            );
+            let edits = &report.outcome.candidates()[0].edits;
+            assert!(
+                edits
+                    .iter()
+                    .any(|edit| edit.role == TokenRole::ArgumentValue && edit.resource)
+            );
+            assert_eq!(
+                report.outcome.candidates()[0].safety.decision,
+                Decision::Confirm
+            );
+        }
+        for source in [
+            "tar xf backup.tar docs/report.txt",
+            "tar xf backup.tar docs",
+            "tar xf backup.tar 'docs/*'",
+            "tar xf backup.tar $MEMBER",
+            "tar cf new.tar docs/reprot.txt",
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(fake.dir.0.clone());
+            let report = correct(&f, &ctx);
+            assert!(
+                report.outcome.candidates().is_empty(),
+                "{source}: {report:?}"
+            );
+        }
+        let ctx = context(&fake).with_which("tar", Some(tar.to_str().unwrap()));
+        let mut f = failure("tar xf backup.tar docs/reprot.txt");
+        f.cwd = Some(fake.dir.0.clone());
+        let report = correct(&f, &ctx);
+        assert!(report.outcome.candidates().is_empty(), "{report:?}");
+        assert_eq!(report.probes, 0);
+        assert!(!fake.dir.0.join("bin/extracted").exists());
+    }
+
+    #[test]
     fn missing_paths_are_repaired_from_the_filesystem() {
         let fake = fake_aws();
         let root = fake.dir.0.join("work");
@@ -2756,6 +3869,55 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
             Some("cat: notse.txt: No such file or directory"),
         );
         assert_eq!(scripts(&outcome)[0], "cat notes.txt");
+        // Archivers name the archive they couldn't open in their own words.
+        fs::write(root.join("backup.tar.gz"), "").unwrap();
+        fs::write(root.join("photos.zip"), "").unwrap();
+        let ctx = ctx
+            .with_which("tar", Some("/usr/bin/tar"))
+            .with_which("unzip", Some("/usr/bin/unzip"));
+        let case = |source: &str, output: &str| {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = Some(1);
+            f.output = CapturedOutput::Combined {
+                text: output.into(),
+                origin: OutputOrigin::ShellLogger,
+            };
+            correct(&f, &ctx).outcome
+        };
+        for (source, output, expected) in [
+            (
+                "tar -xzf backpu.tar.gz",
+                "tar: Error opening archive: Failed to open 'backpu.tar.gz'",
+                "tar -xzf backup.tar.gz",
+            ),
+            (
+                "tar -xzf backpu.tar.gz",
+                "tar: backpu.tar.gz: Cannot open: No such file or directory",
+                "tar -xzf backup.tar.gz",
+            ),
+            (
+                "unzip photso.zip",
+                "unzip:  cannot find or open photso.zip, photso.zip.zip or photso.zip.ZIP.",
+                "unzip photos.zip",
+            ),
+        ] {
+            let outcome = case(source, output);
+            assert_eq!(scripts(&outcome).first(), Some(&expected), "{outcome:?}");
+        }
+        let ctx = context(&fake).with_which("cat", Some("/bin/cat"));
+        let case = |source: &str, status: Option<i32>, output: Option<&str>| {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = status;
+            if let Some(text) = output {
+                f.output = CapturedOutput::Combined {
+                    text: text.into(),
+                    origin: OutputOrigin::ShellLogger,
+                };
+            }
+            correct(&f, &ctx).outcome
+        };
         let outcome = case("cat src/engine/parsr.rs", Some(1), None);
         assert_eq!(scripts(&outcome)[0], "cat src/engine/parser.rs");
         let outcome = case("./scirpt.sh --x", Some(127), None);
@@ -2896,6 +4058,115 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
         }
     }
 
+    /// A partial handler list (zsh's _ffmpeg reads only ffmpeg's basic `-h`;
+    /// _swift lists files where swift's help lists `build`) says nothing
+    /// about a word far from it: the app's documentation confirms or
+    /// repairs it, and decides before `-hide_baner` becomes `-h` with an
+    /// attached value.
+    #[test]
+    fn documentation_judges_words_far_from_a_partial_list() {
+        let fake = fake_aws();
+        let tool = fake.dir.script(
+            "bin/tool",
+            "#!/bin/sh\ncase \"$*\" in\n  --help) printf 'Commands:\\n  build    Build it\\n\\nOptions:\\n  -h TOPIC      Help\\n  -hide_banner  Quiet\\n  -loglevel L   Level\\n';;\n  'build --help') printf 'Options:\\n  --configuration CONF  Config\\n';;\n  *) touch \"$(dirname \"$0\")/ran\"; exit 1;;\nesac\n",
+        );
+        let settings = Settings {
+            trusted_help: vec!["tool".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("tool", Some(tool.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let item = |value: &str, takes_value| native::CompletionItem {
+            value: value.into(),
+            takes_value,
+            description: None,
+        };
+        let partial = vec![
+            item("home", None),
+            item("notes", None),
+            item("-h", Some(true)),
+            item("-v", Some(false)),
+        ];
+        for (source, expected) in [
+            (
+                "tool build --configuraton release",
+                Some("tool build --configuration release"),
+            ),
+            ("tool -hide_baner x", Some("tool -hide_banner x")),
+            ("tool -loglevle quiet", Some("tool -loglevel quiet")),
+            // Still `-h` with a value, and a word nothing documents.
+            ("tool -hbuild", None),
+            ("tool build --zzzzzz", None),
+        ] {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Fixed {
+                    answer: Ok(partial.clone()),
+                    complete: false,
+                });
+            let report =
+                correct_with_backends(&failure(source), &ctx, vec![("tool".into(), backend)]);
+            assert_eq!(
+                report
+                    .outcome
+                    .candidates()
+                    .first()
+                    .map(|c| c.script.as_str()),
+                expected,
+                "{source}: {:?}",
+                report.outcome
+            );
+        }
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    /// `git lfs` runs git-lfs, whose own completer (cobra) checks the words
+    /// after it; git's bridge probes only builtins.
+    #[test]
+    fn git_helpers_with_their_own_completers_check_the_rest_of_the_line() {
+        let item = |value: &str| native::CompletionItem {
+            value: value.into(),
+            takes_value: None,
+            description: None,
+        };
+        let fixed = |words: &[&str]| -> std::rc::Rc<dyn native::NativeCompletionBackend> {
+            std::rc::Rc::new(Fixed {
+                answer: Ok(words.iter().map(|w| item(w)).collect()),
+                complete: true,
+            })
+        };
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("git", Some("/bin/echo"))
+            .with_which("git-lfs", Some("/bin/echo"))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        for (source, expected) in [
+            ("git lfs trak x", Some("git lfs track x")),
+            ("git lfs pull", None),
+            ("git lsf pull", Some("git lfs pull")),
+        ] {
+            let report = correct_with_backends(
+                &failure(source),
+                &ctx,
+                vec![
+                    ("git".into(), fixed(&["lfs", "status"])),
+                    ("git-lfs".into(), fixed(&["track", "pull"])),
+                ],
+            );
+            assert_eq!(
+                report
+                    .outcome
+                    .candidates()
+                    .first()
+                    .map(|c| c.script.as_str()),
+                expected,
+                "{source}: {:?}",
+                report.outcome
+            );
+        }
+    }
+
     #[test]
     fn documentation_answers_where_a_partial_or_broken_completer_says_nothing() {
         let fake = fake_aws();
@@ -2998,7 +4269,7 @@ esac
         let fake = fake_aws();
         let tool = fake.dir.script(
             "bin/archiver",
-            "#!/bin/sh\n[ \"$1\" = --help ] || { touch \"$(dirname \"$0\")/ran\"; exit 1; }\nprintf 'Usage: archiver [options] files\\n\\nOptions:\\n  -c            Create\\n  -x            Extract\\n  -v            Verbose\\n  -z            Compress\\n  -f FILE       Archive file\\n  -j N          Jobs\\n  -C DIR        Change directory\\n  -name PATTERN Match names\\n  --verbose     Talk\\n  --zstd        Use zstd\\n'\n",
+            "#!/bin/sh\n[ \"$1\" = --help ] || { touch \"$(dirname \"$0\")/ran\"; exit 1; }\nprintf 'Usage: archiver [options] files\\n\\nOptions:\\n  -c            Create\\n  -x            Extract\\n  -v            Verbose\\n  -z            Compress\\n  -f FILE       Archive file\\n  -j N          Jobs\\n  -C DIR        Change directory\\n  -name PATTERN Match names\\n  -h TOPIC      Help\\n  -hide_banner  Quiet\\n  -I DIR        Include\\n  -include FILE Prepend\\n  --verbose     Talk\\n  --zstd        Use zstd\\n'\n",
         );
         let settings = Settings {
             trusted_help: vec!["archiver".into()],
@@ -3022,6 +4293,13 @@ esac
             ("archiver -Csrc --verbsoe", "archiver -Csrc --verbose"),
             // A single-dash long option is still repaired as a whole.
             ("archiver -nmae '*.rs'", "archiver -name '*.rs'"),
+            // ffmpeg's `-hide_baner` is not `-h` with a value...
+            ("archiver -hide_baner src", "archiver -hide_banner src"),
+            // ...but gcc's `-Iinclude` is `-I` with one.
+            (
+                "archiver -Iinclude --verbsoe",
+                "archiver -Iinclude --verbose",
+            ),
         ] {
             let report = correct(&failure(source), &ctx);
             assert_eq!(
@@ -3156,6 +4434,44 @@ esac
             "{:?}",
             report.outcome
         );
+        // zsh's _whois lists a few servers: one seven edits away says
+        // nothing about the typed server.
+        let item = |value: &str| native::CompletionItem {
+            value: value.into(),
+            takes_value: None,
+            description: None,
+        };
+        let servers = vec![item("whois.gb.com"), item("whois.ripe.net")];
+        let backend: std::rc::Rc<dyn native::NativeCompletionBackend> = std::rc::Rc::new(Fixed {
+            answer: Ok(servers),
+            complete: false,
+        });
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("tool", Some("/bin/echo"))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        for (source, expected) in [
+            ("tool whois.example.com", None),
+            ("tool whois.ripe.ent", Some("tool whois.ripe.net")),
+            // An abbreviation, as csvlook's `--no-inferr`.
+            ("tool whois.rip", Some("tool whois.ripe.net")),
+        ] {
+            let report = correct_with_backends(
+                &failure(source),
+                &ctx,
+                vec![("tool".into(), backend.clone())],
+            );
+            assert_eq!(
+                report
+                    .outcome
+                    .candidates()
+                    .first()
+                    .map(|c| c.script.as_str()),
+                expected,
+                "{source}: {:?}",
+                report.outcome
+            );
+        }
     }
 
     #[test]
@@ -3416,9 +4732,11 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
             "cobra/app",
             "#!/bin/sh\n[ \"$1\" = __complete ] || exit 1\ncat \"$(dirname \"$0\")/words\"\necho :4\n",
         );
+        // A listed subcommand answers its own (empty) predictions; after
+        // any other word posener lists the root's subcommands again.
         let posener = dir.script(
             "posener/app",
-            "#!/bin/sh\n[ -n \"$COMP_LINE\" ] || exit 1\ncat \"$(dirname \"$0\")/words\"\n",
+            "#!/bin/sh\n[ -n \"$COMP_LINE\" ] || exit 1\nset -- $COMP_LINE\ngrep -qx -- \"$2\" \"$(dirname \"$0\")/words\" && exit 0\ncat \"$(dirname \"$0\")/words\"\n",
         );
         let git = dir.script(
             "git/app",
@@ -3460,6 +4778,218 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
     }
 
     #[test]
+    fn posener_argument_predictions_are_not_a_command_vocabulary() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("posener-arguments");
+        // vault's fixed engine set answers at every argument position;
+        // terraform predicts workspaces, then directories.
+        let app = dir.script(
+            "app",
+            r#"#!/bin/sh
+[ -n "$COMP_LINE" ] || exit 1
+case "$COMP_LINE" in
+  "app secrets ") printf 'enable\ndisable\n';;
+  "app secrets enable "*) printf 'aws\nconsul\ntransit\n';;
+  "app secrets disable "*) ;;
+  "app secrets "*) printf 'enable\ndisable\n';;
+  "app workspace ") printf 'select\nlist\n';;
+  "app workspace select ") printf 'default\n';;
+  "app workspace select "*) printf 'dir/\n';;
+  "app workspace list "*) ;;
+  "app workspace "*) printf 'select\nlist\n';;
+  *) printf 'secrets\nworkspace\n';;
+esac
+"#,
+        );
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("app", Some(app.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let run = |source: &str| {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Backend::new(Flavor::Posener, "app", app.clone()));
+            correct_with_backends(&failure(source), &ctx, vec![("app".into(), backend)])
+        };
+        for valid in [
+            "app secrets enable kv",
+            // Not `transit`: the app never judged the engine's name.
+            "app secrets enable transform",
+            "app workspace select prod",
+            "app workspace select prod dir/",
+        ] {
+            let report = run(valid);
+            assert!(
+                matches!(report.outcome, Outcome::NoCorrection(_)),
+                "{valid}: {:?} {:?}",
+                report.outcome,
+                report.notes
+            );
+        }
+        for (typo, expected) in [
+            ("app secrets enabel kv", "app secrets enable kv"),
+            ("app workspace selcet prod", "app workspace select prod"),
+            ("app secrts list", "app secrets list"),
+        ] {
+            let report = run(typo);
+            assert_eq!(scripts(&report.outcome), [expected], "{:?}", report.notes);
+        }
+    }
+
+    #[test]
+    fn listed_fragments_continue_into_longer_words() {
+        let listed = |words: &[&str]| providers::Vocabulary {
+            words: words
+                .iter()
+                .map(|w| native::CompletionItem {
+                    value: (*w).into(),
+                    takes_value: None,
+                    description: None,
+                })
+                .collect(),
+            authoritative: false,
+            via: "zsh completion".into(),
+            source: Source::NativeCompletion,
+            cached: false,
+            resources: Vec::new(),
+        };
+        // zsh's _file_modes: chmod's `+x` and `=r` go on from operators.
+        let modes = listed(&["u", "g", "o", "a", "+", "-", "="]);
+        for typed in ["+x", "-w", "=r"] {
+            assert!(continues_listed_word(&modes, typed), "{typed}");
+        }
+        assert!(!continues_listed_word(&modes, "+"));
+        assert!(!continues_listed_word(&listed(&["log"]), "logs"));
+        assert!(!continues_listed_word(&listed(&["a+"]), "a+x"));
+        assert!(continues_listed_word(&listed(&["web:"]), "web:a"));
+        // ssh's -o keys: `Name=value`, the name alone, and `Name value`.
+        let keys = listed(&["StrictHostKeyChecking=", "BatchMode="]);
+        assert!(continues_listed_word(&keys, "BatchMode=yes"));
+        assert!(names_listed_key(&keys, "BatchMode"));
+        assert!(names_listed_key(&keys, "BatchMode yes"));
+        assert!(!names_listed_key(&keys, "BatchModes"));
+        let repaired = |typed: &str| {
+            keep_hierarchical_tails(keys.clone(), typed)
+                .words
+                .into_iter()
+                .map(|w| w.value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            repaired("StrictHostKeyCheking=no"),
+            ["StrictHostKeyChecking=no", "BatchMode=no"]
+        );
+        assert_eq!(
+            repaired("BatchMdoe yes"),
+            ["StrictHostKeyChecking yes", "BatchMode yes"]
+        );
+    }
+
+    #[test]
+    fn cobra_boolean_flags_aliases_file_arguments_and_hierarchical_words() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("cobra-arguments");
+        // rclone's shape: remotes complete one level at a time, and files
+        // are valid arguments too (directive 0, no ShellCompDirectiveNoFileComp).
+        let app = dir.script(
+            "app",
+            r#"#!/bin/sh
+[ "$1" = __complete ] || exit 1
+shift
+case "$*" in
+  "") printf 'copy\tCopy files\nlsd\tList directories\n:0\n';;
+  "-") printf -- '--config\tConfig file\n:4\n';;
+  "copy -") printf -- '--dry-run\tTrial run\n--transfers\tParallel transfers\n:4\n';;
+  "copy --transfers ") printf ':0\n';;
+  "lsd -"|"ls -") printf -- '--config\tConfig file\n--recursive\tRecurse\n:4\n';;
+  "copy "*|"lsd "*|"ls "*) printf 'web:\nloc:\n:0\n';;
+  *) printf ':0\n';;
+esac
+"#,
+        );
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("app", Some(app.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let run = |source: &str| {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Backend::new(Flavor::Cobra, "app", app.clone()));
+            correct_with_backends(&failure(source), &ctx, vec![("app".into(), backend)])
+        };
+        for valid in [
+            // `--dry-run` takes no value: `web:a` and `b` are arguments.
+            "app copy --dry-run web:a b",
+            "app copy --transfers 4 web:a b",
+        ] {
+            let report = run(valid);
+            assert!(
+                matches!(report.outcome, Outcome::NoCorrection(_)),
+                "{valid}: {:?} {:?}",
+                report.outcome,
+                report.notes
+            );
+        }
+        let report = run("app copy --dry-rnu web:a b");
+        assert_eq!(scripts(&report.outcome), ["app copy --dry-run web:a b"]);
+        // The root's commands are complete; a misspelled one is decided.
+        let report = run("app lsdd web:");
+        assert!(
+            matches!(report.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(scripts(&report.outcome), ["app lsd web:"]);
+        // cobra lists no aliases; `ls` resolves to `lsd`, whose flags differ
+        // from the root's, while `lsdd` finds no command at all.
+        let report = run("app ls web:");
+        assert!(
+            matches!(report.outcome, Outcome::NoCorrection(_)),
+            "{:?} {:?}",
+            report.outcome,
+            report.notes
+        );
+        // A misspelled remote keeps its path, and a partial level asks.
+        let report = run("app copy web:a wbe:b/c");
+        assert!(
+            !matches!(report.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(scripts(&report.outcome)[0], "app copy web:a web:b/c");
+    }
+
+    #[test]
+    fn handler_values_repeated_in_every_slot_are_resources() {
+        use super::native::{Backend, Flavor};
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let dir = Dir::new("handler-values");
+        // make's targets come back after every target; svn-like commands
+        // only where a command goes.
+        let script = dir.script(
+            "completion",
+            "_vals() { COMPREPLY=(alpha beta gamma); }\ncomplete -F _vals vals\n_cmds() { COMPREPLY=(); [ \"$COMP_CWORD\" -eq 1 ] && COMPREPLY=(build deploy); }\ncomplete -F _cmds cmds\n",
+        );
+        for (app, typo, expected, approval) in [
+            ("vals", "vals alpah", "vals alpha", Decision::Confirm),
+            ("cmds", "cmds biuld", "cmds build", Decision::Allow),
+        ] {
+            let path = dir.script(&format!("bin/{app}"), "#!/bin/sh\nexit 0\n");
+            let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+                .with_which(app, Some(path.to_str().unwrap()))
+                .with_which("man", None)
+                .with_history::<&str>(&[]);
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> = std::rc::Rc::new(
+                Backend::new(Flavor::BashFunction, app, bash.clone()).with_helper(script.clone()),
+            );
+            let report = correct_with_backends(&failure(typo), &ctx, vec![(app.into(), backend)]);
+            let candidates = report.outcome.candidates();
+            assert_eq!(candidates[0].script, expected, "{:?}", report.notes);
+            assert_eq!(candidates[0].safety.decision, approval, "{typo}");
+        }
+    }
+
+    #[test]
     fn shell_handlers_follow_upgrades_and_fingerprint_the_app_and_registration() {
         use super::native::{Backend, Flavor};
         let dir = Dir::new("shell-upgrades");
@@ -3481,13 +5011,14 @@ storage account *|--resource-group=\nstorage account *|--verbose\n",
             let words = app.parent().unwrap().join("words");
             fs::write(&words, "build\ndeploy\n").unwrap();
             let body = if shell == Shell::Fish {
+                // Commands only where a command goes, as real handlers do.
                 format!(
-                    "complete -c app -f -a '(cat {})'\n",
+                    "complete -c app -f -n 'test (count (commandline -opc)) -eq 1' -a '(cat {})'\n",
                     parser::quote_word_with_dialect(words.to_str().unwrap(), parser::Dialect::Fish)
                 )
             } else {
                 format!(
-                    "_app() {{ COMPREPLY=(); while IFS= read -r word; do COMPREPLY+=(\"$word\"); done < {}; }}\ncomplete -F _app app\n",
+                    "_app() {{ COMPREPLY=(); [ \"$COMP_CWORD\" -eq 1 ] || return 0; while IFS= read -r word; do COMPREPLY+=(\"$word\"); done < {}; }}\ncomplete -F _app app\n",
                     crate::shlex::quote(words.to_str().unwrap())
                 )
             };

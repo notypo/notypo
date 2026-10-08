@@ -104,9 +104,10 @@ impl Word {
     pub fn option_name_span_to(&self, src: &str, end: usize) -> Option<Span> {
         let raw = self.span.of(src);
         let name = raw.get(..end)?;
+        // `+` starts dig's query options (`+short`).
         (name.len() > 1
-            && name.starts_with(['-', '/'])
-            && name.bytes().all(|c| {
+            && name.starts_with(['-', '/', '+'])
+            && name.bytes().skip(1).all(|c| {
                 c.is_ascii_alphanumeric() || matches!(c, b'-' | b'/' | b'_' | b'.' | b'?' | b':')
             }))
         .then(|| Span::new(self.span.start, self.span.start + end))

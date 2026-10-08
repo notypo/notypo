@@ -1,6 +1,9 @@
-//! Click 8's completion protocol: with `<VAR>=bash_complete`, the app reads
-//! `COMP_WORDS` (split like `shlex.split`) and `COMP_CWORD`, prints one
-//! `type,value` line per item, and exits before running any command.
+//! Click 8's completion protocol: with `<VAR>=zsh_complete`, the app reads
+//! `COMP_WORDS` (split like `shlex.split`) and `COMP_CWORD`, prints three
+//! lines per item (type, literal value, description), and exits before
+//! running any command. No shell needs to run to use this wire format.
+//! Described colons in newer versions are verified against the literal
+//! Bash format; multiline descriptions also fall back to that format.
 //! `plain` items are words; `file` and `dir` ask the shell to complete
 //! paths instead. The variable is derived from the program name the app was
 //! started with, or set by the app, and an app ignoring it just runs. So it
@@ -28,6 +31,8 @@ pub(super) struct Protocol {
     variable: String,
     /// The app may have been replaced since its evidence was read.
     application_fingerprint: String,
+    /// Only own help distinguishes root command names from callback values.
+    root_commands: Option<Vec<String>>,
 }
 
 fn app_fingerprint(path: &Path) -> String {
@@ -143,6 +148,7 @@ impl Protocol {
         bound.then(|| Self {
             variable,
             application_fingerprint: app_fingerprint(path),
+            root_commands: None,
         })
     }
 
@@ -168,6 +174,7 @@ impl Protocol {
         Some(Self {
             variable: variable_for(program)?,
             application_fingerprint: app_fingerprint(path),
+            root_commands: root_commands(help),
         })
     }
 
@@ -182,8 +189,8 @@ impl Protocol {
             short_options: true,
             // Hidden commands and options are omitted, as in cobra.
             complete_options: true,
-            complete_subcommands: true,
-            descriptions: false,
+            complete_subcommands: self.root_commands.is_some(),
+            descriptions: true,
             query_dialect: None,
             trust,
         }
@@ -199,6 +206,18 @@ impl Protocol {
         capabilities
     }
 
+    pub fn resource(&self, words: &[&str], item: &CompletionItem) -> bool {
+        // The wire format has no enum/resource distinction. Only root names
+        // listed by own help are known commands; all other plain values may
+        // be local resources even when HTTP access is disabled.
+        !item.is_option()
+            && !(words.is_empty()
+                && self
+                    .root_commands
+                    .as_ref()
+                    .is_some_and(|commands| commands.contains(&item.value)))
+    }
+
     fn query(
         &self,
         backend: &Backend,
@@ -206,6 +225,36 @@ impl Protocol {
         incomplete: &str,
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
+        let text = self.raw(backend, words, incomplete, "zsh_complete", budget)?;
+        let mut items = match parse(&text, budget.max_candidates) {
+            Ok(items) => items,
+            Err(error) => {
+                // Click prints descriptions without escaping newlines.
+                // An application's multiline help breaks the zsh framing;
+                // use a separately validated literal answer without help.
+                let text = self.raw(backend, words, incomplete, "bash_complete", budget)?;
+                return parse_bash(&text, budget.max_candidates).map_err(|_| error);
+            }
+        };
+        // Click 8.2.2+ escapes described colons for zsh's `_describe`.
+        // Older versions can return a literal backslash before a colon.
+        // Verify ambiguous bytes with the library's literal bash format;
+        // neither shell is launched. Changing callback lists fail closed.
+        if items.iter().any(|item| item.value.contains(r"\:")) {
+            let text = self.raw(backend, words, incomplete, "bash_complete", budget)?;
+            restore_literals(&mut items, &text, budget.max_candidates)?;
+        }
+        Ok(items)
+    }
+
+    fn raw(
+        &self,
+        backend: &Backend,
+        words: &[&str],
+        incomplete: &str,
+        instruction: &str,
+        budget: &mut Budget,
+    ) -> Result<String, CompletionError> {
         if app_fingerprint(&backend.completer) != self.application_fingerprint {
             return Err(CompletionError::Failed(
                 "the app changed after its click completion evidence was read".into(),
@@ -230,15 +279,15 @@ impl Protocol {
             line.push(' ');
             line.push_str(&crate::shlex::quote(incomplete));
         }
-        let mut key = vec!["click"];
+        let mut key = vec!["click", instruction];
         key.extend_from_slice(words);
         key.push(incomplete);
-        let text = backend.memoized(&key, || {
+        backend.memoized(&key, || {
             let mut env = super::offline_env(Flavor::Click);
             env.extend([
                 (
                     OsString::from(&self.variable),
-                    Some(OsString::from("bash_complete")),
+                    Some(OsString::from(instruction)),
                 ),
                 ("COMP_WORDS".into(), Some(line.into())),
                 (
@@ -247,8 +296,7 @@ impl Protocol {
                 ),
             ]);
             run_stdout(&backend.completer, Vec::new(), env, budget, true)
-        })?;
-        parse(&text, budget.max_candidates)
+        })
     }
 
     pub fn complete(
@@ -289,10 +337,15 @@ impl Protocol {
 
 fn parse(text: &str, limit: usize) -> Result<Vec<CompletionItem>, CompletionError> {
     let mut items: Vec<CompletionItem> = Vec::new();
-    for line in text.lines().filter(|line| !line.is_empty()) {
-        let Some((kind, value)) = line.split_once(',') else {
+    if text == "\n" {
+        // Click's echo adds one newline to an empty completion answer.
+        return Ok(items);
+    }
+    let mut lines = text.split_terminator('\n');
+    while let Some(kind) = lines.next() {
+        let (Some(value), Some(description)) = (lines.next(), lines.next()) else {
             return Err(CompletionError::Failed(
-                "click completion returned a line without a type".into(),
+                "click completion returned an incomplete record".into(),
             ));
         };
         match kind {
@@ -305,9 +358,9 @@ fn parse(text: &str, limit: usize) -> Result<Vec<CompletionItem>, CompletionErro
                 )));
             }
         }
-        // Words with whitespace would need quoting the answer cannot show.
+        // Values are literal bytes. The edit layer quotes spaces, commas,
+        // quotes, Unicode, and shell operators for the user's shell.
         if value.is_empty()
-            || value.contains(char::is_whitespace)
             || value.contains(char::is_control)
             || items.iter().any(|item| item.value == value)
         {
@@ -321,14 +374,113 @@ fn parse(text: &str, limit: usize) -> Result<Vec<CompletionItem>, CompletionErro
         items.push(CompletionItem {
             value: value.to_owned(),
             takes_value: None,
-            description: None,
+            description: (!description.is_empty()
+                && description != "_"
+                && !description.contains(char::is_control))
+            .then(|| description.to_owned()),
         });
     }
     Ok(items)
 }
 
+fn root_commands(help: &str) -> Option<Vec<String>> {
+    let help = crate::engine::docs::strip_formatting(help);
+    let mut commands = Vec::new();
+    let mut section = false;
+    let mut found = false;
+    for line in help.lines() {
+        if line.trim() == "Commands:" {
+            section = true;
+            found = true;
+            continue;
+        }
+        if !section || line.trim().is_empty() {
+            continue;
+        }
+        if !line.starts_with("  ") {
+            section = false;
+            continue;
+        }
+        if line.starts_with("   ") {
+            continue;
+        }
+        let name = line.split_whitespace().next()?;
+        if !name.contains(char::is_control) && !commands.iter().any(|c| c == name) {
+            commands.push(name.to_owned());
+        }
+    }
+    found.then_some(commands)
+}
+
+fn parse_bash(bash: &str, limit: usize) -> Result<Vec<CompletionItem>, CompletionError> {
+    if bash == "\n" {
+        return Ok(Vec::new());
+    }
+    // Convert the literal bash answer into the same validated records.
+    let mut records = String::new();
+    for line in bash.split_terminator('\n') {
+        let Some((kind, value)) = line.split_once(',') else {
+            return Err(CompletionError::Failed(
+                "click literal verification returned a line without a type".into(),
+            ));
+        };
+        records.push_str(kind);
+        records.push('\n');
+        records.push_str(value);
+        records.push_str("\n_\n");
+    }
+    parse(&records, limit)
+}
+
+fn restore_literals(
+    items: &mut [CompletionItem],
+    bash: &str,
+    limit: usize,
+) -> Result<(), CompletionError> {
+    let literal = parse_bash(bash, limit)?;
+    let same = items.len() == literal.len()
+        && items
+            .iter()
+            .zip(&literal)
+            .all(|(item, literal)| item.value == literal.value);
+    let escaped = items.len() == literal.len()
+        && items.iter().zip(&literal).all(|(item, literal)| {
+            item.value
+                == if item.description.is_some() {
+                    literal.value.replace(':', r"\:")
+                } else {
+                    literal.value.clone()
+                }
+        });
+    if !same && !escaped {
+        return Err(CompletionError::Failed(
+            "click completion changed during literal verification".into(),
+        ));
+    }
+    for (item, literal) in items.iter_mut().zip(literal) {
+        item.value = literal.value;
+    }
+    Ok(())
+}
+
 /// Help-based discovery for a trusted Python console script. Only `--help`
 /// runs; no completion variable is set unless the help shows click's.
+impl Protocol {
+    /// Root command names from the app's own `--help`, for a protocol found
+    /// through its completion script when that help is trusted.
+    pub(super) fn read_root_commands(&mut self, path: &Path, budget: &mut Budget) {
+        if let Ok(help) = run_stdout(
+            path,
+            vec!["--help".into()],
+            super::offline_env(Flavor::Click),
+            budget,
+            true,
+        ) {
+            self.root_commands = root_commands(&help);
+        }
+    }
+}
+
 pub(super) fn discover_from_help(
     path: &Path,
     identity: Option<&str>,
@@ -389,13 +541,8 @@ fn site_packages(script: &Path, module: &str) -> Option<PathBuf> {
     }
     let real = std::fs::canonicalize(script).ok()?;
     let head = super::head(&real, 4096);
-    let interpreter = head
-        .lines()
-        .next()?
-        .strip_prefix("#!")?
-        .split_whitespace()
-        .next()?;
-    let prefix = Path::new(interpreter).parent()?.parent()?;
+    let interpreter = super::identity::python_interpreter(&head)?;
+    let prefix = Path::new(&interpreter).parent()?.parent()?;
     let mut libs: Vec<PathBuf> = std::fs::read_dir(prefix.join("lib"))
         .ok()?
         .filter_map(Result::ok)
@@ -477,7 +624,7 @@ complete --no-files --command clickfix --arguments "(_clickfix_completion)";
     const HELP: &str = "Usage: clickfix [OPTIONS] COMMAND [ARGS]...\n\n  Fixture app.\n\nOptions:\n  -c, --config TEXT    Config file\n  --help               Show this message and exit.\n\nCommands:\n  db:migrate  Run migrations.\n  deploy      Deploy an app.\n";
 
     /// A stand-in for Python running a click app: completion answers like
-    /// click 8.5.0 did for the same command tree; anything else is a run.
+    /// click 8.1.8 did for the same command tree; anything else is a run.
     const PYTHON: &str = r#"#!/bin/sh
 root=$(dirname "$0")
 [ "$1" = -m ] && [ "$2" = clickfix ] || exit 8
@@ -486,12 +633,20 @@ printf '[%s]' "$@" >> "$root/calls"
 printf '%s|%s|%s\n' "$_CLICKFIX_COMPLETE" "$COMP_CWORD" "$COMP_WORDS" >> "$root/calls"
 [ "$PYTHONDONTWRITEBYTECODE" = 1 ] && [ "$HTTPS_PROXY" = http://127.0.0.1:9 ] || exit 8
 if [ "$*" = --help ] && [ -z "$_CLICKFIX_COMPLETE" ]; then cat "$root/help"; exit 0; fi
-[ "$#" = 0 ] && [ "$_CLICKFIX_COMPLETE" = bash_complete ] || { touch "$root/operation-marker"; exit 2; }
+[ "$#" = 0 ] || { touch "$root/operation-marker"; exit 2; }
+case "$_CLICKFIX_COMPLETE" in zsh_complete|bash_complete) ;; *) touch "$root/operation-marker"; exit 2;; esac
+emit() {
+  if [ "$_CLICKFIX_COMPLETE" = bash_complete ]; then
+    awk 'NR % 3 == 1 { kind = $0 } NR % 3 == 2 { printf "%s,%s\n", kind, $0 }'
+  else cat; fi
+}
 if [ -f "$root/mode" ]; then
   case "$(cat "$root/mode")" in
-    unknown) printf 'plain,deploy\nmystery,value\n'; exit 0;;
-    failed) printf 'plain,deploy\n'; exit 1;;
-    utf8) printf 'plain,\377\n'; exit 0;;
+    unknown) printf 'plain\ndeploy\n_\nmystery\nvalue\n_\n' | emit; exit 0;;
+    failed) printf 'plain\ndeploy\n_\n'; exit 1;;
+    utf8) printf 'plain\n\377\n_\n'; exit 0;;
+    truncated) if [ "$_CLICKFIX_COMPLETE" = bash_complete ]; then printf 'missing-type\n'; else printf 'plain\ndeploy\n_\nplain\nmissing-help\n'; fi; exit 0;;
+    multiline) if [ "$_CLICKFIX_COMPLETE" = bash_complete ]; then printf 'plain,deploy\nplain,with space\n'; else printf 'plain\ndeploy\nHelp\n\nContinued help\nplain\nwith space\n_\n'; fi; exit 0;;
     hanging) (sleep 1; touch "$root/delayed-marker") & wait; exit 0;;
   esac
 fi
@@ -499,20 +654,20 @@ w="$COMP_WORDS "
 w="${w#* }"
 w="${w% }"
 case "$COMP_CWORD|$w" in
-  '1|-') printf 'plain,--config\nplain,-c\nplain,--verbose\nplain,--help\n';;
-  '2|deploy') printf 'plain,status\n';;
-  '3|deploy status') printf 'plain,prod\nplain,staging\n';;
-  '3|deploy status -') printf 'plain,--watch\nplain,--format\nplain,--help\n';;
-  '4|deploy status --format') printf 'plain,json\nplain,yaml\n';;
-  '2|open') printf 'file,\n';;
+  '1|-') printf 'plain\n--config\nConfig file\nplain\n-c\nConfig file\nplain\n--verbose\n_\nplain\n--help\nHelp\n';;
+  '2|deploy') printf 'plain\nstatus\nShow status\n';;
+  '3|deploy status') printf 'plain\nprod\n_\nplain\nstaging\n_\n';;
+  '3|deploy status -') printf 'plain\n--watch\n_\nplain\n--format\nOutput format\nplain\n--help\nHelp\n';;
+  '4|deploy status --format') printf 'plain\njson\n_\nplain\nyaml\n_\n';;
+  '2|open') printf 'file\n\n_\n';;
   *) cat "$root/root";;
-esac
+esac | emit
 "#;
 
     fn app(dir: &Dir, name: &str) -> PathBuf {
         dir.script("python3", PYTHON);
         dir.script("help", HELP);
-        dir.script("root", "plain,db:migrate\nplain,deploy\nplain,with space\n");
+        dir.script("root", "plain\ndb:migrate\nRun migrations\nplain\ndeploy\nDeploy an app\nplain\nwith space\n_\n");
         dir.script(
             name,
             &format!(
@@ -642,8 +797,7 @@ esac
         let mut budget = budget();
         assert_eq!(
             values(&backend.complete(&[], "", &mut budget).unwrap()),
-            ["db:migrate", "deploy"],
-            "words needing quotes are not offered"
+            ["db:migrate", "deploy", "with space"]
         );
         assert_eq!(
             values(&backend.complete(&[], "-", &mut budget).unwrap()),
@@ -673,14 +827,14 @@ esac
         let calls = calls(&dir);
         assert!(
             calls.contains(
-                r#"bash_complete|5|clickfix 'a b' '' 'it'"'"'s' '$(touch operation-marker)'"#
+                r#"zsh_complete|5|clickfix 'a b' '' 'it'"'"'s' '$(touch operation-marker)'"#
             ),
             "{calls}"
         );
         assert!(
             calls
                 .lines()
-                .all(|line| line.starts_with("[]bash_complete|")),
+                .all(|line| line.starts_with("[]zsh_complete|")),
             "no arguments reach the app: {calls}"
         );
         assert!(!dir.0.join("operation-marker").exists());
@@ -715,11 +869,116 @@ esac
     }
 
     #[test]
+    fn records_preserve_literal_values_and_descriptions_and_reject_bad_framing() {
+        let literal = "team 😀/it's $(touch marker), a;b";
+        let items = parse(
+            &format!("plain\n{literal}\nCurrent team\nfile\n\n_\ndir\nignored\n_\nplain\njson\n_\nplain\n{literal}\nDuplicate\n"),
+            3,
+        )
+        .unwrap();
+        assert_eq!(values(&items), [literal, "json"]);
+        assert_eq!(items[0].description.as_deref(), Some("Current team"));
+        assert_eq!(items[1].description, None);
+        assert!(parse("", 1).unwrap().is_empty());
+        assert!(parse("\n", 1).unwrap().is_empty());
+        assert!(
+            parse("plain\n\n_\nplain\na\tb\n_\nplain\na\rb\n_\n", 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            parse("plain\nword\n\x1b[31mUnsafe\n", 1).unwrap()[0].description,
+            None
+        );
+        for bad in [
+            "plain,word\n",
+            "plain\nword\n",
+            "plain\nword\n_\nplain\n",
+            "plain\nline\nbreak\n_\n",
+            "mystery\nword\n_\n",
+        ] {
+            assert!(parse(bad, 8).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn plain_values_need_confirmation_without_help_evidence_of_root_commands() {
+        let dir = Dir::new("click-resources");
+        let backend = found(&dir);
+        let mut budget = budget();
+        let root = backend.complete(&[], "", &mut budget).unwrap();
+        assert!(!backend.candidate_is_resource(&[], &root[0]));
+        assert!(!backend.candidate_is_resource(&[], &root[1]));
+        assert!(backend.candidate_is_resource(&[], &root[2]));
+        assert!(backend.candidate_is_resource(&["deploy"], &root[1]));
+        let options = backend.complete(&[], "-", &mut budget).unwrap();
+        assert!(!backend.candidate_is_resource(&[], &options[0]));
+        let path = dir.0.join("clickfix");
+        let script = Protocol::from_script(BASH, "clickfix", &path).unwrap();
+        assert!(!script.capabilities(Trust::UserTrusted).complete_subcommands);
+        assert!(script.resource(&[], &root[1]));
+        // mkdocs's bash script with trusted help: its root commands are known.
+        let mut script = script;
+        script.read_root_commands(&path, &mut budget);
+        assert!(script.capabilities(Trust::UserTrusted).complete_subcommands);
+        assert!(!script.resource(&[], &root[1]));
+        assert!(script.resource(&[], &root[2]));
+        assert_eq!(
+            root_commands(
+                "Commands:\n  first  Wrapped description\n      continuation\n  db:migrate  Second\n\nOptions:\n  --bad  Ignored\n"
+            ),
+            Some(vec!["first".into(), "db:migrate".into()])
+        );
+    }
+
+    #[test]
+    fn colon_verification_preserves_old_and_new_formats_and_literal_backslashes() {
+        let bash = "plain,team:one\nplain,team\\:two\nplain,team:three\n";
+        for wire in [
+            "plain\nteam:one\nTeam\nplain\nteam\\:two\nTeam\nplain\nteam:three\n_\n",
+            "plain\nteam\\:one\nTeam\nplain\nteam\\\\:two\nTeam\nplain\nteam:three\n_\n",
+        ] {
+            let mut items = parse(wire, 4).unwrap();
+            restore_literals(&mut items, bash, 4).unwrap();
+            assert_eq!(values(&items), ["team:one", r"team\:two", "team:three"]);
+            assert_eq!(items[0].description.as_deref(), Some("Team"));
+        }
+        let mut items = parse("plain\nteam\\:one\nTeam\n", 1).unwrap();
+        for bad in [
+            "plain,other\n",
+            "plain,team:one\nplain,extra\n",
+            "plain",
+            "mystery,team:one\n",
+        ] {
+            assert!(restore_literals(&mut items, bad, 2).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn multiline_help_uses_validated_literal_answers_without_descriptions() {
+        let dir = Dir::new("click-multiline");
+        let backend = found(&dir);
+        dir.script("mode", "multiline");
+        let mut budget = budget();
+        let items = backend.complete(&[], "", &mut budget).unwrap();
+        assert_eq!(values(&items), ["deploy", "with space"]);
+        assert!(items.iter().all(|item| item.description.is_none()));
+        assert_eq!(budget.spawned(), 2);
+        backend.complete(&[], "", &mut budget).unwrap();
+        assert_eq!(budget.spawned(), 2, "both formats are memoized");
+        assert!(!dir.0.join("operation-marker").exists());
+        for bad in ["plain", "plain,word\ncontinued value\n", "mystery,word\n"] {
+            assert!(parse_bash(bad, 3).is_err());
+        }
+    }
+
+    #[test]
     fn failures_changed_apps_and_unrepresentable_words_fail_closed() {
         for (mode, why) in [
             ("unknown", "unknown item type"),
             ("failed", "exited"),
             ("utf8", "UTF-8"),
+            ("truncated", "incomplete record"),
             ("hanging", "timed out"),
         ] {
             let dir = Dir::new("click-failures");
@@ -871,7 +1130,10 @@ esac
         let mut budget = budget();
         let before = found(&dir);
         assert!(!values(&before.complete(&[], "", &mut budget).unwrap()).contains(&"rollback"));
-        dir.script("root", "plain,db:migrate\nplain,deploy\nplain,rollback\n");
+        dir.script(
+            "root",
+            "plain\ndb:migrate\n_\nplain\ndeploy\n_\nplain\nrollback\n_\n",
+        );
         let path = dir.0.join("clickfix");
         let protocol = Protocol::from_help(HELP, &path).unwrap();
         let after = backend("clickfix", &path, None, protocol);

@@ -68,6 +68,11 @@ pub const POWERSHELL_COMPLETERS: &str = r#"$env:NOTYPO_POWERSHELL_COMPLETIONS = 
             }
         } catch { };"#;
 
+/// Session parameter callbacks and command definitions, without executing
+/// profile statements. Public for checks against real PowerShell sessions.
+#[doc(hidden)]
+pub const POWERSHELL_PARAMETER_COMPLETERS: &str = include_str!("shells/powershell_parameters.ps1");
+
 /// bash code for the integration function: the definitions of the
 /// functions named in the previous command (and, one level down, in those
 /// definitions), each after a `#notypo-function` line, so a function that
@@ -715,6 +720,7 @@ impl Shell {
                  $notypo_runs = if ($notypo_found -and $notypo_found.CommandType -eq 'Alias') {{ $notypo_found.ResolvedCommand }} else {{ $notypo_found }}; \
                  \"$_`t$($notypo_found.CommandType)`t$($notypo_runs.CommandType)`t$(if ($notypo_runs.CommandType -eq 'Application') {{ $notypo_runs.Source }} else {{ $notypo_runs.Name }})\" }}) -join \"`n\";\n        \
                  {POWERSHELL_COMPLETERS}\n        \
+                 {POWERSHELL_PARAMETER_COMPLETERS}\n        \
                  $env:NOTYPO_CURRENT_COMMAND = $history;\n        \
                  $env:NOTYPO_POWERSHELL = (Get-Process -Id $PID).Path;\n        \
                  $env:TF_SHELL = 'powershell';\n        \
@@ -722,7 +728,7 @@ impl Shell {
                  $env:NOTYPO_SHELL_FUNCTIONS = (Get-ChildItem alias:, function: -Name) -join ' ';\n        \
                  {POWERSHELL_WRAPPERS}\n        \
                  $fuck = $(& {exe} $args);\n        \
-                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_POWERSHELL_COMPLETIONS, Env:NOTYPO_POWERSHELL_WRAPPERS, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
+                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_POWERSHELL_COMPLETIONS, Env:NOTYPO_POWERSHELL_PARAMETERS, Env:NOTYPO_POWERSHELL_WRAPPERS, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
                  if (-not [string]::IsNullOrWhiteSpace($fuck)) {{\n            \
                  if ($fuck.StartsWith(\"echo\")) {{ $fuck = $fuck.Substring(5); }}\n            \
                  else {{ iex \"$fuck\"; }}\n        }}\n    }}\n    [Console]::ResetColor() \n}}\n"

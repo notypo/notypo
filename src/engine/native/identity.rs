@@ -17,6 +17,9 @@ pub fn identify(path: &Path) -> Option<String> {
     if super::dotnet::installation(path).is_some() {
         return Some("dotnet:sdk".into());
     }
+    if let Some(tool) = super::rabbitmq::tool(path) {
+        return Some(format!("rabbitmq:{tool}"));
+    }
     let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     if let Some(package) = npm_package(&real) {
         return Some(format!("npm:{package}"));
@@ -221,11 +224,31 @@ fn is_package_name(name: &str) -> bool {
 /// The top-level module a Python console script runs: pip's and uv's
 /// `from awscli.clidriver import main`, or setuptools' older
 /// `load_entry_point('awscli==1.29.0', 'console_scripts', 'aws')`.
-fn python_module(head: &str) -> Option<String> {
-    let shebang = head.lines().next()?;
-    if !shebang.contains("python") {
+/// The interpreter a Python console script names: its shebang, or the
+/// `#!/bin/sh` launcher pip writes when that path has spaces (pipx's venvs
+/// under `~/Library/Application Support` on macOS):
+/// `'''exec' "/path/bin/python" "$0" "$@"`, then `' '''`.
+pub(crate) fn python_interpreter(head: &str) -> Option<String> {
+    let mut lines = head.lines();
+    let shebang = lines.next()?.strip_prefix("#!")?;
+    if shebang.contains("python") {
+        return shebang.split_whitespace().next().map(str::to_owned);
+    }
+    if shebang.trim() != "/bin/sh" {
         return None;
     }
+    let (path, rest) = lines
+        .next()?
+        .strip_prefix(r#"'''exec' ""#)?
+        .split_once('"')?;
+    (rest.trim() == r#""$0" "$@""#
+        && lines.next()?.trim() == "' '''"
+        && Path::new(path).file_name()?.to_str()?.starts_with("python"))
+    .then(|| path.to_owned())
+}
+
+fn python_module(head: &str) -> Option<String> {
+    python_interpreter(head)?;
     // setuptools names the distribution; its loader import is not the app.
     let distribution = head.lines().find_map(|line| {
         let rest = line.split_once("load_entry_point(")?.1;
@@ -315,6 +338,20 @@ mod tests {
             python_launcher("#!/bin/sh\nexec node cli.js \"$@\"\n"),
             None
         );
+        // pip's launcher for an interpreter path with spaces (pipx on macOS).
+        let pipx = "#!/bin/sh\n'''exec' \"/Users/a/Library/Application Support/pipx/venvs/llm/bin/python\" \"$0\" \"$@\"\n' '''\n# -*- coding: utf-8 -*-\nimport sys\nfrom llm.cli import cli\nif __name__ == \"__main__\":\n    sys.exit(cli())\n";
+        assert_eq!(
+            python_interpreter(pipx).as_deref(),
+            Some("/Users/a/Library/Application Support/pipx/venvs/llm/bin/python")
+        );
+        assert_eq!(python_module(pipx).as_deref(), Some("llm"));
+        for other in [
+            "#!/bin/sh\n'''exec' \"/usr/bin/node\" \"$0\" \"$@\"\n' '''\nfrom x import y\n",
+            "#!/bin/sh\n'''exec' \"/v/bin/python\" \"$0\"\n' '''\nfrom x import y\n",
+            "#!/bin/bash\n'''exec' \"/v/bin/python\" \"$0\" \"$@\"\n' '''\nfrom x import y\n",
+        ] {
+            assert_eq!(python_module(other), None, "{other}");
+        }
     }
 
     #[test]

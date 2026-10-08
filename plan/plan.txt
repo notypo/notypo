@@ -14,12 +14,49 @@ Status: first and second slices implemented in src/engine/ on branch
         (section 2), so cmdlet names and parameters are repaired from
         PowerShell's own metadata (section 5). Native-program completers
         registered in a PowerShell session are bridged (2026-10-05);
-        parameter-value completers for PowerShell's own commands, broader
-        app coverage, and rollout validation remain unfinished.
+        named parameter-value callbacks for PowerShell's own commands are
+        bridged (2026-10-06), and positional binding is bridged too.
+        PowerShell provider coverage,
+        captured module/closure state, broader app coverage, and rollout
+        validation remain unfinished.
         Fourth slice in progress: npm, pip, clap, Cargo, .NET SDK, urfave/cli,
-        click, kingpin, go-flags, yargs, and oclif bridges are implemented
-        (section 5B shared-protocol record);
+        click, kingpin, go-flags, yargs, oclif, Symfony Console, and
+        RabbitMQ CLI bridges are implemented (section 5B shared-protocol
+        record);
         the other shared protocols and per-tool verification remain.
+        HashiCorp runtime tools are audited and verified (2026-10-06), as
+        are the backup tools and, except home-manager, dotfile managers.
+        Security scanners and secret managers are verified (2026-10-06).
+        CI/CD tools and the Kubernetes development loop, including garden,
+        are verified (2026-10-06). Git helpers/TUIs, remote access,
+        migration tools, AI assistants, network/service tools, and
+        archive safety/redaction were worked through the same day;
+        archive input/member correction is implemented for tar, unzip, and
+        7-Zip (2026-10-06), and inputs/members for the wider archive and
+        compressor inventory the same day; only rar/unrar (no installable
+        build) remain.
+        Data/text CLIs are verified, including Miller verbs, `then` chains,
+        and qsv commands, and so are all AI assistants (aider, Block's
+        goose, sgpt, gh copilot, llm under pipx) (2026-10-06).
+        Web servers, proxies, and certificate tools are verified on macOS
+        (2026-10-07); Debian's a2enmod/a2ensite wait for Linux checks.
+        Media, document, and static-site tools are verified the same day,
+        except TeX Live and jekyll (not installable here), and so are
+        linters, formatters, and test runners (Ruby gems and cypress aside),
+        and macOS's network diagnostics (Linux firewalls deferred).
+        clang's `--autocomplete` protocol is bridged, and compilers and
+        binary tools are verified on macOS (Linux debuggers deferred).
+        Editors are verified on macOS except GUI-only launchers.
+        macOS's administration tools are verified (Linux's deferred).
+        Mobile and device tools are verified on macOS (adb's handler no
+        longer starts its server).
+        Version control tools are verified (2026-10-08); `git <helper>`
+        hands the rest of the line to the helper's own completer.
+        JavaScript package managers (yarn 1, pnpm, bun, deno) too.
+        cross-cutting fixes: Go build information from executable headers,
+        no controlling terminal for probes, posener/cobra/handler argument
+        and arity detection, cobra alias confirmation, case-sensitive short
+        options, and password masking in reports.
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.
         [ ] NOT DONE = work required to deliver this plan.
@@ -489,6 +526,13 @@ and ls --colro=auto the option name while preserving its value.
     opt-in via trusted_completers) are bridged with shared probe limits.
     Fish conditions, option arity, and values work; descriptions are dropped.
     User startup configuration is skipped. PowerShell is pending.
+    (2026-10-06, macOS) The ZLE driver dropped every compadd with a suffix
+    other than a space, so options declared as `--name=[...]` (added by
+    _arguments with an `=` suffix; clap's generated zsh scripts use it for
+    valued options) were missing and their typos looked valid. Option names
+    added with `-S =` are now kept, with unknown arity (attached-only values
+    use the same suffix); other suffixed words remain dropped. Unit fixture;
+    rabbitmqadmin 2.35.0's installed handler now repairs `--nmae`/`--vhots`.
     PARTIAL (2026-10-05): PowerShell commands (src/engine/native/
     powershell.rs). A profile-free, non-interactive PowerShell (the
     session's own executable, else pwsh on PATH) runs a fixed script passed
@@ -528,6 +572,81 @@ and ls --colro=auto the option name while preserving its value.
     fixtures) pass with and without pwsh (NOTYPO_TEST_PWSH names portable
     PowerShell 7.6.6); rustfmt, host Clippy, and Windows GNU/MSVC, FreeBSD,
     and Linux musl Clippy pass; the six opt-in installed checks pass.
+    PARTIAL (2026-10-06, macOS): named parameter values now use PowerShell's
+    CommandCompletion binder with an empty target word and the full literal
+    context on both sides of the slot. The cursor is in UTF-16 units. The
+    backend reads ArgumentCompleter scripts/types/factories and
+    ArgumentCompletions attributes, plus callbacks registered when a trusted
+    module imports. Live registrations retain their actual ScriptBlock and
+    private module scope. Inline attribute script blocks keep PowerShell's
+    own scope behavior: a fixture that refers to unavailable private state
+    yields no application values, not the filesystem fallback.
+    The shell function passes a bounded versioned JSON snapshot of session
+    functions/types/helpers/namespaces and specific/global parameter
+    registrations. Only definitions are restored; profile statements and
+    the failed command body never run. Restoring session code or calling its
+    registrations requires explicit command trust. Command-specific callbacks
+    precede global parameter callbacks. Snapshots are validated completely;
+    malformed/duplicate records, oversized data, closures/module-backed
+    captured registrations, and unbound outer variables fail closed.
+    Every callback-derived selector requires confirmation, including fixed
+    ArgumentCompletions hints. Enumerations and ValidateSet remain ordinary
+    fixed choices with their existing binder semantics. Descriptions and
+    quoted spaces/apostrophes/operators/Unicode/slashes/colons/dash values
+    survive literal parsing and quoting. Callback code, expansions, and
+    provider/file results are never treated as literal application words.
+    Empty, failed, noisy, truncated, excessive, or slow replies abstain;
+    no default file completion is accepted. Opaque arguments on either side
+    of the slot (including $false expressions) and unresolved context
+    parameters suppress callback queries rather than binding placeholders.
+    Probes use blocked proxies, disabled prompts/telemetry/metadata lookups,
+    no inherited AWS credentials/profile files or cloud secret environment
+    variables, and request-only memoization. These environment controls are
+    not an operating-system network sandbox for arbitrary trusted code.
+    At this stage, positional callbacks, other providers' dynamic parameters,
+    captured module/closure state, and real cloud-module inventory remain
+    pending; this does not complete the PowerShell protocol family.
+    Coverage: five new unit tests and the opt-in installed PowerShell check
+    use the real macOS 7.6.6 runtime. Fixtures cover aliases, multiple typos,
+    earlier/later bound arguments, switches, attached parameters, static
+    choices, typed/factory callbacks, session registrations and precedence,
+    private module state, trust gates, resource/-y safety, isolation, limits,
+    and operation/profile markers. No new application installation was
+    needed; the existing portable runtime is recorded in plan/app.txt.
+[x] DONE: Bind PowerShell positional values using the installed shell's
+    StaticParameterBinder, then query the selected parameter through the
+    existing native callback bridge (2026-10-06, macOS, PowerShell 7.6.6).
+    The fixed binding probe inserts an empty literal at the slot, with
+    literal arguments before and after it; the cursor uses UTF-16 offsets.
+    PowerShell chooses the default/selected parameter set and accounts for
+    later named arguments. Binding errors, ambiguous sets, unknown names,
+    malformed replies, and opaque context abstain; no operation is replayed.
+    Metadata reports whether each parameter has a positional slot. Open
+    commands and slots with no declared choices/callbacks remain unjudged.
+    Module commands are qualified when probing so restored session helpers
+    cannot make the binder select another command of the same name.
+    Enumeration and ValidateSet choices retain case/flags/numeric behavior;
+    callback selectors, including ArgumentCompletions hints, require
+    confirmation. ArgumentValue edits preserve quoting and script structure.
+    Quoted dash-prefixed data retains its syntax in contexts on both sides,
+    including a value spelled exactly like a parameter. CompleteInput's
+    quoted empty placeholder is normalized to an empty callback prefix;
+    otherwise ArgumentCompletions filters away every choice before a suffix.
+    An unquoted parameter after a valued parameter never becomes a quoted
+    data argument during a probe; incomplete binding context abstains.
+    Binding and answers are memoized only within the request, including
+    following arguments and literal/parameter syntax. Trust, isolation,
+    limits, description/literal decoding, and no-file-fallback policy are
+    shared with named callbacks. Provider-dependent dynamic parameters,
+    captured module/closure state, and cloud-module inventory remain open.
+    Regression coverage: strict binding-record decoding; real positional
+    callbacks and enums; aliases; later named arguments; default/selected
+    and ambiguous parameter sets; quoted dash values; Unicode with a
+    supplementary character before the cursor; specific/global registration
+    precedence; module callbacks; untrusted/opaque context; confirmation/-y
+    behavior and untouched operation/profile markers. The installed check
+    uses the macOS runtime only. The benchmark harness adds a positional
+    callback case with a later -Scope argument.
     PARTIAL (2026-10-05): native-program completers registered in the
     user's PowerShell session (`Register-ArgumentCompleter -Native`, and
     cobra's registration without -Native, which lands in the same table),
@@ -604,6 +723,10 @@ and ls --colro=auto the option name while preserving its value.
     (2026-10-05: native-program completers registered in the session, by
     a profile or a module, are passed by the PowerShell function; see the
     shell completion adapters record.)
+    (2026-10-06: named PowerShell parameter callbacks, literal context on
+    both sides of the cursor, session function definitions, and portable
+    parameter registrations are bridged; positional/provider callbacks and
+    captured module/closure state remain pending.)
     Bash compatibility files (etc/bash_completion.d) that register several
     commands are found by their `complete -F` lines (2026-10-05, bq/gsutil).
     PARTIAL (2026-10-05): fish 4 embeds about a thousand completion scripts
@@ -659,6 +782,27 @@ and ls --colro=auto the option name while preserving its value.
     removed, one line, capped), cached, and shown in --explain/--json and
     choice reasons. Replacement ranges and other protocols' descriptions are
     still dropped.
+    (2026-10-06, macOS) cobra arity and argument lists. cobra's protocol
+    does not say which flags take values, so the word after any flag was
+    treated as its possible value: `rclone copy --dry-rnu web:a b` became
+    `--dry-run web: b`. cobra completes a flag's value after a flag that
+    takes one and, after a boolean flag, exactly what it completes without
+    it; equal non-empty answers (words and directive) now mark the flag
+    boolean (option_requires_value has a probe budget for this), and any
+    other answer leaves arity unknown, as before. Positional answers that
+    allow file completion (no ShellCompDirectiveNoFileComp) are partial
+    below the root (rclone lists only remotes after `copy`; local paths are
+    valid too), and a word that extends a listed word ending in `:`, `/`,
+    or `=` continues it (`web:a` after `web:`). A repaired head keeps the
+    typed tail (`wbe:b/c` becomes `web:b/c`, asked). Root command lists stay
+    complete: rclone's root reports directive 0 over its 58 commands.
+    (2026-10-06) cobra aliases and hidden commands are confirmed through
+    cobra's own resolution before a word is called a misspelling (see the
+    Kubernetes development loop entry); one or two memoized probes.
+    kubectl, helm, gh, docker (not run here), restic, chezmoi, and kind
+    levels answer directive 4 and keep deciding. Engine fixture; corpus
+    metrics are unchanged (top-1 99.0%, decided alone 96.5%, no wrong
+    decisions).
 [x] DONE: AWS adapter: invoke the installed aws_completer (or its Windows
     equivalent) with the native completion context. Use its service/operation,
     flag, and value results; support CLI v1/v2 capabilities without recreating
@@ -744,6 +888,40 @@ and ls --colro=auto the option name while preserving its value.
     followed only by other tags; prose mentioning `[string]` doesn't count.) Help stays partial evidence needing
     confirmation. Queries are memoized per executable/path within a request;
     failures, timeouts, and truncated output are discarded and reported.
+    (2026-10-06, macOS) A non-zero exit is still used when the output's
+    first line is a usage line naming the program (nats-server 2.15.0 exits
+    1 after printing its help); output that starts with an error, or names
+    another program, stays discarded. Unit fixture plus the installed
+    help-fallback check (`nats-server --jetsream`).
+    (2026-10-06, macOS) More help layouts: argparse subparsers under an
+    `actions:` heading with parenthesized aliases (borgmatic 2.1.9's
+    `repo-list (rlist)`); entries at the margin under an underlined heading
+    (direnv 2.37.1's `allow [PATH_TO_RC]:`); and, when no command section
+    exists, usage lines that each name the program and a command
+    (duplicity 3.2.1's `usage: duplicity backup ...` and continuations,
+    macOS tmutil's repeated `Usage: tmutil <verb>`), requiring two distinct
+    commands. Aliases after commas or in parentheses are now listed too:
+    without them `borgmatic rlist` looked like a misspelling of `list`.
+    A bash handler script that registers no function (yadm's needs git's
+    bash handler loaded first) is reported as a failed handler rather than
+    an authoritative empty list, so documentation still applies.
+    (2026-10-06, macOS) commander.js entries (`migrate:make [options]
+    <name>`, `install|i`) and argparse subparser choice lines
+    (`{branches,check,upgrade}`) list commands too.
+    (2026-10-06, macOS) Any unindented heading ending in `:` that has the
+    word "commands" starts a command section (buildkite-agent). kingpin's
+    `--[no-]name` declares `--name` and `--no-name` (booleans), and a
+    usage line's lowercase alternation right after the program
+    (`wg-quick [ up | down | save | strip ]`) lists its commands. Bash
+    handler discovery indexes the compatibility directories' `complete -F`
+    registrations once per process instead of reading every file for each
+    candidate program; with about eighty scripts in Homebrew's directory
+    the corpus run fell from 66 s to 12 s.
+    (2026-10-06, macOS) Columns of command names under headings such as
+    openssl's `Standard commands` (no colon) are read; a usage line naming
+    the program after a banner is accepted for non-zero exits unless an
+    error line comes first (lynis 3.1.7 exits 64). Help and man probes now
+    use the handler probes' offline environment (help_env).
 [x] DONE: Man-page provider: extract options/subcommands from locally
     installed documentation; handle formatting/backspaces and disable pagers.
     Missing man support, including on Windows, must degrade gracefully.
@@ -1140,6 +1318,21 @@ command catalogs. They use the same app-native discovery/correction mechanism.
     The installed tofu also links urfave/cli/v3 v3.10.1; its audit keeps the
     posener protocol (installed check still passes). Unaudited apps linking
     urfave/cli with cobra or posener are refused as ambiguous.
+    (2026-10-06, macOS) posener answers a command's subcommands, its
+    argument predictions, and its flags in one list, and that list was
+    taken as a complete subcommand vocabulary: `terraform workspace select
+    prod` was called invalid, and `vault secrets enable transform` (a valid
+    engine missing from vault's fixed 2018 list) was repaired to `transit`
+    without asking. For a word a posener list lacks, the answer after a
+    listed word is now compared with the answer after the typed word;
+    equal answers mean the list holds argument predictions, and the slot
+    is an argument that is not judged (new backend hook lists_arguments).
+    It costs one or two request-memoized probes per suspect word. Argument
+    typos at such slots (`vault secrets enable trnasit`) are no longer
+    repaired. Engine fixture (fixed set and position-dependent predictors)
+    and installed checks. `terraform`/`tofu apply -destroy` or `-replace`,
+    force-unlock, taint, state push, and `packer build -force` now need
+    approval (safety record below).
 [ ] NOT DONE: Container tools: docker, podman, nerdctl and their installed
     extensions; preserve project/context/remote-host selection.
     PARTIAL: docker is an audited cobra app (verified; it asks its CLI plugins for metadata).
@@ -1205,6 +1398,19 @@ SHARED IMPLEMENTATION AND COVERAGE TASKS
     and registrations; inventory updates must not be required for their routing.
     argcomplete markers and Go module dependencies route by protocol; trust
     for unaudited apps comes from trusted_completers, not the inventory.
+    (2026-10-06, macOS) Go build information is read from the section the
+    executable's headers name, as `go version -m` reads it: ELF's
+    .go.buildinfo, Mach-O's __go_buildinfo (thin or any universal slice), or
+    PE's first writable data section. The bounded sequential scan remains
+    for pre-1.18 layouts and files without such a section. vault 2.1.1's
+    macOS executable (536,915,920 bytes) exceeded the scan's 512 MiB limit,
+    so it was routed to Homebrew's `complete -C` file instead of posener.
+    All 31 Go executables in /opt/homebrew/bin match `go version -m` (about
+    0.2 ms each, without reading the file through). Unit fixtures cover
+    Mach-O, universal, ELF32 big-endian, ELF64, and PE headers with an
+    earlier decoy record, malformed headers (a zero-sized load command,
+    oversized tables, a Java class file), and a sparse file beyond the
+    limit. The go-modules cache moved to v5 so old negative entries expire.
 
 5B. DEVELOPER AND DEVOPS TOOL INVENTORY
 
@@ -1308,6 +1514,25 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     PARTIAL (2026-10-05): svn (Homebrew subversion) is repaired through its
     bash handler, found in the `subversion` file by its `complete -F`
     registration (`svn stauts` -> `svn status`, asked).
+    PARTIAL (2026-10-08, macOS, Homebrew): glab (gitlab.com/gitlab-org/
+    cli/cmd/glab) and git-lfs (built as `command-line-arguments`, so
+    trusted by name) are cobra; hub 2.14 uses its fish script; Mercurial
+    7 its bash handler; pre-commit trusted help. git's bridge probes only
+    builtins, so `git lfs trak` was not judged. Now, when `git <name>`
+    runs a `git-<name>` program with its own native completer, the words
+    after it are checked by that program (`git lfs trak` -> `track`, `git
+    lfs track --lockabel` -> `--lockable`). Mercurial: in a repository whose
+    .hg/hgrc enables an extension (Python), the handler's `hg
+    debugcomplete` and `hg --help` loaded it (a marker was written). hg and
+    chg join the workspace-trust table for .hg/hgrc, found in parent
+    directories as Mercurial does. Untrusted, no probe runs. fish creates
+    an empty ~/.local/share/fish when hub's script loads. Repaired: `glab mr
+    lsit`, `glab isue`, `git-lfs trak`, `hub pul-request`, `hub brwse`,
+    `hg stauts`/`comit`/`log --limt`, `pre-commit rnu`/`autoupdte`, and
+    `pre-commit instal` (asked, via the hook rule). Installed check:
+    installed_vcs_tools_repair_typos_and_keep_repositories_closed.
+    Remaining: remotes, branches on hosts, and repository names are
+    resources and were not looked up.
 [ ] NOT DONE: JavaScript and TypeScript: node, npm, npx, yarn, pnpm, bun,
     deno, and package-runner targets (section 5A's runner support). npm has
     its own completion protocol (`npm completion` with COMP_CWORD, COMP_LINE,
@@ -1323,6 +1548,24 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     option lists are partial and omit global flags on this installed version;
     enum values, workspace selectors, Windows runtime, and other JS tools
     remain unverified or unsupported. See the shared-protocol record.
+    PARTIAL (2026-10-08, macOS, Homebrew): yarn 1.22.22, pnpm, bun
+    (oven-sh tap), and deno, in a project whose package.json scripts
+    (build, test, preinstall) write markers. None ran, and HOME stayed
+    clean. yarn's help bullets its commands (`- access` under
+    `Commands:`), which are read now; an option never has a space after
+    its dash. pnpm's bash script asks `pnpm completion-server`, which
+    lists project scripts (`pnpm run biuld` -> `build`). bun's bash script
+    is static and offers its commands again after any of them, so they
+    count as values and repairs are asked. deno uses its bash script and,
+    below `run`, trusted help (`--allow-ent` -> `--allow-net`). Repaired:
+    `yarn instal`, `yarn add --dve` (asked), `pnpm instal` and `add
+    --save-dve` (asked), `pnpm run biuld`, `bun instal`/`tset` (asked),
+    and `deno rnu`. Installed check:
+    installed_js_package_managers_repair_typos_without_running_scripts.
+    Limits: `yarn run <script>` and `bun run <script>` names are not read
+    (neither tool lists them; package.json has no reader of its own here).
+    Remaining: yarn berry (2+), corepack, and npx targets beyond section
+    5A's runner support.
 [ ] NOT DONE: Python: python/python3, pip/pip3, pipx, uv/uvx, poetry, conda,
     tox, nox, pytest, ruff, black. pip answers its own protocol
     (PIP_AUTO_COMPLETE with COMP_WORDS/COMP_CWORD); pipx and pytest are
@@ -1337,7 +1580,11 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     record). black 26.10.0 was verified in a scratch virtualenv (click
     8.5.0): `--chek`, `--line-lenght`, and an enum value of
     --target-version. No click app is installed system-wide here, so the
-    opt-in installed checks have no click case yet.
+    opt-in installed checks initially had no click case.
+    (2026-10-05, macOS) The installed checks now include SAM, OCI, a real
+    Click fixture, and an isolated Flask project. Literal values and
+    descriptions are covered on Click 8.1.8 and 8.4.2; see the shared
+    protocol record. Black's current installation remains unverified.
 [ ] NOT DONE: Rust toolchain and cargo ecosystem: cargo, rustup, rustc,
     rustdoc, rustfmt, cargo clippy, rust-analyzer, cargo miri, cross, and
     installed cargo-* subcommands (cargo-nextest, cargo-watch, cargo-audit,
@@ -1451,6 +1698,12 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     and rake 12.3.3 (`rake --taks`) are repaired through zsh 5.9's
     handlers, as are java and javac options (/usr/bin stubs; zsh's
     _java lists them statically, no JDK installed). All opt-in checks.
+    PARTIAL (2026-10-05, macOS): composer 2.10.3 now uses its Symfony
+    native completer for commands, options, and values (shared-protocol
+    record below). PHP 8.5.11's interpreter form is verified with Laravel
+    13.34.0's artisan, including project-defined commands and migration
+    confirmation. Other JVM/PHP/Elixir tools and PHP interpreter options
+    before the script remain pending.
 [ ] NOT DONE: Build and task runners: make, cmake, ninja, bazel/bazelisk,
     just, task (go-task), mage, earthly. Targets and recipes come from
     project files (Makefile, justfile, Taskfile.yml, BUILD); listing them
@@ -1499,21 +1752,107 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     console-script wrappers lack the PYTHON_ARGCOMPLETE_OK marker that
     ansible's CLI modules carry, so the argcomplete protocol isn't used.
     PARTIAL: terraform, tofu, and packer are audited posener apps (verified).
-[ ] NOT DONE: HashiCorp runtime tools: vault, consul, nomad, boundary,
+[x] DONE: HashiCorp runtime tools: vault, consul, nomad, boundary,
     waypoint, expected to answer posener/complete like terraform. Audit each
     before trusting it: vault's predictors can list secret paths from the
     server, so VAULT_ADDR, CONSUL_HTTP_ADDR, and NOMAD_ADDR lookups stay off
     unless network_completion allows them, and tokens are never logged.
-[ ] NOT DONE: CI/CD and GitOps: argocd, flux, tkn (section 5A), act,
+    DONE (2026-10-06, macOS, Homebrew; hashicorp/tap): vault 2.1.1, consul
+    2.0.4, nomad 2.0.7, boundary 0.21.3, waypoint 0.11.4 (archived), and
+    OpenBao 2.7.1 (bao, Homebrew core). All link posener/complete v1.2.3
+    through hashicorp/cli or mitchellh/cli (waypoint also links cobra; the
+    posener choice holds) and are now audited by module path, so no
+    trusted_completers entry is needed.
+    Audit: a crawl of every command path (to depth three) at its argument,
+    option, and following positions (3,783 queries) against logging
+    servers on each default address. With the user's environment, vault
+    and bao sent their token to sys/mounts, sys/policies/acl, sys/auth,
+    sys/audit, sys/namespaces, and sys/plugins/catalog; nomad sent its
+    token to /v1/search and the ACL endpoints. The defaults are loopback
+    addresses, which Go reaches without the blocked proxy. vault also runs
+    a configured external token_helper (`helper get`) during completion,
+    even with a closed address. consul, boundary, and waypoint (also from
+    a waypoint.hcl project) contacted nothing.
+    Offline probes for every protocol now point VAULT_ADDR, BAO_ADDR,
+    NOMAD_ADDR, CONSUL_HTTP_ADDR, and BOUNDARY_ADDR at a missing Unix
+    socket; set VAULT_CONFIG_PATH/BAO_CONFIG_PATH to the null device (no
+    token helper) and BOUNDARY_KEYRING_TYPE=none; and remove agent
+    addresses (which take precedence), client proxies, retry counts, and
+    VAULT/BAO/NOMAD/CONSUL/BOUNDARY tokens. The same crawl then made zero
+    requests and wrote nothing in HOME. network_completion keeps the user's
+    environment for option-value lookups: `vault secrets enable
+    -plugin-name` queried the fake server's plugin catalog with the token
+    only when it was enabled. Positional resources (policies, jobs, keys)
+    are never judged. Tokens are never logged or cached.
+    Safety: vault/bao secrets/auth/audit disable, secrets/auth move, kv
+    rollback, operator seal/step-down/rekey/generate-root, raft snapshot
+    restore, and -force; nomad (job) stop, job revert, alloc
+    stop/restart/signal, node drain/eligibility, system gc, server
+    force-leave, deployment fail, operator snapshot restore, and
+    -purge/-force; consul leave/force-leave/exec/lock, maint -enable or
+    -disable, and snapshot restore; boundary sessions cancel; waypoint
+    -prune. Generic delete/destroy/revoke verbs already applied. Help
+    flags anywhere before `--` (as hashicorp/cli parses them) are read-only.
+    Coverage: unit fixtures for the offline environment, the gate (confirm
+    and allow lists across POSIX/fish/tcsh and replay), and an opt-in
+    installed check (installed_hashicorp_clients_repair_typos_without_
+    servers_or_token_helpers) whose controls prove vault reaches the
+    listener and runs the marker helper when asked directly; notypo's 22
+    repairs reach neither. Argument values missing from vault's fixed
+    engine list stay unjudged (terraform record above). macOS only.
+[x] DONE: CI/CD and GitOps: argocd, flux, tkn (section 5A), act,
     circleci, glab ci, gitlab-runner, buildkite-agent, dagger, goreleaser.
     act, circleci, dagger, and goreleaser are expected to be cobra;
     pipeline, job, workflow, and application names are resources.
-[ ] NOT DONE: Security, secrets, and supply chain: sops, age, gpg, openssl,
+    DONE (2026-10-06, macOS, Homebrew and vendor taps): cobra under
+    trusted_completers: argocd 3.5.3, flux 2.9.6 (fluxcd/tap; Homebrew core's
+    `flux` is InfluxData's query language), tkn 0.46.1, act 0.2.89 (its
+    build records only `command-line-arguments`, so trust names it),
+    circleci 1.0.52041, glab 1.120.0, dagger 0.21.10, goreleaser 2.18.2.
+    gitlab-runner 19.4.1 and buildkite-agent 3.138.0 (buildkite tap; its
+    buildkite-agent@3 dependency had to be trusted with `brew trust
+    --formula`) link urfave/cli v1 but don't enable completion, so trusted
+    help supplies commands (buildkite's `Available commands are:` and
+    `Commands that can be run within a Buildkite job:` headings are now
+    read). Resources: argocd completes no applications, projects, clusters,
+    or repositories (a configured local server with a token saw no
+    connection); act completes no jobs or workflows; flux and tkn lists
+    need a cluster (KUBECONFIG is null offline). No pipeline, job,
+    workflow, or application name is therefore offered offline. Installed
+    check: installed_ci_and_kubernetes_tools_repair_typos_without_running_
+    project_code.
+[x] DONE: Security, secrets, and supply chain: sops, age, gpg, openssl,
     ssh-keygen, step, op (1Password), bw, gopass, cosign, syft, grype,
     trivy. openssl has subcommands but no completer (`openssl help` lists
     them). Secret names, key IDs, and vault items are resources; probes must
     never unlock a vault or prompt for a passphrase. Observed: openssl has
     no completer found.
+    DONE (2026-10-06, macOS, Homebrew): cobra under trusted_completers:
+    cosign 3.1.3, syft 1.54.0, grype 0.120.0, op 2.40.0 (1password-cli cask;
+    its old kingpin import is not a completion library notypo counts), and
+    trivy 0.74.0 (earlier record). urfave/cli v1: sops 3.13.3 and step
+    0.31.0. urfave/cli v3.11: gopass 1.17.3 (Before hooks, so trusted_help
+    too). bw 2026.9.1 through its zsh handler, which only defines its
+    functions: the ZLE driver loads a handler's definition without running
+    it and calls the handler again when the first call redefined it, as
+    zsh's second Tab does (a handler that keeps its definition runs once).
+    Trusted help: age 1.3.2, gpg 2.5.24, and openssl 4.0.3, whose commands
+    are read from `Standard/Message Digest/Cipher commands` columns.
+    ssh-keygen (OpenSSH 10.3p1) documents single-letter options only.
+    Resources: gopass lists secret names from the store without decrypting
+    (a recording gpg first on PATH saw no call). Its callback answers only
+    words, which urfave levels now recognize: after a listed word the same
+    command answers the same words again, so they are resources and a
+    repaired secret name needs approval (`gopass show bnak` -> `bank`). op
+    completes no items, vaults, or accounts (the 1Password desktop app is
+    not installed, so its app integration is unverified). Never unlocked:
+    offline probes set OP_BIOMETRIC_UNLOCK_ENABLED=false and remove
+    OP_SESSION_*, OP_SERVICE_ACCOUNT_TOKEN, OP_CONNECT_HOST/_TOKEN, and
+    BW_SESSION/CLIENTID/CLIENTSECRET/PASSWORD; no probe has a controlling
+    terminal, so passphrase prompts fail. Approval: gpg --delete-*,
+    ssh-keygen -R, and the generic delete/revoke verbs (op/bw delete, step
+    ca revoke, gopass rm). Installed check:
+    installed_security_tools_repair_typos_without_unlocking_or_scanning.
 [ ] NOT DONE: Network, remote access, and HTTP: ssh, scp, sftp, rsync, mosh,
     curl, wget, httpie (http/https), grpcurl, dig, nc, mtr, tailscale, wg.
     Hosts from ssh config and known_hosts are local evidence only; changing
@@ -1523,9 +1862,50 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     offer `KX`/`MX` for the host `x`, a positional the handler's record
     types only partly describe. A word a partial list omits is no longer
     doubted by candidates only as close as the floor (ranking record).
-    dig's `+` query options are still not recognized as options (the
-    engine treats only `-` words as options; `+x` means other things to
-    chmod, cargo, and set), so `+shrot` is not repaired.
+    dig's `+` query options were not recognized as options (the engine
+    treated only `-` words as options; `+x` means other things to chmod,
+    cargo, and set), so `+shrot` was not repaired (addressed below).
+    PARTIAL (2026-10-06, macOS): zsh 5.9's handlers serve ssh, rsync
+    (openrsync), curl 8.7.1, dig, and tmux 3.7c; Homebrew's serve wget
+    1.25.0, mtr 0.96, and mosh 1.4.0; tailscale 1.102.5's own zsh handler
+    serves zsh users (for bash users another handler comes first and
+    answers nothing). grpcurl 1.9.4 and httpie 3.2.4 use trusted help.
+    Handlers report no option arity: the word after `mtr --report` was
+    taken as its value and "repaired" to the placeholder `hostname`. An
+    option after which a handler answers exactly as without it now takes
+    no value (handler probes, memoized). Words a handler offers again after
+    any of them (dig's record types, make's targets, mtr's `ip_address
+    hostname`) are values: repairs from them are resources needing
+    approval, never applied automatically. Not repaired: sftp's and ssh's
+    attached `-oName=value` (a cluster of `-o` and its value). Remote
+    programs need approval for any changed argument. Installed check:
+    installed_network_and_service_tools_repair_typos.
+    (2026-10-06, macOS) ssh/scp `-o` keys. zsh's _ssh adds ssh_config names
+    with an `=` suffix, and the ZLE driver dropped every such word that was
+    not an option name. It now keeps them with their `=` (`KEY=`), and a
+    value that continues a listed `Name=` is valid; otherwise only the name
+    is judged and the typed value is kept (`-o StrictHostKeyCheking=no` ->
+    `StrictHostKeyChecking=no`, asked). The name alone and ssh's spaced form
+    (`-o 'BatchMode yes'`) count as naming the key, and a repaired spaced
+    name keeps its space and quoting (`'ConectTimeout 5'` ->
+    `'ConnectTimeout 5'`). Unit fixtures (driver, listed keys, kept tails)
+    and the installed check above.
+    (2026-10-06, macOS) dig's `+` query options. For dig, delv, mdig, and
+    kdig only, a `+letter...` word is an option: zsh's _dig lists them only
+    after a `+` prefix, so that is the prefix asked; `=` attaches values
+    and a `+` option never takes the next word (arity known). Three pieces
+    stood in the way: the ZLE driver kept `=`-suffixed words only for `-`
+    names (`+timeout=` was dropped, so the valid `+timeout=5` became
+    `+idnout=5`); an option name was editable in place only when it began
+    with `-` or `/`; and unknown arity let `+noall` swallow `+answr`.
+    Repaired, asked: `+shrot`, `+noal +answr`, `+tiemout=5`, `+trcae`;
+    `+short +timeout=5` and `+nocmd` stay valid. chmod's `+x` is not an
+    option. zsh's _chmod completes modes piecewise (`u`, `+`, `-`, `=`), so
+    `chmod +x notes.txt` was weakly "repaired" to `chmod + notes.txt`; a
+    word that goes on from a listed bare `+` or `-` now continues it, as
+    `=r` already did (`chmod +x ntoes.txt` still repairs the file). Unit
+    fixtures (a _dig-shaped handler, listed fragments); installed check
+    above.
 [ ] NOT DONE: Service operation, observability, and load testing:
     systemctl, journalctl, launchctl, promtool, amtool, logcli, k6, hey,
     tmux, screen. Unit and service names are local resources: listing them
@@ -1534,6 +1914,17 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     PARTIAL (2026-10-05): k6 v2.3.0 (`k6 rnu script.js` -> `k6 run`) uses the
     cobra bridge under trusted_completers (go.k6.io/k6/v2); completion ran
     no test and wrote nothing in a sandboxed HOME.
+    PARTIAL (2026-10-06, macOS): logcli 3.7.8 (Homebrew) is kingpin:
+    trusted completers and help repair it, and its argument hints sent no
+    request to a listener on Loki's default localhost:3100 (`logcli
+    delete` already needs approval). tmux uses zsh's handler; screen's
+    leaves `-lsit` alone (recorded earlier). hey 0.1.5 has Go's single-dash
+    flags only. launchctl rejects `--help` as an error and lists its
+    subcommands under `launchctl help`, which help probes don't ask, so it
+    is not repaired (2026-10-07: now asked; see the system administration
+    entry). amtool (alertmanager) is not in Homebrew core, and
+    systemctl/journalctl are Linux tools (Linux checks are deferred by the
+    owner).
 [ ] NOT DONE: System and application package managers: apt, apt-get,
     apt-cache, aptitude, dpkg (Debian/Ubuntu); dnf, dnf5, yum, microdnf, rpm
     (Fedora/RHEL); zypper (SUSE); pacman, makepkg, yay, paru (Arch); apk
@@ -1620,11 +2011,11 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
       its own usage text; a word such as `extarct` is not a spelling of
       `x`, so it gets no correction rather than a guess.
     - Archive paths: a misspelled archive name (`7z x dat.7z`,
-      `tar xvzf backpu.tar.gz`, `unzip photso.zip`) gets no repair today
-      without captured output, because the filesystem provider only checks
-      arguments containing `/` or named missing by the output. After a
-      known failure, also check file-like arguments with a sibling of the
-      same extension, and parse each tool's "cannot open" message.
+      `tar xvzf backpu.tar.gz`, `unzip photso.zip`) now gets a repair after
+      a known failure without captured output (2026-10-06). Archive argument
+      positions come from each tool's syntax; inputs compare with regular
+      sibling files of the same extension. Newly created archives and
+      archive-member selectors are excluded from this filesystem lookup.
     - Members inside an archive (`unzip a.zip dir/file`, `tar xf a.tar
       dir/file`, `7z x a.7z name`) are resources, read only from the
       archive's own listing (tar -tf, unzip -Z1, 7z l -ba) under probe
@@ -1644,10 +2035,202 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     fallback repairs long options for tar, zip, gzip, bzip2, xz, and cpio
     (`--verbsoe` -> `--verbose`, needing confirmation); unzip has a zsh
     handler; ditto and 7z have no completer.
-[ ] NOT DONE: Data and text CLIs chained in pipelines: jq, yq, fzf,
+    PARTIAL (2026-10-06, macOS): (1) Short options are case-sensitive:
+    `zip -P hunter2 out.zip f` was "repaired" to `zip -p hunter2` (the
+    password became a file argument, without approval) because names were
+    compared ignoring case; a one-letter option in the other case is now
+    another option (both scorers, unit fixtures). (2) Passwords are masked
+    in --explain and --json: 7-Zip/rar `-p<pwd>` and rar `-hp<pwd>` (shown
+    as `-p***`), zip/unzip `-P <pwd>`, MySQL's attached `-p<pwd>`, sshpass
+    `-p`, openssl `pass:` values, curl `-u user:password`, and any
+    `--password`/`--passphrase` value, everywhere in the report (notes and
+    evidence too); the command printed for the alias is unchanged. (3) The
+    archivers' own "cannot open" messages name the missing archive:
+    bsdtar's `Failed to open '<file>'`, GNU tar's `<file>: Cannot open: No
+    such file or directory`, unzip's `cannot find or open <file>,`, zip's
+    `name not matched: <file>`, and zstd's `can't stat <file> :`; with
+    captured shell output `tar -xzf backpu.tar.gz` and `unzip photso.zip`
+    are repaired (engine fixture), and `zip out.zip fiel.txt` with replay.
+    Replaying tar or unzip extractions stays refused (they write), so
+    without captured output they were not repaired at this stage (addressed
+    below). (4) Archivers and
+    in-place compressors (bsdtar/gtar, zip, 7z family, rar/unrar, unar,
+    ditto, cpio, gzip/gunzip/pigz, bzip2/bunzip2/pbzip2, xz/unxz/lzma,
+    zstd/unzstd, lz4, brotli, compress/uncompress) now need approval when
+    a correction changes a target or input (`gzip -d backpu.tar.gz` ->
+    `backup.tar.gz` would decompress and delete that file), and unzip -o,
+    7z -y/-aoa/-aou, tar --overwrite/--unlink-first, and compressor
+    -f/--force/--rm need approval. tar's man page now comes from the
+    binary's own installation (GNU tar's gnubin/gnuman; core shell tools
+    entry).
+    IMPLEMENTED (2026-10-06, macOS): src/engine/archives.rs classifies tar's
+    old-style modes/clusters and separate/attached -f/--file arguments,
+    unzip's archive/member/password/exclusion/destination slots, and 7-Zip's
+    commands, selectors, attached switches, and output directory. Unknown
+    arities, opaque arguments, stdin archives, and response-file contexts
+    are declined. The walk preserves tar xf/xvzf even when a shell handler
+    offers only x, and keeps archive arguments out of subcommand spelling.
+    Known failures repair bare or attached archive inputs using only existing
+    regular files of the same extension, with confirmation. Archive names
+    being created and archive members never get host-filesystem guesses.
+    Trusted tar/unzip/7-Zip readers list members using fixed argv, closed
+    stdin, a private cwd/HOME, cleared archive/injection environment variables,
+    and the shared time/process/output/candidate limits. User passwords,
+    extraction options, external-compressor options, and file lists are never
+    forwarded. tar's own --version selects GNU --quoting-style=c/--force-local
+    or bsdtar's escaped listing; C/octal byte escapes decode to UTF-8. unzip's
+    -Z1 and 7-Zip's l -slt -ba names need a second exact-name selection to
+    reject lossy console displays (7-Zip turns newline into underscore).
+    Control characters, traversal/absolute paths, wildcard/list-file selectors,
+    backslashes, and unrepresentable names are declined. Selected members are
+    ArgumentValue resource edits needing confirmation even with -y, and
+    archive and member typos can be corrected together. This local reader
+    uses trusted_completers and the native source, without network_completion
+    or a persistent member/password cache. 7-Zip's changed attached -o<dir>
+    target also needs confirmation in the common safety gate. An absent
+    unzip/7-Zip output directory alone is valid (those tools create it), so
+    filesystem repair there requires the diagnostic to name it missing;
+    tar -C still requires an existing directory.
+    Real macOS checks use bsdtar 3.5.3/libarchive 3.7.4, GNU tar 1.35,
+    Info-ZIP unzip/zip, and 7-Zip 25.01 on isolated local tar/zip/7z fixtures.
+    Cases include quoted spaces/apostrophes, supplementary Unicode, literal
+    shell operators/substitutions, valid underscores versus lossy newline
+    displays, encrypted headers, archive/member typos together, untrusted
+    readers, environmental checkpoint actions, and -y refusal. Markers and
+    the extraction directory stay untouched. GNU tar was installed with
+    Homebrew and added to app.txt. The wider archiver/compressor inventory,
+    transformed/member-pattern contexts, and foreign runtime behavior remain
+    open; all checks in this continuation are on macOS, without Docker.
+    Validation: all 410 default tests pass (363 unit, 43 CLI, one corpus,
+    three rule fixtures), plus both benchmark smoke runs; 27 installed-client
+    checks pass serially in 249 s with Docker excluded and no missing-tool
+    skips. The archive check passes again after the strict unzip arity guard,
+    added malformed/password cases, and shell-dialect quoting matrix (5.7 s).
+    Formatting, all-target/all-feature macOS Clippy with -D warnings, release
+    build, doc-tests, cargo package, and publish --dry-run --allow-dirty
+    --locked pass. Package verification includes archives.rs (104 files,
+    2.5 MiB/555 KiB) and excludes plan/benchmarks/benches; nothing is uploaded.
+    benchmarks/archive-results.md measures 15 cold and 15 warm processes per
+    reader: cold/warm medians 20.8/20.1 ms (bsdtar), 34.1/33.1 (GNU tar),
+    34.6/34.0 (unzip), and 39.2/36.7 (7-Zip), two probes each; peak RSS
+    6.7/7.0/7.2/17.2 MiB. bsdtar's cold p95 includes a 243 ms startup
+    outlier. The standalone fixtures check every answer and no extraction.
+    The 20-batch macOS engine benchmark still meets the existing ~2 ms
+    budget: nested two-typo correction 0.970/0.974 ms median/p95, executable
+    typo 1.874/1.889 ms, valid command 0.0257/0.0266 ms. Parsing is 1.37 us
+    median; ranking 806 operations is 790 us and 962 executables 36.3 us.
+    Reproduce with cargo bench --locked --bench engine and python3
+    benchmarks/structured.py --archive-fixtures --case 'archive members'
+    --samples 15 --output benchmarks/archive-results.md.
+    IMPLEMENTED (2026-10-06, macOS): the wider inventory. archives.rs gives
+    every remaining tool its operand slots from its own syntax; a known
+    failure repairs a missing input from regular sibling files with the
+    same extension, with confirmation and no probe. Outputs, option values,
+    created archives, patterns, and destination directories are never
+    looked up. Unknown options, recursion (-r), file lists (-@, --files,
+    --filelist, -E, -T), stdin/stdout operands, benchmarks, and training
+    modes decline the layout; for tools without members (compressors, zip,
+    ditto, ouch, atool, mksquashfs, PowerShell) a declined line keeps the
+    generic path provider, as before.
+    - Compressors: gzip/gunzip/zcat/gzcat (Apple gzip 487.0.1), pigz/unpigz
+      2.8, bzip2/bunzip2/bzcat 1.0.8, pbzip2 1.1.13, xz/unxz/xzcat/lzma
+      5.8.4, zstd/unzstd/zstdcat 1.5.7 (`-o=FILE` or `-o FILE`), lz4/unlz4/
+      lz4cat 1.10.0 and pixz 1.0.7 (the second operand is the output unless
+      -m; pixz -i names an input), brotli 1.2.0 (values only as separate
+      words or `--name=`), compress/uncompress (BSD), lzip 1.26, plzip 1.13,
+      lzop 1.04 (`-p[DIR]`).
+    - Archivers: zip 3.0 (whole option words only, since `-ds 10` is not
+      `-d -s`; -d/-U/-FS declined), zipinfo (UnZip 6.00), ar (Xcode 27's;
+      `ar t`, `-t -v`, a/b/i position members, q/r inputs), jar (OpenJDK
+      27: old-style `cmf` clusters whose values follow in letter order,
+      GNU style, `-C dir file`, manifests as inputs), pax (list/read `-f`,
+      write operands), cpio (bsdcpio 3.5.3; -i/-t with -F/-I/--file;
+      GNU's remote `host:file` declined), ditto (-x archive, -c sources),
+      unar/lsar 1.10.7, ouch 0.8.3 (clap; d/l/c with aliases), atool 0.39.0
+      and aunpack/als/acat/apack/adiff/arepack (mode from name or option,
+      -e), dtrx 8.7.1, cabextract 1.11, unsquashfs/mksquashfs 4.7.5,
+      p7zip 17.05's 7za/7zr, and PowerShell 7.6.6's Expand-Archive and
+      Compress-Archive (Microsoft.PowerShell.Archive 1.2.6; case-insensitive
+      names, unique parameter prefixes, `-Path:value`, positional binding;
+      arrays and -Path wildcards declined).
+    - Members: zipinfo (`-1`), ar (`t`), unar/lsar (lsar's `-ja -jss` JSON,
+      found beside unar; -nr, -e/-E, and -i decline members), and jar (`tf`,
+      with the JVM's console encoding set to UTF-8 by -J properties) join
+      tar/unzip/7-Zip under trusted_completers, with the exact-selection
+      check before a name is offered. Listings also clear JAVA_TOOL_OPTIONS,
+      JDK_JAVA_OPTIONS, _JAVA_OPTIONS, and CLASSPATH (an installed check
+      poisons JAVA_TOOL_OPTIONS so the JVM would refuse to start). A repaired
+      archive whose listing lacks a named member and offers nothing close is
+      dropped (`ar x libfo.a gg.o` used to offer `libx.a`, which holds no
+      such member). Old-style jar and ar clusters (`tf`, `rcs`) are kept out
+      of subcommand spelling like tar's (zsh's _java offered `jar t`).
+    - Attached values (`-Path:x`, `-xfx.tar`, `--file=x`, `-o<dir>`) are now
+      replaced by themselves when their prefix is written unquoted, so a
+      dialect quotes only the value: PowerShell had turned `-Path:photso.zip`
+      into the string `'-Path:photos.zip'`.
+    - Approval: ar, jar, pax, bsdcpio, unpigz, unlz4, zstdmt, the lzip
+      family, lzop, pixz, ouch, atool/aunpack/apack/arepack, unsquashfs,
+      mksquashfs, cabextract, dtrx, Expand-Archive, and Compress-Archive
+      join the writers whose changed targets need approval. Also flagged:
+      brotli -j/--rm and -f, compress -f, lzip -f, lzop -U/-f, ouch -y and
+      -r/--remove, unar -force-overwrite, dtrx -o, atool -f, unsquashfs -f,
+      and zip -m/--move ("deletes its input files"); fixtures and read-only
+      counterexamples in all three dialects. Passwords: unar/lsar
+      `-p`/`-password`, ouch's and dtrx's `-p` are masked in reports.
+    Coverage: four new unit tests (layouts for every family, PowerShell
+    binding, zip, jar), an engine fixture (inputs with and without a known
+    failure, outputs/values/patterns left alone, declined syntax falling
+    back), and the opt-in installed check installed_compressors_and_
+    archivers_repair_inputs_without_writing: 32 real-tool repairs (40 with
+    NOTYPO_TEST_JDK/NOTYPO_TEST_PWSH set: jar and PowerShell), -y refusal,
+    negative cases, and a directory snapshot showing nothing was written.
+    benchmarks/archive-results.md adds zipinfo, unar, ar, and jar readers
+    (cold/warm medians 40/39, 53/51, 104/52, and 134/135 ms; ar's cold run
+    pays xcrun's developer-directory lookup, jar a JVM start). The engine
+    benchmark keeps its budget (nested two-typo correction 0.974 ms).
+    Installed with Homebrew and recorded in plan/app.txt: unar, pigz,
+    pbzip2, lzip, plzip, lzop, pixz, ouch, atool, cabextract, squashfs,
+    dtrx, openjdk, and their dependencies. Unverified: rar/unrar (the rar
+    cask was disabled on 2026-09-01 because it fails Gatekeeper, so it was
+    not installed; no layout is guessed for it), and tar's transformed or
+    pattern member contexts stay declined. macOS only.
+    Validation at the end of this continuation (2026-10-06, macOS, after
+    the archive, garden, AI-assistant, dig, and ssh -o work): 423 default
+    tests pass (376 unit, 43 CLI, corpus, three rule fixtures); rustfmt and
+    all-target/all-feature Clippy with -D warnings pass; all 28 opt-in
+    installed checks pass serially in 253 s with Docker excluded and
+    NOTYPO_TEST_JDK, NOTYPO_TEST_PWSH, and NOTYPO_TEST_BLOCK_GOOSE set.
+[x] DONE: Data and text CLIs chained in pipelines: jq, yq, fzf,
     xsv/qsv, gron, miller (mlr), csvkit (rg, fd, bat, jaq, and other
     rewrites are in the Rust rewrites entry). yq (mikefarah) is expected to
     be cobra. Observed: jq has a zsh handler.
+    PARTIAL (2026-10-06, macOS, Homebrew): yq 4.54.1 is cobra under
+    trusted_completers; jq through zsh 5.9's handler; fzf 0.74.4, gron
+    0.7.1, miller 6.22.0 (options), xsv 0.13.0, and csvkit 2.2.0 through
+    trusted help and man pages. Typos inside pipelines are repaired per
+    stage (`cat f.json | jq --raw-ouptut .a`, `csvcut ... | csvlook
+    --no-inferr`). Miller's verbs (listed by `mlr help list-verbs`, not
+    --help) and qsv 23.0.1's commands (`qsv --list`) were not repaired at
+    this stage (addressed below). An option of unknown arity no longer takes an option-shaped next word
+    as its value (`yq -P --prettyPrnt` used to hide the second word);
+    after `-P`, cobra itself omits `--prettyPrint`, so that line is left
+    as insufficient evidence. Installed check:
+    installed_data_clis_repair_typos_inside_pipelines.
+    (2026-10-06, macOS) Miller verbs and qsv commands (src/engine/
+    data_help.rs). Under trusted_help, mlr's vocabulary comes from `mlr
+    help list-verbs` and `help flag/verb --as-json` (aliases and arity kept;
+    braces name arbitrary fields, never an enum); qsv's from `qsv --list`
+    (its count must match) plus per-command help, including nested words
+    (`qsv cat rows`). Probes are fixed requests in a private directory with
+    MLRRC=__none__ and QSV_DOTENV_PATH=<NONE>; an empty QSV_DOTENV_PATH is
+    loaded as a file, and qsv 23.0.1 then exits 1 silently, so the first
+    version never read qsv. A Miller `then` starts another verb only after
+    the previous verb's required arguments (from its usage line) are bound,
+    so `put then cta` and `head -n then cta` leave the expression/value and
+    file alone; --mload and unknown options fail closed. Repaired, asked:
+    `mlr ... sotr`, `sort -nf a then hed`, `put '$c = 1' then cta`, `qsv
+    slect`, `qsv cat rwos --pda`. qsv's Homebrew bash handler gives the same
+    repairs when trusted. Unit fixtures plus the installed check above.
 [ ] NOT DONE: Core shell tools: cp, mv, rm, mkdir, rmdir, chmod, chown,
     chgrp, ln, touch, cat, head, tail, sort, uniq, wc, cut, tr, paste, join,
     xargs, tee, find, grep, sed, awk/gawk/mawk, diff, patch, cmp, comm,
@@ -1671,6 +2254,16 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     and man_no_space (all ported). Observed (macOS, BSD tools): tail, sort,
     and xargs option typos are repaired from man pages; cp, mv, mkdir,
     chmod, head, date, sed, df, and crontab have zsh handlers (opt-in).
+    PARTIAL (2026-10-06, macOS): the man-page provider asked `man <name>`,
+    so GNU coreutils 9.12's `ls` first on PATH (Homebrew's gnubin) was read
+    against BSD `ls`'s page. The page installed with the resolved binary
+    now comes first: <prefix>/share/man/man1 (man8 for sbin) beside
+    <prefix>/bin, or libexec/gnuman beside libexec/gnubin; otherwise the
+    name is looked up as before. With gnubin first, `ls --sortt=size` ->
+    `--sort=size` and `cp --recursve` -> `--recursive` (approval); with BSD
+    `ls`, which has no --sort, nothing is offered. GNU tar from gnu-tar's
+    gnubin is identified the same way. Unit fixture. Remaining: BusyBox
+    and uutils layouts and GNU tools without their own page.
 [ ] NOT DONE: Editors and IDE launchers: vi, vim, nvim, emacs, emacsclient,
     nano, micro, code (VS Code), cursor, zed, subl, the JetBrains launchers
     (idea, pycharm, goland, ...), open (macOS), and xdg-open. Options come
@@ -1679,6 +2272,26 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     (`code --install-extension`) are marketplace resources (network).
     Observed: vim and emacs option typos are repaired from man pages; nano
     has no completer.
+    PARTIAL (2026-10-07, macOS): vim 9 (and vi), emacs/emacsclient,
+    macOS's nano and open, Homebrew's neovim, micro, and helix, and VS
+    Code's `code` (from its application bundle, put on PATH for the
+    check). Probes have no terminal, so no editor opened. zsh's handlers
+    repair `vim --cleen`, `nvim --headles`, `code --new-windw`, `code
+    --install-extention`, and `open -a Safarii` (applications are listed
+    by the handler). emacs, emacsclient, micro (man page), and helix (`hx
+    --helth`, `--grammer`) use trusted help. Neovim writes
+    ~/.local/state/nvim/nvim.log even for --help, so probes set
+    NVIM_LOG_FILE to the null device. Extension IDs are never checked
+    (`code --install-extension ms-python.pyhton` stays). Approval, added:
+    code/code-insiders/codium/cursor/windsurf --install-extension,
+    --uninstall-extension, and --update-extensions (marketplace installs),
+    and `code tunnel` (remote access). `+10` and `-c 'set nu'` stay
+    opaque. Limits: macOS's open rejects --help before printing its
+    usage, and help after an error is not read, so `open --revael` is not
+    repaired. Apple's nano 2.0.6 has no --linenumbers. Installed check:
+    installed_editors_repair_options_without_opening. Remaining: zed,
+    subl, the JetBrains launchers, and cursor (application installs), and
+    xdg-open (Linux).
 [ ] NOT DONE: Network diagnostics, firewalls, and tunnels: ping, ping6,
     traceroute, tracepath, netstat, ss, ip (iproute2), ifconfig, route, arp,
     nslookup, whois, telnet, socat, nmap, masscan, tcpdump, tshark,
@@ -1693,6 +2306,38 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     `ifconfig -a` (ported). Observed: ping, traceroute, netstat, ifconfig,
     and nslookup have zsh handlers; nmap and tcpdump option typos are
     repaired from man pages.
+    PARTIAL (2026-10-07, macOS): macOS's ping, traceroute, netstat,
+    ifconfig, route, arp, nslookup, whois, tcpdump, pfctl, networksetup,
+    and scutil; iproute2mac's ip and ss; Homebrew's nmap, socat, masscan,
+    telnet, wireshark (tshark), and ngrok (cask). zsh 5.9's handlers repair
+    `ip addr shwo`, `ip lnik`, `route -n gte`, `tcpdump --immediate-mod`,
+    `pfctl -s rulse`, `networksetup -getdnsserver`, and `scutil --dsn`.
+    nmap's options come from its man page (`--top-port`, `--scirpt`),
+    tshark's from trusted help, and ngrok's from cobra (go.ngrok.com/cmd/
+    ngrok; completion wrote nothing). zsh's _whois lists a few whois
+    servers for `-h`, so `whois -h whois.example.com` was "repaired" to
+    `whois.gb.com` (seven edits) and allowed. Two changes:
+    - A partial list is now evidence only against a typo-sized
+      difference: at most 2 edits plus one per 10 characters, or an
+      abbreviation with one slip at its end (csvlook's `--no-inferr`), or
+      a word the app's own output names. Authoritative lists are
+      unchanged.
+    - Every argument of a network diagnostic or scanner (ping, ping6,
+      traceroute(6), tracepath, mtr, whois, telnet, nc/ncat/netcat, socat,
+      nmap, masscan, nslookup, host, dig, drill, arping) is a target. A
+      repair that changes one needs approval (`whois -h whois.ripe.ent` ->
+      `whois.ripe.net`, asked); dig's `+` query options are not targets.
+    Approval, added: networksetup -set*/-create*/-delete*/-remove*/-add*/
+    -rename*/-import*/-order*/-switchto*, BSD route add/delete/change/
+    flush, ifconfig with anything after the interface, arp -d/-s/-S/-f,
+    and scutil --set and --nc start/stop/enablepreference. Limits:
+    masscan's help is prose that exits 1, with no usage line and no man
+    page. socat's address types (`TCP-LISTEN:`) are positional values its
+    handler doesn't list. Installed check:
+    installed_network_diagnostics_repair_typos_and_ask_before_changing_
+    targets. Remaining: Linux's iptables, ip6tables, nft, ufw,
+    firewall-cmd, tracepath, resolvectl, nmcli, and iw (Linux checks
+    deferred).
 [ ] NOT DONE: System administration, users, disks, and kernel: su, doas,
     run0, useradd, usermod, userdel, groupadd, passwd, chpasswd, visudo,
     shutdown, reboot, poweroff, hostnamectl, timedatectl, localectl,
@@ -1708,6 +2353,38 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     probe ever runs with sudo. thefuck: sudo, sudo_command_from_user_path,
     and unsudo (ported). Observed: dd, mount, dmesg, and sysctl have zsh
     handlers.
+    PARTIAL (2026-10-07, macOS): diskutil, launchctl, hdiutil, tmutil,
+    sysadminctl, dscl, systemsetup, pmset, sysctl, csrutil, nvram, fdisk,
+    dd, mount, and shutdown, all from macOS. diskutil rejects --help
+    ("type diskutil for a list") and lists its verbs when run bare (exit 1,
+    still a usage document). Only that bare root request is ever made:
+    `diskutil <verb>` acts on what follows. Its camelCase verbs, with
+    optional parts expanded (`info[rmation]`, `u[n]mount`,
+    `rename[Volume]`), are read under `where <verb> is as follows:`.
+    launchctl also rejects --help and lists its subcommands under
+    `launchctl help`. Nested levels use `launchctl help <subcommand>`, never
+    `<subcommand> --help`, which `reboot` would take as its argument.
+    Repaired: `diskutil lsit`, `informaton`, `unmoutDisk`, and `eraseDsk`
+    (asked), `launchctl lsit`, `bootot` and `kickstrat -k` (asked), `hdiutil
+    attch` (zsh), `tmutil lisbackups` and `delte` (asked), `sysadminctl
+    -deleteUsr` (asked), `dscl . -delte` (man page, asked), and
+    `systemsetup -settimezne` (man page, asked). `dscl . -delete
+    /Users/example` and `sysadminctl -deleteUser` had been allowed.
+    Approval, added: dscl delete (USER) and create/change/append/merge/
+    passwd; sysadminctl -deleteUser (USER), -addUser,
+    -resetPasswordFor, and -secureTokenOn/Off; settings other than
+    `status` for -guestAccount, -afpGuestAccess, -smbGuestAccess,
+    -automaticTime, -screenLock, and -autologin; systemsetup -set*
+    (`-setremotelogin on` among them); pmset other than -g (sleepnow
+    suspends); sysctl -w or name=value; csrutil disable/enable/clear/
+    authenticated-root/netboot; nvram writes and -d/-c/-f; launchctl
+    disable and `kickstart -k`. Limits: sysctl names, dd operands
+    (`status=progres`), pmset settings, and shutdown's time are values
+    neither help nor handlers judge. csrutil exits 64 for --help. Installed
+    check: installed_macos_admin_tools_repair_verbs_and_ask_before_changes.
+    Remaining: the Linux tools (useradd, systemd's *ctl, lsblk, parted,
+    mkfs, LVM, mdadm, cryptsetup, zfs, btrfs, modprobe, nsenter; Linux
+    checks deferred).
 [ ] NOT DONE: Compilers, linkers, and debuggers: gcc, g++, cc, c++, clang,
     clang++, clang-tidy, clang-format, swiftc, tsc, zig, nasm, as, ld, lld,
     meson, autoconf, automake, ./configure, pkg-config, gdb, lldb,
@@ -1724,6 +2401,41 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     lldb, objdump, otool, and pkg-config option typos are repaired from man
     pages; g++ has no option source; zig has no completer (`zig help`
     lists its commands).
+    PARTIAL (2026-10-07, macOS): Apple clang 21 (clang, clang++, and the
+    cc, c++, gcc, and g++ that run it), Homebrew GCC 16 (gcc-16), swiftc,
+    tsc (typescript), meson, ninja, automake, lld, clang-format, nasm,
+    pkg-config, lldb, objdump, nm, otool, codesign, lipo, strings, c++filt,
+    cmake, and install_name_tool. clang has its own completion protocol,
+    the one its bash script uses: `clang --autocomplete=<prefix>` lists
+    the driver's options, all 2377 `-W` warnings among its 4754, with
+    descriptions. `--autocomplete=<option>=,` lists an option's values:
+    84 for `-std=`, 3 for `-stdlib=`. A clang bridge (built in; it compiles
+    nothing) is chosen for clang, clang++, clang-N, cc, c++, gcc, and g++
+    when the driver answers `--autocomplete=--version`. GCC rejects that
+    request ("unrecognized command-line option", no input files, exit 1)
+    and keeps its help and man page. Joined options are reported without
+    their `=` and with a value, so `-std=c++2O` -> `c++20` and
+    `-stdlib=libc+` -> `libc++` go through the attached-value path. Plain
+    flags have unknown arity. Input files are not vocabulary. Some
+    descriptions span lines (`-dD`'s "Only valid with -E."), and those
+    lines are skipped. Before, zsh's _gcc took 16 probes for `-Wal`, and
+    with its handler untrusted `clang -Wall` was "repaired" to `-Wl` from
+    the man page. CCC_OVERRIDE_OPTIONS is unset for probes. Repaired:
+    `clang -Wal`, `clang --versoin`, `cc -Wextr`, `gcc
+    -fno-omit-frame-poiner`, `gcc-16 -Wextr` (help and man page), `swiftc
+    -emit-executabel`, `tsc --stirct`, `meson setp` (bash handler),
+    `pkg-config --cflgas` and `lldb --batc` (zsh), `codesign --sing`,
+    `lipo -inf`, `cmake --biuld`, and `install_name_tool -add_rpth`.
+    `-Iinclude`, `-lm`, `-DFOO=1`, `-Werror=format`, `-fsanitize=address,
+    undefined`, and `-march=native` stay. clang does not enumerate
+    sanitizers or CPUs. Limits: ninja's `-t` tools, nasm's `-f` formats, and
+    clang-format's `--style` presets are prose or separate listings; the
+    installed zig 0.17 cannot start (its llvm@22 library is missing), so
+    zig is unverified. Installed check:
+    installed_compilers_repair_flags_and_values_without_compiling.
+    Remaining: Linux's gdb, valgrind, perf, strace, ltrace, bpftrace, rr,
+    readelf, ldd, and addr2line (Linux checks deferred; binutils is
+    keg-only on macOS), and clang-tidy (LLVM's full toolchain).
 [ ] NOT DONE: Languages and REPLs: ruby/irb, perl/prove/cpan, lua/luajit,
     R/Rscript, julia, kotlin/kotlinc, scala/scalac/scala-cli/sbt, swift
     (build, test, package, run), ghc/ghci, erlang (erl, rebar3), elixir/iex,
@@ -1743,6 +2455,9 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     --configuraton` is not repaired: the handler's option list there is
     partial and not empty, and documentation is not merged into a
     non-empty native list.
+    (2026-10-07) Now repaired: documentation is asked when a partial
+    native list omits a word (see the Media entry); swift's help keeps
+    `build` and repairs `--configuraton`.
 [ ] NOT DONE: Web framework CLIs: ng (Angular), vue, create-vite and vite,
     next, nuxi, astro, svelte-kit, remix, nest, nx, turbo, lerna,
     react-native, ionic, cordova, django-admin and manage.py, flask,
@@ -1767,6 +2482,12 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     its completion and help run only when trusted_workspaces covers it.
     nx is covered too; the legacy react-native rule no longer runs
     `react-native --help` in an untrusted project.
+    (2026-10-05, macOS) A reproducible opt-in Flask 3.1.3/Click 8.1.8
+    check creates an isolated app.py with an import marker and a seed-db
+    command marker. Without workspace trust, discovery makes zero probes
+    and does not import it. With trust, seed-bd, rutes, and run --prot are
+    repaired using completion, with the project command's description;
+    import code runs but the command callback and server never run.
 [ ] NOT DONE: Mobile and device tools: adb, fastboot, emulator, avdmanager,
     sdkmanager, xcodebuild, xcrun (simctl, notarytool, altool),
     xcode-select, xcodes, pod (CocoaPods), carthage, fastlane, ios-deploy,
@@ -1777,6 +2498,44 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     Fastfile (workspace trust). thefuck: adb_unknown_command reads adb's
     printed command list (ported). Observed: xcodebuild and xcrun option
     typos are repaired from man pages.
+    PARTIAL (2026-10-07, macOS): Xcode 27's xcodebuild, xcrun, and
+    xcode-select; Homebrew's android-platform-tools (adb, fastboot; cask),
+    cocoapods, carthage, fastlane, ios-deploy, libimobiledevice, and xcodes.
+    zsh's _adb lists device serials with `adb devices -l`. In a probe
+    that started adb's server (a daemon on 127.0.0.1:5037; stopped with
+    `adb kill-server`) and wrote an RSA key pair to ~/.android. adb joins
+    borg among the apps whose handlers get a failing stub in place of the
+    app, so only the handler's fixed words are used. `adb --help` itself
+    leaves an empty ~/.android. CocoaPods' CLAide help marks commands
+    `+ cache`, and fastlane's heading is `Commands: (* default)`; both
+    are read now. pod's help doesn't evaluate the Podfile. fastlane stays
+    in the workspace-trust table (marker test: its --help doesn't evaluate
+    the Fastfile either). Repaired: `adb devcies`, `adb instal` (asked),
+    `adb -s ... shel`, `xcodebuild -sheme`, `xcrun --show-sdk-pth`,
+    `xcode-select --print-pth` and `--swtich` (asked), `xcodes lsit` and
+    `instal` (asked), `carthage bootsrap` (asked), `pod instal` and `pod
+    repo updte` (asked), `fastlane lanse`, and `ideviceinfo --simpel`.
+    Approval, added: adb install*/uninstall/push/sync/sideload/restore/
+    reboot/root/unroot/remount/(dis|en)able-verity (on the device);
+    fastboot flash/flashall/flashing/erase/format/update/boot/oem/
+    set_active/wipe-super/logical partitions/reboot/-w; xcode-select
+    -s/--switch/-r/--reset/--install (system-wide); xcodes install/
+    uninstall/select/update/runtimes; pod install/update/deintegrate/
+    cache/repo/setup/trunk; carthage bootstrap/update/checkout/build.
+    Limits: fastboot's commands sit under free-form headings with
+    placeholders (`flash PARTITION [FILENAME]`), and are not read.
+    xcodebuild's actions (build, clean, test, archive) are only a
+    `<buildaction>` placeholder in its help. `xcrun simctl` runs another
+    tool that xcrun's help doesn't list. ios-deploy's help exits 253.
+    Simulators, schemes, and device serials were not looked up.
+    Installed check:
+    installed_mobile_tools_repair_typos_without_touching_devices.
+    Remaining: emulator, avdmanager, and sdkmanager (the Android SDK and a
+    JDK; not installed).
+    Homebrew's ruby 4.0.7 (a cocoapods/fastlane dependency) links Bundler
+    4.0.20 ahead of macOS's 1.17.2. Its --help is its formatted man page;
+    `PRIMARY COMMANDS`/`UTILITIES` sections and `bundle install(1)` entries
+    are now read (installed help-fallback check passes again).
 [ ] NOT DONE: Media, documents, and static sites: ffmpeg, ffprobe, ffplay,
     ImageMagick (magick, convert, identify, mogrify), gm, exiftool, sox,
     yt-dlp, gifsicle, optipng, jpegoptim, cwebp, pandoc, latexmk, pdflatex,
@@ -1790,6 +2549,66 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     Output files are writes, and changing one needs approval. hugo is
     expected to be cobra and mkdocs click. Observed: ffmpeg has a zsh
     handler; magick and convert option typos are repaired from man pages.
+    PARTIAL (2026-10-07, macOS, Homebrew): FFmpeg 8 (ffmpeg, ffprobe,
+    ffplay), ImageMagick 7 (magick, convert), GraphicsMagick 1.3.48,
+    exiftool 13.55, sox 14.4.2, yt-dlp, gifsicle 1.96, optipng 7.9.1,
+    jpegoptim 1.5.6, cwebp, pandoc 3.12, tectonic 0.17.0, qpdf 12.4.2,
+    pdftk-java 3.3.3, Ghostscript 10.08.0, hugo 0.167.0, mkdocs 1.6.1, and
+    sphinx-build 9.1; eleventy and docusaurus 3.10 were installed in a
+    scratch npm project.
+    FFmpeg: zsh's _ffmpeg reads ffmpeg's basic `-h` (42 options). That
+    has no -i, -hide_banner, -loglevel, or -pix_fmt and none of the codec,
+    format, or filter options (-preset, -crf, -movflags). Trusted help now
+    reads FFmpeg's own `-h full` (about 1 MiB, under its own 8 MiB limit)
+    and `-codecs` (two probes) through data_help, and that is preferred to a
+    shell handler. Main options at the margin become declarations; those
+    marked `[:<stream_spec>]` also get one per stream type (`-c:v`, `-b:a`);
+    AVOptions (`  -preset <string>`) all take a value. Codec options list
+    the codec names with the decoders and encoders that implement them, so
+    `-c:v libx26` -> `libx264` and `-c:a acc` -> `aac`. Long option names
+    may contain `:` for this. Three engine changes came from ffmpeg:
+    - A word close to a listed single-dash long option is no longer read as
+      a short option with an attached value. `-hide_baner` was `-h`
+      (`-h topic`) plus `ide_baner`; gcc's `-Iinclude` shares no head with
+      `-include` and stays `-I`.
+    - When a partial native list omits a word, the app's documentation
+      (trusted help, man page) is asked before branching. A documented
+      word stays: `-pix_fmt` had been "repaired" to `-pix_fmts`. A word far
+      from everything listed is judged by documentation (`-loglevle`).
+    - When a partial list would accept a word as a short option with an
+      attached value, documentation decides first.
+    This also repairs `swift build --configuraton` (swift's help lists
+    `build`, which zsh's _swift answers with files).
+    Startup helpers: mkcert's package init runs `brew --prefix nss` on
+    macOS, and hugo links that code as github.com/bep/mclib. Every probe
+    of a Go binary linking either (the probe runner reads its build
+    information) now puts a failing `brew` stub first on PATH; shell
+    handlers that call such an app get it too. Before this, hugo's cobra
+    completion wrote 850 Homebrew cache files into HOME. Help probes set
+    NO_UPDATE_NOTIFIER and NODE_USE_ENV_PROXY for every app now, not only
+    yargs bridges: docusaurus's update-notifier wrote under HOME.
+    docusaurus --help evaluates docusaurus.config.* (a marker was written),
+    so it joins the workspace-trust table. eleventy's help reads no config.
+    mkdocs: click apps found through their bash script (mkdocs's) never
+    read root help, so every root command was a possible resource needing
+    approval. With trusted help, root commands now come from it.
+    Repaired: ffmpeg/ffprobe/ffplay options and codecs, `magick -resiz`,
+    `convert -qualty` and `gm conver` (zsh), `exiftool
+    -overwrite_orignal`, `yt-dlp --extract-adio` and `pandoc --from
+    markdwn` (bash handlers), gifsicle/optipng/jpegoptim/cwebp/qpdf/
+    tectonic options, `pdftk ... cta output` (asked: the handler offers its
+    operations again after every file, so they are values), `hugo serer`,
+    `hugo new projcet` (cobra; `new site` became `new project`),
+    `mkdocs serv`, `eleventy --serv`, and `docusaurus biuld` (trusted
+    project only). Limits: Ghostscript's `-dNAME`/`-sNAME=value` define
+    interpreter parameters with arbitrary names, and only zsh's handler
+    state machine knows `-sDEVICE=` devices, so they are not judged.
+    sox's effects and sphinx-build's builders are positional values their
+    help does not list. Installed check:
+    installed_media_and_document_tools_repair_typos_without_writing (HOME
+    stays empty). Remaining: TeX Live's latexmk/pdflatex/xelatex/lualatex
+    (several GB; tectonic stands in) and jekyll (needs Ruby 2.7+, and macOS
+    has 2.6).
 [ ] NOT DONE: Messaging and streaming: Apache Kafka's tools (kafka-topics,
     kafka-console-producer, kafka-console-consumer, kafka-consumer-groups,
     kafka-configs, kafka-acls, kafka-storage, and their .sh forms), kcat,
@@ -1803,6 +2622,29 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     rpk), kingpin/fisk's --completion-bash (nats), and
     `rabbitmqctl autocomplete`. Deleting topics or groups and resetting
     offsets need approval.
+    PARTIAL (2026-10-06, macOS): rabbitmqctl, rabbitmq-diagnostics,
+    rabbitmq-plugins, rabbitmq-queues, rabbitmq-streams, and
+    rabbitmq-upgrade (Homebrew RabbitMQ 4.3.6, Erlang/OTP 28) use the
+    RabbitMQ CLI bridge in the shared-protocol record. Commands (with
+    descriptions), `help <command>` arguments, global switches, and command
+    options are repaired; queue, vhost, and node names stay untouched.
+    Deleting/purging queues, vhosts, users, and replicas, node resets/stops,
+    connection closes, code evaluation, drains, membership changes, and
+    plugin enable/disable/set need approval; explicit --help stays allowed.
+    No broker ran.
+    PARTIAL (2026-10-06, macOS, Homebrew): kaf 0.2.14
+    (github.com/birdayz/kaf/cmd/kaf) and kafkactl 5.20.0
+    (github.com/deviceinsight/kafkactl/v5) repair commands and options
+    through cobra under trusted_completers; rabbitmqadmin 2.35.0 through its
+    installed zsh handler (partial lists ask); nats-server 2.15.0 through
+    trusted help; mosquitto_pub/mosquitto_sub 2.1.2 through their man pages.
+    kcat 1.7.0 documents only short options, so it has no long-option
+    vocabulary to repair. Topic/group/queue deletion needs approval through
+    the generic verb gate; kafkactl reset, kaf group commit, rpk group seek,
+    and kafka-consumer-groups --delete-offsets or --reset-offsets with
+    --execute (a dry run otherwise) need approval as offset moves. Kafka's
+    Java tools, rpk (not in Homebrew core), emqx (a broker), and
+    pulsar-admin remain unverified; Homebrew's pulsar is an unrelated editor.
 [ ] NOT DONE: Web servers, proxies, and certificates: nginx, apachectl/
     apache2ctl, httpd, a2enmod/a2ensite, caddy, traefik, haproxy, envoy,
     varnishadm, certbot, acme.sh, and mkcert. Requirements: config checks
@@ -1812,6 +2654,59 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     and deleting or revoking certificates need approval; modules and sites
     (a2enmod) are local resources; certificate names and domains are
     resources. caddy is expected to be cobra.
+    PARTIAL (2026-10-07, macOS, Homebrew): nginx 1.31.6, caddy 2.11.7,
+    traefik 3.7.13, haproxy 3.4.6, varnish 9.1.0, envoy 1.39.2, certbot
+    5.8.0, acme.sh 3.1.6, mkcert 1.4.4, and macOS's own httpd/apachectl.
+    caddy links cobra and urfave/cli (through smallstep), so it was refused
+    as ambiguous. Its source was audited: caddycmd's cobra tree has no
+    completion callbacks or pre-run hooks, and package init only registers
+    modules. The official module (github.com/caddyserver/caddy/v2/cmd/caddy)
+    is audited cobra. xcaddy names every build's main module `caddy`, plugins
+    included (Homebrew's is one), so for those the linked
+    caddyserver/caddy/v2 settles the protocol, and trust comes from
+    trusted_completers. An audited or settled flavor now comes before the
+    linked-library order (go-modules cache v6). Completion wrote nothing.
+    nginx rejects --help (`invalid option: "-"`), and so do others. After
+    such a rejection, help probes ask the short flag the installed man
+    page documents as printing help or usage. nginx's and varnishadm's `-h`
+    qualify; varnishd's `-h <type>` (a hash algorithm) and ls's `-h`
+    never do. Apache's httpd does not reject --help: it goes on to start
+    the server (stopped here only by an unwritable log), and apachectl
+    hands unknown words to httpd. Neither ever gets --help from any probe
+    (help text or generator discovery), even when renamed. They get only
+    their man page's flag, or nothing. httpd's usage names the path it ran
+    as (`Usage: /usr/sbin/httpd`), which the usage check now accepts.
+    Option values: a description that closes with a list after naming the
+    placeholder (nginx's `-s signal : ...: stop, quit, reopen, reload`;
+    examples such as `e.g.` excluded), and a synopsis's alternatives
+    (httpd's `[-k start|restart|graceful|graceful-stop|stop]`), which also
+    document an option missing from the declarations. traefik's
+    hierarchical options (`--log.level`, `--providers.docker.endpoint`)
+    were dropped by the option parser, which rejected dots; long options
+    keep interior dots now (man cache revision 2). certbot's root help shows
+    only common commands; its `--help commands` topic, appended to root
+    help, lists all of them as a margin listing under `SUBCOMMANDS is:`.
+    mkcert runs `brew --prefix nss` at startup on macOS, even for --help.
+    Homebrew then wrote its caches into HOME, and the probe could time out.
+    Help probes for mkcert (by identity) put a failing `brew` stub first on
+    PATH, the mechanism borg's handlers use. Repaired: `caddy valdate`,
+    `caddy run --confg`, `nginx -s relod`, `httpd -k gracefl`, `traefik
+    --log.levl=DEBUG`, `traefik helthcheck`, `certbot renw`/`rollbak`,
+    `certbot certonly --standalon`, `mkcert -pkcs21`, `envoy --mdoe`,
+    `acme.sh --isue` (its bash handler), and `apachectl configtets`
+    (zsh's _apachectl). Approval, added: caddy trust/untrust and mkcert
+    -install/-uninstall (as Go flags) change the system trust store; caddy
+    upgrade/add-package/remove-package replace its binary; haproxy -sf/-st
+    stop old processes; varnishadm stop; certbot unregister and rollback;
+    acme.sh --deactivate/--deactivate-account. Limits: varnishadm's
+    commands belong to the running varnishd's CLI (varnish-cli(7)), so
+    listing them needs its management port and they are not repaired.
+    haproxy prints single-dash flags in single-spaced prose and exits 1, so
+    only its man page applies. envoy's enum values are prose (`One of
+    'serve' ... or 'validate'`) and are not read. Installed check:
+    installed_web_servers_and_certificate_tools_repair_typos_without_
+    starting_them (HOME stays empty). Remaining: a2enmod/a2ensite and
+    apache2ctl (Debian; Linux checks deferred).
 [ ] NOT DONE: Lint, format, and test runners: eslint, prettier, biome,
     oxlint, stylelint, shellcheck, shfmt, hadolint, yamllint, markdownlint,
     golangci-lint, staticcheck, mypy, pyright, rubocop, ktlint, swiftlint,
@@ -1836,6 +2731,36 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     no git hook was installed. Without trusted_help nothing is probed.
     `lefthook install` itself (writes .git/hooks) has no extra safety
     policy yet. The other tools in this entry remain unverified.
+    PARTIAL (2026-10-07, macOS): Homebrew's shellcheck, shfmt, hadolint,
+    yamllint, markdownlint-cli, golangci-lint 2, staticcheck, mypy,
+    pyright, ktlint, swiftlint, locust, wrk, vegeta, biome, oxlint,
+    prettier, eslint, and phpunit; jest, vitest, mocha, @playwright/test,
+    stylelint, and husky in a scratch npm project; macOS's ab. Discovery
+    ran in a git project whose JavaScript configs (.mocharc.js,
+    jest/vitest/vite/playwright/eslint/prettier/stylelint configs,
+    .markdownlint.js), locustfile.py, and phpunit.xml's bootstrap each
+    write a marker. No help probe evaluated any of them, and no test ran.
+    golangci-lint is cobra (trusted_completers); swiftlint uses its
+    Homebrew bash handler; the rest use trusted help. vegeta's help lists
+    commands as `attack command:` flag sections, which are now read as
+    subcommands (`vegeta atack`). husky has no help: every run except its
+    deprecated commands sets core.hooksPath and writes hooks. `husky
+    --help`, in a repository, ran `git config core.hooksPath --help/_` and
+    wrote hooks under a `--help` directory. Every probe now sets HUSKY=0,
+    husky's documented switch (it then prints "HUSKY=0 skip install").
+    Approval, added: husky (any run but add/set/uninstall), lefthook
+    install/uninstall/add, and pre-commit install/uninstall/install-hooks/
+    init-templatedir install or remove git hooks. Limits: biome and
+    golangci-lint create empty cache directories under ~/Library/Caches
+    at startup (dev.biomejs.biome, goimports), with no files, even with
+    BIOME_LOG_PATH set, so they are recorded rather than audited. locust's
+    help needs about 1.6 s (gevent), beyond the default probe timeout, and
+    imports no locustfile. ab's options are single letters; mocha's
+    `--recursive` is asked by the generic recursive-flag rule. Installed
+    check: installed_linters_and_test_runners_repair_typos_without_running_
+    tests (NOTYPO_TEST_LINT_PATH adds npm install directories). Remaining:
+    rubocop and rspec (Ruby 2.7+ gems; macOS has 2.6), cypress (its binary
+    download), and lefthook-style hook listing for husky (none exists).
 [ ] NOT DONE: Database migrations and ORMs: flyway, liquibase, alembic,
     prisma, goose, migrate (golang-migrate), dbmate, knex, sequelize-cli,
     typeorm, dotnet ef, and the Rust/Ruby/Django tools in their entries.
@@ -1844,12 +2769,67 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     or runs a migration; destructive verbs (flyway clean, liquibase
     dropAll, prisma migrate reset, alembic downgrade, dbmate drop) need
     approval.
-[ ] NOT DONE: Backup and sync: restic, borg, borgmatic, duplicity, kopia,
+    PARTIAL (2026-10-06, macOS): goose 3.28.0 (pressly; Homebrew's goose)
+    and golang-migrate 4.20.1 have no completer and use trusted help;
+    dbmate 2.36.0 links urfave/cli v2 without enabling completion, so help
+    again. knex 3.3.0, typeorm 1.1.1 (npm), and alembic 1.20.0 (pip),
+    installed in scratch directories, use trusted help: commander.js
+    entries (`migrate:make [options] <name>`, `install|i`) and argparse
+    choice lines (`{branches,check,...}`) are now read. sequelize-cli
+    loads `.sequelizerc` (JavaScript) even for --help and needs the
+    project's own sequelize package, so it joins the workspace-trust table
+    (an untrusted project gets no probe; outside one it exits 1). knex,
+    typeorm, and prisma help loaded no knexfile, ormconfig, or
+    prisma.config.ts. No probe connects to a database: discovery runs only
+    help. prisma installed as 8.0.0-rc.20, a new platform CLI without
+    `migrate` and with a bordered help that has no commands heading, so
+    its commands are not read. Approval, added: knex `migrate:rollback`/
+    `migrate:down` (the rule expected `migrate rollback`), goose down,
+    down-to, reset, and redo (also after DRIVER DBSTRING), and golang-
+    migrate down, force, and goto; flyway clean, liquibase dropAll and
+    rollback, prisma reset, alembic downgrade, dbmate drop/rollback,
+    sequelize undo/drop, and typeorm revert/schema:drop were already
+    gated. Unverified: flyway and liquibase (Homebrew's resource unpacking
+    runs its own sandbox-exec, which this session's sandbox refuses, and no
+    Java runtime is installed), and dotnet ef. Installed check:
+    installed_migration_and_ai_tools_repair_typos_without_touching_prompts
+    (NOTYPO_TEST_MIGRATION_PATH adds npm and pip install directories).
+[x] DONE: Backup and sync: restic, borg, borgmatic, duplicity, kopia,
     rsnapshot, tarsnap, and tmutil (macOS), alongside rclone (5A) and rsync.
     Requirements: repositories and snapshots are resources; repository
     passwords (RESTIC_PASSWORD, BORG_PASSPHRASE) are never logged or
     cached; discovery never opens a repository; forget/prune/delete need
     approval. Expected protocols: cobra (restic) and kingpin (kopia).
+    DONE (2026-10-06, macOS, Homebrew): restic 0.19.1 is an audited cobra
+    app: a crawl of 52 command paths (1,602 queries, every flag value)
+    with RESTIC_REPOSITORY naming a listening REST address and a marker
+    RESTIC_PASSWORD_COMMAND made no connection and asked no password;
+    snapshot IDs are not completed. kopia 0.23.1 (kingpin) is recorded in
+    the shared-protocol record. borg 1.4.5's bash, zsh, and fish handlers
+    (trusted_completers) list archives with `borg list` and keys with
+    `borg config`: with an earlier option of unknown arity, notypo queried
+    the slot after `repo::a1`, and borg opened a real repository and ran
+    BORG_PASSCOMMAND. Handler probes for borg now find a private failing
+    stub first on PATH (engine::native CLOSED_APPS), so only the handlers'
+    fixed words are used; no lock file appears and no passcommand runs in
+    any of the three shells. borgmatic 2.1.9, duplicity 3.2.1, and macOS's
+    tmutil have no completer and fall back to trusted --help (new layouts:
+    argparse `actions:` with parenthesized aliases, and usage lines that
+    each name a command). tarsnap 1.0.41 uses its bash handler.
+    rsnapshot 1.5.1's commands are interval names from its configuration
+    and its help prints only the version; man options remain, and its
+    rotation commands already need approval. Approval: restic forget/prune,
+    borg delete/prune/compact, borgmatic prune/compact/delete actions (and
+    defaults), duplicity remove-*, tmutil delete*, tarsnap -d/--nuke,
+    kopia snapshot/repository delete, and rclone purge/delete.
+    Offline probes remove BORG_PASSPHRASE/PASSCOMMAND/PASSPHRASE_FD/
+    NEW_PASSPHRASE and RESTIC_PASSWORD/_FILE/_COMMAND and set
+    BORG_RSH=false; no probe has a controlling terminal (section 6), so a
+    passphrase prompt fails instead of appearing. Nothing logs or caches
+    these values. Coverage: unit fixtures (borg stub, environment, gate)
+    and installed_backup_and_dotfile_tools_repair_typos_without_opening_
+    repositories, which uses a real encrypted borg repository, a marker
+    password command for borg/restic/rclone, and a listening address.
 [ ] NOT DONE: Security scanners and auditing: semgrep, gitleaks, trufflehog,
     snyk, nikto, bandit, pip-audit, osv-scanner, checkov, tfsec, kube-bench,
     lynis, and clamscan (trivy, grype, syft, and cargo audit/deny are in
@@ -1859,40 +2839,213 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     triggers; scan targets (hosts, URLs) are resources, and scanning a
     different one needs approval. Expected protocols: cobra (gitleaks),
     kingpin (trufflehog), and click (semgrep).
-[ ] NOT DONE: Kubernetes development loop: skaffold, tilt, telepresence,
+    DONE (2026-10-06, macOS, Homebrew): cobra under trusted_completers:
+    gitleaks 8.30.1 (its hidden `detect`/`protect` aliases are not listed,
+    so they are not repaired), tfsec 1.28.14, kube-bench 0.16.0. kingpin:
+    trufflehog 3.98.0 (trusted completers and help). osv-scanner 2.6.0
+    links urfave/cli v3 but does not enable completion (exit 127), so its
+    trusted help supplies commands. Trusted help: semgrep 1.179.0 (its
+    entry point dispatches to its own binaries, and its help lacks click's
+    marker, so the click bridge does not apply even with both trusts),
+    bandit 1.9.4, pip-audit
+    2.10.1, checkov 3.3.20 (about 3.5 s cold, past the default 3 s probe
+    limit on first use), lynis 3.1.7 (usage after a banner, exit 64, now
+    accepted), clamav 1.5.4's clamscan, nikto 2.6.1, and snyk 1.1307.4.
+    Discovery runs only completion and help, never a scan; help probes now
+    get the same offline environment as handler probes, and every probe
+    sets NODE_USE_ENV_PROXY=1, since snyk's Node wrapper made nine requests
+    while printing help (refused by the blocked proxy; its help works
+    offline). In a new HOME, snyk's first run copies its 69 MB binary into
+    the cache, which can outlast the probe limit once. Rule IDs and config names are option values that these tools
+    do not enumerate offline, so they are not repaired. Approval: a repaired
+    nikto host or URL (-h/-host/-url) and trufflehog repository, org,
+    bucket, or endpoint; clamscan --remove/--move/--copy; the generic
+    --recursive flag still asks for read-only scanners too (conservative).
+    Installed check: the security check above.
+[x] DONE: Kubernetes development loop: skaffold, tilt, telepresence,
     okteto, devspace, garden, kubefwd, and mirrord. Requirements: profiles
     and modules come from project config (skaffold.yaml, Tiltfile);
     cluster lookups need network_completion; connecting or intercepting
     (telepresence connect/intercept) changes cluster state and needs
     approval. skaffold, tilt, telepresence, okteto, and devspace are
     expected to be cobra.
+    PARTIAL (2026-10-06, macOS, Homebrew and vendor taps): cobra under
+    trusted_completers: skaffold 2.25.0, tilt 0.37.8 (completion and help
+    never evaluate the Tiltfile), okteto 3.23.1, kubefwd 1.25.16, and
+    telepresence-oss 2.32.1 (connect/intercept already need approval). devspace
+    6.3.21 links go-flags too and was refused as ambiguous; it is now an
+    audited cobra app (50 command paths, 276 queries outside a project:
+    no connection, no files). In a project, its completion and even
+    --help run devspace.yaml's `vars` commands (once per query), so
+    devspace joins the workspace-trust table: an untrusted project gets no
+    probe at all. mirrord 3.270.0 (Rust, metalbear-co tap) uses trusted help.
+    garden is not in Homebrew (unverified). cobra lists neither aliases nor
+    hidden commands: `kubefwd svcs` and `helm ls` were flagged as typos.
+    cobra resolves them, so the flags offered after the typed word are
+    compared with the level's own: a different, non-empty list means the
+    word selected a command (an unknown root word finds none and offers
+    nothing; deeper, it is an argument offering the level's flags again).
+    Profiles come from project files only as option values cobra lists;
+    cluster lookups stay offline. Installed check: the CI/CD check above.
+    DONE (2026-10-06, macOS): garden 0.14.20 (garden-io/garden tap's
+    garden-cli; recorded in plan/app.txt) has no completer and uses trusted
+    help. Its nested help prefixes entries with the bound command (`get
+    status` under `garden get`, `cloud secrets list` under `garden cloud`),
+    which read as nothing; such entries now count when their first word is
+    the program or the last bound command (docs fixture). garden is a
+    self-extracting Node bundle: the first run in a HOME unpacks about
+    147 MB into ~/Library/Application Support/io.garden.garden in about
+    2 s (under the 3 s probe limit; a run killed mid-extraction recovers
+    on the next). Every command, including --help, also wrote
+    ~/.garden/global-config.json for analytics and checks for releases;
+    probes now set GARDEN_DISABLE_ANALYTICS and
+    GARDEN_DISABLE_VERSION_CHECK, after which only the runtime cache is
+    written. No request reached a logging proxy, and --help writes nothing
+    in the working directory (`garden version` and `options` create a
+    .garden/ log directory there; probes never run them). Root `garden --help`
+    resolves the project configuration (project.garden.yml, garden.yml, or
+    any *.garden.yml, searched upwards) to list custom commands; a broken
+    configuration makes it fail, while command help does not. garden
+    therefore joins the workspace-trust table: an untrusted project gets
+    no probe. Actions, environments, and plugin commands come from the
+    project and providers and are not listed offline. Approval: garden
+    cleanup (Deploys or the namespace), plugins (provider operations such as
+    cluster-init), and self-update. Repaired, asked: `garden deplyo`, `get
+    statsu`, `cloud secrets lsit`, `cleanup namespce` (approval). Installed
+    check: the CI/CD check above, with the untrusted-project case.
 [ ] NOT DONE: Dotfiles and environment managers: direnv, chezmoi, stow,
     yadm, home-manager, dotbot, and rcm. Requirements: `direnv allow`
     trusts and runs a project's .envrc, so a correction into it needs
     approval; chezmoi apply and stow write files, and changing their target
     needs approval. chezmoi is expected to be cobra.
-[ ] NOT DONE: Git and container TUIs and helpers: tig, lazygit, lazydocker,
+    PARTIAL (2026-10-06, macOS, Homebrew): chezmoi 2.73.0 links cobra and
+    urfave/cli/v3 (through a dependency), so it was refused as ambiguous
+    even when trusted; it is now an audited cobra app. A crawl of 117
+    command paths (3,979 queries) with a source state holding an `output`
+    template, a run_always script, and read-source-state/apply hooks ran
+    none of them and wrote nothing; target paths are not completed.
+    direnv 2.37.1 and dotbot 1.24.1 have no completer and use trusted
+    --help (direnv's underlined heading with margin entries is now read).
+    stow 2.4.1 uses zsh 5.9's `_stow`; yadm 3.5.0 uses its zsh and fish
+    handlers, while its bash script registers nothing unless git's bash
+    handler is loaded, which now counts as a failed handler (noted), so
+    trusted help supplies yadm's own commands; git commands it passes
+    through are not judged. rcm 1.3.6 (rcup, mkrc, lsrc, rcdn) documents
+    only single-letter options in its man pages, so there is no long
+    vocabulary to repair. home-manager needs nix, which is not installed
+    (its macOS installer needs a root-owned /nix volume): unverified.
+    Approval: direnv allow/permit/grant/edit/exec; stow -D (--delete was
+    already generic); a repaired chezmoi target (after apply, add, re-add,
+    update, import, chattr, merge, merge-all, edit, init, forget) or
+    -S/-D/-W/-c directory, and a repaired stow package or -t/-d directory.
+    Repairing only the operation (`chezmoi aply ~/.bashrc`) does not count
+    as a target change. Fixtures and the installed backup/dotfile check.
+[x] DONE: Git and container TUIs and helpers: tig, lazygit, lazydocker,
     ctop, git-flow, git-extras, git-absorb, and git-branchless (gitui, dive,
     k9s, and sofka are in their entries). TUIs get only their argv flags and
     subcommands and are never launched during discovery; git-* helpers on
     PATH already appear through the git bridge (`git --list-cmds=others`).
-[ ] NOT DONE: AI and developer assistants: ollama, llm, claude (Claude
+    DONE (2026-10-06, macOS, Homebrew): tig 2.6.1, lazygit 0.66.0,
+    lazydocker 0.25.2, and ctop 0.7.7 have no completer and use trusted
+    --help, which each prints and exits from in under a second without a
+    terminal, writing nothing (probes have no controlling terminal, so a
+    TUI cannot start). git-flow 0.4.1 (nvie's; the AVH fork is gone from
+    Homebrew), git-extras 7.5.0, git-absorb 0.9.0, and git-branchless
+    0.11.1 come through the git bridge as git-* helpers (`git sumary`,
+    `git absrob`, `git brnachless init`, `git flwo init` decide), and
+    git-absorb's own options come from trusted help and its man page.
+    Approval: git-extras and git-branchless commands that discard work,
+    rewrite or push history, or replace a clone (obliterate, undo, clear,
+    clear-soft, reset-file, force-clone, sync, squash, abort, rename-tag,
+    rename-branch, release, hide, move, restack, reword, amend, submit;
+    delete-* was already generic) and `git absorb --and-rebase`.
+    Installed check: installed_git_helpers_tuis_and_remote_tools_repair_
+    typos_without_launching.
+[x] DONE: AI and developer assistants: ollama, llm, claude (Claude
     Code), aider, codex, gemini, opencode, goose, sgpt, and gh copilot.
     Requirements: model names come from local listings only, and
     discovery never starts a model server (`ollama list` talks to one); API
     keys are secrets; prompts are free text and never corrected. ollama is
     expected to be cobra and llm click. Observed: claude has no completer.
+    PARTIAL (2026-10-06, macOS): ollama 0.35.1 is an audited cobra app:
+    its completion lists no models and neither contacts nor starts a
+    server (a listener on 127.0.0.1:11434 saw no request across 55
+    queries). llm 0.36 (pip, scratch virtualenv) works through click: the
+    root and `models` groups default to a prompt and to `list`, so their
+    unknown words are left alone, and option typos repair (`llm logs
+    --cout 3`). claude 2.1.290, codex-cli 0.160.0, gemini-cli 0.46.0, and
+    opencode 2.0.20 use trusted help; prompts such as `claude explain the
+    bug` or `codex fix tests` produce no candidates, and only near-misses
+    of their real commands are offered, asked. Offline probes remove
+    OPENAI/ANTHROPIC/GEMINI/GOOGLE_GENAI/OPENROUTER/MISTRAL/GROQ/DEEPSEEK/
+    OLLAMA API keys. Unverified: aider (Homebrew's resource unpacking fails
+    in this sandbox), Block's goose (its `goose` binary conflicts with the
+    migration tool's), sgpt (not in Homebrew), gh copilot (no extension
+    installed). Installed check: the migration/AI check above.
     PARTIAL (2026-10-05): llm 0.36 (scratch virtualenv) is found as click
     from its help, but its root and `keys` groups are click-default-groups
     (an unknown first word is the default command's argument, so `llm
     modles` is a prompt), and its completion answers nothing there; notypo
     abstains rather than correcting prompt text.
+    (2026-10-05, macOS) Current package metadata is llm 0.31.1 after SAM's
+    installation, not the earlier 0.36. It now fails during import because
+    httpx is missing. Pip dependency repair, including an explicit PyPI
+    index, found no available distribution in this environment; current
+    LLM completion checks remain unverified. Recorded in plan/app.txt.
+    DONE (2026-10-06, macOS): the remaining assistants, each recorded in
+    plan/app.txt. aider 0.86.2 (Homebrew; its bottle installed this time)
+    is repaired through its shtab bash/zsh handlers or trusted help; `aider
+    --help` takes 0.6 s and writes and contacts nothing; file operands and
+    prompt words are left alone. Block's goose 1.53.0 (block-goose-cli)
+    conflicts with the migration tool's `goose`, so it stays unlinked and
+    NOTYPO_TEST_BLOCK_GOOSE names its keg; it is clap with trusted help,
+    and every run, --help included, created a log under
+    ~/.local/state/goose: probes set GOOSE_PATH_ROOT to the null device
+    (goose only warns) and GOOSE_DISABLE_KEYRING. sgpt 1.5.1 (pipx; typer
+    0.27 no longer brings click, which sgpt imports, so click was injected)
+    turns Typer completion off; its Rich help boxes are read through trusted
+    help. Unconfigured, it asks for an OpenAI key at import; probes have no
+    terminal, so that fails closed; a configured ~/.config/shell_gpt/.sgptrc
+    lets help run and is not rewritten. gh 2.102's `gh copilot` is built in
+    (the old extension cannot be installed over it): it downloads the
+    Copilot CLI on first use and runs it, or removes it with --remove, so
+    both need approval (and `gh extension install/remove/upgrade`); its
+    completion lists only its own flags. gh now writes
+    ~/.local/state/gh/device-id and reports usage on every command; probes
+    set GH_TELEMETRY=0 and the shared DO_NOT_TRACK=1. llm 0.36 is installed
+    with pipx, whose venv path has a space, so pip wrote its `#!/bin/sh` /
+    `'''exec' "<python>"` launcher instead of a shebang; console-script
+    identity and click's site-packages lookup now read that launcher
+    (unit fixture), and `llm logs --cout 3` repairs through click again.
+    API keys, tokens, and secrets (`--anthropic-api-key`, `--api-key
+    provider=KEY`, `--set-env NAME=VALUE`, `--*-token`, `--*-secret`) are
+    masked in --explain/--json. Installed check: the migration/AI check,
+    with aider, sgpt, gh copilot, llm, and Block's goose (no log, no gh
+    state, no key in the report).
 [ ] NOT DONE: Remote access and VPN: tmate, tsh (Teleport), openvpn,
     openconnect, wg-quick, zerotier-cli, netbird, sshuttle, and autossh
     (ssh, mosh, tailscale, wg, cloudflared, and boundary are in their
     entries). Requirements: profiles, peers, and nodes are resources;
     connecting or bringing a tunnel up or down changes network state and
     needs approval when the target changes. tsh is expected to use kingpin.
+    PARTIAL (2026-10-06, macOS, Homebrew): tsh (teleport 18.11.1) links
+    kingpin and cobra and is refused as ambiguous, so trusted help supplies
+    its commands and options; kingpin's `--[no-]forward-agent` notation is
+    now read as both spellings without a value. tctl (kingpin only) uses
+    kingpin completion under trusted completers and help. tsh's help
+    locked ~/.tsh/bin for managed client-tool updates; offline probes set
+    TELEPORT_TOOLS_VERSION=off, which stops that. netbird 0.80.0 (netbird
+    tap) is cobra; `netbird up/down` need approval. wg-quick (wireguard-
+    tools 1.0.20260223) reads its commands from the usage line's
+    `[ up | down | save | strip ]`; up/down need approval. openvpn 2.7.7,
+    openconnect 9.21, sshuttle 2.0.0, and autossh 1.4g use help and man
+    pages, and any changed argument of theirs needs approval (remote
+    gate). tmate 2.4.0 is tmux's command language; its commands (in the
+    man page) are not read, so only its options are known. A repaired tsh
+    node, cluster, or database (after ssh, scp, join, login, kube, db,
+    app, proxy) or --proxy/--cluster value needs approval. zerotier-one's
+    cask installs a root package and daemon: not installed (unverified).
+    Installed check: the git/TUI/remote check above.
 [ ] NOT DONE: Extend the safety gate for the destructive operations named
     in section 5B (disk formatting and wiping, user removal, shutdown,
     firewall flushes, server stops, certificate deletion, migration resets,
@@ -1905,6 +3058,39 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     flyway/liquibase/prisma/alembic/dbmate/knex/typeorm/Sequelize/Rails,
     restic/borg/borgmatic/duplicity/kopia/tmutil/tarsnap/rsnapshot,
     telepresence, WireGuard, tailscale/netbird/ZeroTier/nmcli/ip.
+    (2026-10-06, macOS) RabbitMQ's CLI tools: underscore operations that
+    delete, purge, clear, close, force, forget, reset, restart, stop,
+    evaluate code, import definitions, drain, shrink, rebalance, or move
+    leadership, plus rabbitmq-plugins enable/disable/set, need approval.
+    Known global option values are skipped; a parsed --help/-? is
+    read-only, while a --help consumed as an option value is not.
+    (2026-10-06) Kafka offset moves: kafkactl reset, kaf group commit, rpk
+    group seek, kafka-consumer-groups(.sh) --delete-offsets, and
+    --reset-offsets with --execute; global option values are skipped.
+    (2026-10-06, macOS) HashiCorp tools and OpenBao (see their entry):
+    mount disable/move, rollbacks, seal/rekey/step-down, snapshot restores,
+    job stops/reverts, drains, gc, force-leave, consul exec/lock/maint,
+    boundary session cancels, Go-style -force/-purge/-prune, and terraform/
+    tofu `apply -destroy`/`-replace` (equivalent to destroy and to forced
+    replacement), force-unlock, taint, state push/replace-provider, and
+    `packer build -force` need approval. Go flags are recognized with one
+    or two dashes and with =values; known option values are skipped; help
+    flags make the line read-only; `plan -destroy` and `-prune-retain`
+    without -prune are allowed.
+    (2026-10-06, macOS) direnv allow/permit/grant/edit/exec, stow -D, and
+    repaired chezmoi/stow targets (dotfile entry above) need approval.
+    (2026-10-06, macOS) gpg --delete-*, ssh-keygen -R, clamscan
+    --remove/--move/--copy, and repaired scanner targets (nikto hosts,
+    trufflehog repositories) need approval; target comparison now uses
+    every word of the original command, so a misspelled option name that
+    preceded the same target does not count as a change.
+    (2026-10-06, macOS) git-extras/git-branchless history rewrites and
+    discards, `git absorb --and-rebase`, and repaired tsh connection
+    targets need approval (git TUI and remote access entries).
+    (2026-10-06, macOS) knex migrate:rollback/down (the old rule expected
+    two words), goose down/down-to/reset/redo, golang-migrate
+    down/force/goto, changed archiver and compressor targets, and archive
+    overwrite flags need approval (migration and archive entries).
     (2026-10-05) AWS CDK's `--require-approval never` (separate or with
     `=`) is treated like -auto-approve: it skips the tool's own
     confirmation, so a correction producing it needs approval.
@@ -1982,6 +3168,8 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     (--get-yargs-completions), oclif's autocomplete, kingpin/fisk
     (--completion-bash), `nmcli --complete-args`, and
     `rabbitmqctl autocomplete`.
+    (2026-10-07) clang's `--autocomplete=` is bridged too; see the
+    compilers entry.
     Record each protocol's offline behavior and capabilities before auditing
     any app that uses it. clap's bridge takes the variable name and argument
     layout from the app's generated script (`sofka completion zsh` runs
@@ -2270,6 +3458,38 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     fixtures), rustfmt, host Clippy, and all-target/all-feature Clippy for
     Windows GNU/MSVC, FreeBSD, and Linux musl pass; the four opt-in
     installed checks still pass.
+    PARTIAL (2026-10-05, macOS): Click now reads zsh_complete's three-line
+    records without starting zsh. Literal spaces, quotes, shell operators,
+    commas, Unicode, and slash-containing plain values survive; file/dir
+    requests still contribute no candidates. Descriptions reach edits and
+    reports. Click 8.2.2+ escapes described colons, unlike 8.1.8; ambiguous
+    backslash-colon bytes are checked against a separate literal bash_complete
+    answer. Both layouts are memoized per request and share the same probe
+    limits. Mismatched lists fail closed. Multiline descriptions (OCI's
+    option help) break zsh's framing, so a separately validated Bash reply
+    supplies literal words without descriptions. Invalid framing/types in
+    both formats, UTF-8 failures, exits, timeouts, controls, and limits
+    cannot introduce unvalidated candidates.
+    The format does not identify enum choices versus callback resources.
+    Every plain replacement needs confirmation except a root command named
+    in the app's own trusted help. Installed-script-only command evidence
+    is partial and no longer authorizes -y repairs automatically. This
+    conservative policy also applies to fixed enum choices and nested
+    commands until their roles can be established. Options remain ordinary
+    vocabulary. Click probes stay offline even when network completion is
+    enabled; enabling live resource callbacks is not implemented.
+    Reproducible installed fixture: tests/data/click/cli.py, with
+    NOTYPO_TEST_CLICK_PYTHON selecting an existing Click 8 interpreter.
+    The 8.1.8 and 8.4.2 runs cover root/nested/option/argument/enum repairs,
+    literal spaces, Unicode, operators, colons and backslashes, ignored
+    file/dir requests, bool flags, help/completer trust, extensions on the next
+    request, request-only caching, descriptions, and denied -y resource
+    repairs. Bash set-only round trips prove values retain their bytes
+    without executing them. Parameter and resource callbacks run under
+    trust, but operation markers remain absent. The regular CLI fixture
+    still reads an installed Bash script without sourcing it. Remaining:
+    option arity, fixed-choice/resource distinction, context-specific
+    command roles, and other Click app/version coverage.
     PARTIAL (2026-10-05): kingpin's completion flag implemented for
     gopkg.in/alecthomas/kingpin.v2, github.com/alecthomas/kingpin/v2, and the
     choria-io/fisk fork (src/engine/native/kingpin.rs), from the 2.4.0,
@@ -2298,11 +3518,32 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     cover levels, flags, aliases, the private directory, positional words,
     `@file` words, help trust by name and identity, usage text, failures,
     and discovery/ambiguity. Real-library runs repaired root, nested,
-    alias, nested-flag, and global-flag typos. No kingpin app (promtool,
-    amtool, kopia, trufflehog, logcli, nats) is installed here.
+    alias, nested-flag, and global-flag typos. At this stage no kingpin app
+    (promtool, amtool, kopia, trufflehog, logcli, nats) was installed here.
     Validation: 260 default tests (224 unit, 32 CLI, corpus, three rule
     fixtures), rustfmt, host Clippy, and Windows GNU/MSVC, FreeBSD, and
     Linux musl Clippy pass; the five opt-in installed checks pass.
+    PARTIAL (2026-10-05, macOS): real promtool 3.15.0, kopia 0.23.1,
+    and nats 0.5.0 (fisk 0.9.1) exposed a resource-callback boundary:
+    argument hints can open repositories, and a group's implicit default
+    command can invoke those hints too. `--help` does not reliably stop
+    default-command descent during completion in custom applications.
+    Command names now come from the app's context-sensitive help; native
+    completion is queried only for long option names with a final `--`.
+    Help removes flags from implicitly selected default commands and
+    resolves aliases without querying argument hints. Both queries include
+    the built-in help flag, which suppresses library default value setters;
+    application pre-actions still run in the private probe directory under
+    both trust settings. Flat and compact tree help layouts are supported,
+    including Kopia's annotated command heading. Explicit program paths
+    accept help trust by basename, and live resource queries stay disabled.
+    tests/data/kingpin contains a reproducible kingpin 2.4.0 fixture with
+    root and nested defaults, resource-hint and operation markers, a file-
+    opening default, aliases, and extension registration. The opt-in test
+    proves that hints, operations, and default file setters never run, no
+    original option values or response-file words reach probes, and a new
+    request sees the extension. Ordinary values/resources remain unverified;
+    lists stay partial, so completion alone requires confirmation.
     PARTIAL (2026-10-05): .NET SDK's `dotnet complete` bridge implemented
     in src/engine/native/dotnet.rs. SDK installer receipts, dependency
     manifests, and completion symbols identify the host without executing
@@ -2560,11 +3801,78 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     name the app's identity (`python:oci_cli`), as trusted_completers
     entries may, for the help provider too (unit fixture with a real
     Python console script). Verified with oci-cli 3.94.1 (5A record).
-    Remaining protocols (2026-10-05): Symfony Console's `_complete` (no PHP
-    here), dnf's helper, `flatpak complete`, `nmcli --complete-args`, and
-    `rabbitmqctl autocomplete` (Linux tools), `winget complete` (Windows),
-    and NIX_GET_COMPLETIONS (nix is not installed). None can be checked
-    against a real implementation on this macOS machine.
+    PARTIAL (2026-10-05, macOS only): Symfony Console's `_complete` bridge
+    (src/engine/native/symfony.rs) is implemented. It discovers a trusted
+    PHP script from its own help, then verifies the hidden _complete
+    command's JSON definition before invoking the protocol. Commands,
+    options (including negatable long names), and values come from native
+    completion; JSON command help annotates option arity only. Global
+    options do not consume the following command, and namespaced command
+    abbreviations and aliases are left valid. Literal values with spaces,
+    quotes, operators, Unicode, or slashes are quoted by the edit layer;
+    control characters, non-UTF-8, failed, and over-limit answers fail.
+    Values need confirmation because the wire format cannot identify enums
+    separately from resources. App/extension upgrades are visible on the
+    next request; no answers are cached on disk, and replacing the script
+    or interpreter after discovery invalidates its backend.
+    Completion requires trusted_completers and trusted_help. Project code
+    follows trusted_workspaces. Composer stays offline, with --no-scripts;
+    plugins remain available under that trust rather than being suppressed.
+    Existing explicit executable paths (./artisan, bin/console) now use the
+    same providers as PATH programs. The php <script> form, including
+    non-executable scripts without shebangs, uses the resolved interpreter;
+    versioned and absolute PHP names work, and interpreter/script caches
+    are separate from each other and from PATH executables. Interpreter
+    options before the script (-d, -c, etc.) are not yet bridged.
+    Real checks: Composer 2.10.3 with PHP 8.5.11; Symfony Console 5.4.47
+    and 7.4.20 with isolated app commands, values, aliases, abbreviations,
+    quoted values, upgrade, and trust/refusal fixtures; Laravel 13.34.0
+    (Symfony Console 8.1.8), with php artisan route:list, migrate --pretend,
+    migrate:fresh, and a project-defined command. Marker callbacks never
+    run, including when a valid project command is inspected. The safety
+    gate covers Laravel/Doctrine resets and migrations, and interpreted
+    Composer package operations, without treating names after list or
+    global option values as operations. Drush and WP-CLI remain unverified.
+    Installations and versions are recorded in plan/app.txt.
+    PARTIAL (2026-10-06, macOS only): RabbitMQ CLI bridge
+    (src/engine/native/rabbitmq.rs). Discovery reads files only: the
+    `run_escript` script, its sibling rabbitmq-env, and the escript of the
+    same name in ../escript, through at most Homebrew's one-line exec
+    wrapper; identity is rabbitmq:<tool>. The framework's `autocomplete`
+    takes one word: a command prefix, or after `--` an option prefix
+    answered with every global switch. It never lists command switches, an
+    empty prefix answers nothing, and rabbitmq-streams/rabbitmq-upgrade
+    lack it. Commands therefore come from the root `help` (core plus enabled
+    plugins, with descriptions), validated by its usage line, group
+    headings, and closing hint. Global switches come from
+    `autocomplete -- --` when the tool lists it. Command options come from
+    `help <command>`: usage brackets give arity (`--x <v>`, `--a|-b`,
+    `--x=<a|b>`), and documented options add descriptions. Only listed
+    command words reach help. Command lists are complete unless an aliases
+    file is configured; option lists are partial; values/resources are
+    never completed. Each probe sources rabbitmq-env.conf and starts an
+    Erlang VM that loads enabled plugins, so both trusted_completers and
+    trusted_help are required. Probes run in a private directory that is
+    also HOME (the VM creates .erlang.cookie there) with crash dumps and
+    ERL_AFLAGS/ERL_ZFLAGS disabled; no node is contacted. Answers are
+    request-local.
+    Coverage: five unit tests with a layout-faithful fixture (identity,
+    trust, arity, private HOME/cwd, memoization, foreign/failed output,
+    unlisted commands) and an opt-in check of all six installed tools.
+    The broker's rabbitmq-server script, beside them, is never identified,
+    so it cannot be started for help.
+    Real RabbitMQ 4.3.6 runs: ten repairs; protected operations need
+    approval; arguments and option values stay unchanged. Debian/RPM
+    wrappers (su to the rabbitmq user) and Windows .bat files are not
+    identified, and are unverified here. Positional choices documented in
+    help (list_queues columns) and `<a | b>` value placeholders remain
+    unused.
+    Remaining protocols (2026-10-06): dnf's helper, `flatpak complete`, and
+    `nmcli --complete-args` (Linux tools), `winget complete` (Windows), and
+    NIX_GET_COMPLETIONS (nix is not installed; its macOS installer needs a
+    root-owned /nix volume). None can be checked against a real
+    implementation on this macOS machine without such installation;
+    non-macOS runtime checks remain deferred by the owner.
 [ ] NOT DONE: Extend tests/installed_clis.rs (--ignored) with one typo per
     installed 5B tool, and keep a per-tool record of discovery, protocol,
     trust policy, and verified version. Tools missing locally are reported
@@ -2671,6 +3979,145 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     llm) and NOTYPO_TEST_PWSH/NOTYPO_TEST_AWS_V1 set, all eleven opt-in
     tests pass. Validation: 355 default tests (308 unit, 43 CLI, corpus,
     three rule fixtures), rustfmt, and macOS Clippy pass.
+    PARTIAL (2026-10-05, macOS only): thirteen opt-in tests now pass,
+    including a Symfony fixture and an isolated Laravel check. The shared
+    list repairs 54 typos across 40 installed apps, including Composer
+    command, option, and value cases. Docker is explicitly excluded with
+    NOTYPO_TEST_SKIP_CLIS=docker; it is not probed or run. No missing app
+    is counted as passed; the needed CLI installs, portable PowerShell,
+    Symfony versions, and Laravel are recorded in plan/app.txt. Additional
+    coverage runs the Symfony fixture with 5.4.47 and 7.4.20; Laravel
+    13.34.0 supplies the 8.1.8 runtime. All three test sets verify that
+    discovery/print-only correction does not run operation callbacks.
+    Validation: 364 default tests (317 unit, 43 CLI, corpus, three rule
+    fixtures; PowerShell checks enabled), rustfmt, macOS Clippy, release
+    build, package verification, and publish --dry-run pass. No Linux,
+    Windows, FreeBSD, or Docker runtime or cross-target checks were run.
+    PARTIAL (2026-10-05, macOS): fourteen opt-in checks now pass, including
+    the real kingpin default-command/resource-callback fixture. The shared
+    list repairs 62 typos across 43 installed apps, adding promtool 3.15.0,
+    kopia 0.23.1, and nats 0.5.0. Commands come from each app's own help;
+    option edits use its native completion and are checked against help.
+    Aliases work, partial lists ask for confirmation, and NATS stream
+    removal also requires the destructive-operation safety gate. No missing
+    app is skipped; Docker remains explicitly excluded and is never invoked.
+    The installs and the reused offline Go fixture toolchain are recorded
+    in plan/app.txt. Other clients in the inventory remain unverified.
+    Validation: 365 available default tests pass (318 unit, 43 CLI,
+    corpus, three rule fixtures), with PowerShell enabled, plus benchmark
+    smoke checks. The full --all-targets run encounters one sandbox block:
+    reads_matching_record_from_socket fails at UnixListener::bind with
+    EPERM before exercising the reader. A standalone macOS socket bind
+    reproduces that restriction; the passing run explicitly skips only
+    that test and does not count it as passed. Formatting, macOS Clippy,
+    release build, and offline package verification pass. No foreign
+    targets, Docker, services, or cloud writes were executed.
+    PARTIAL (2026-10-05, macOS): sixteen opt-in checks pass, adding real
+    Click 8 fixtures and an isolated Flask application. The shared list
+    still checks 62 typos across 43 apps, including SAM and OCI with the
+    updated descriptions/literal-value bridge. The serial installed run
+    (--test-threads=1) avoids contention against the three-second probe
+    limit; two earlier concurrent checks timed out (CDK and AWS CLI v1).
+    The passing run has no missing-client skips; Docker is explicitly
+    excluded. LLM's broken dependency is separately recorded as unverified.
+    Available default tests: 369 pass (322 unit, 43 CLI, corpus, three
+    rule fixtures), plus benchmark smoke checks, with PowerShell enabled.
+    The one socket-binding test is explicitly filtered because the macOS
+    sandbox rejects UnixListener::bind with EPERM; it is not counted as
+    passed. Formatting, macOS Clippy, and release build pass. Click 8.1.8
+    and 8.4.2 fixture runs pass; Bash round trips and operation markers
+    verify that literal completions are quoted and operations are not run.
+    No Linux, Windows, FreeBSD, or Docker runtime or cross-target checks
+    were run. Other inventory clients and protocol limits remain open.
+    PARTIAL (2026-10-06, macOS): PowerShell parameter callback checks pass
+    with portable PowerShell 7.6.6. The available default run initially
+    passed 374 tests (327 unit, 43 CLI, corpus, three rule fixtures) and all
+    seventeen then-present opt-in checks passed serially with the scratch
+    installs and fixture variables, including the real .NET SDK. Later
+    workspace changes add further clients/checks: the current default run
+    passes 400 tests (353 unit, 43 CLI, corpus, three rule fixtures), with
+    26 installed checks opt-in. The socket-binding test remains explicitly
+    excluded because of the previously reproduced sandbox EPERM, and is
+    never counted as passed. Current macOS Clippy/release validation is
+    recorded with the comparison below. No foreign targets or Docker ran.
+    PARTIAL (2026-10-06, macOS): installed_rabbitmq_repairs_commands_and_
+    options_from_its_own_help covers RabbitMQ 4.3.6's six CLI tools in an
+    isolated HOME/config/cache: untrusted settings make zero probes; ten
+    repairs (commands, help arguments, global and command options) report
+    rabbitmq completion with command descriptions; complete command lists
+    decide, partial option lists ask; delete/purge/plugin/drain repairs
+    require approval; arguments and option values stay unchanged; no Erlang
+    cookie or crash dump reaches HOME or the working directory.
+    The shared list adds kaf, kafkactl (cobra), and rabbitmqadmin (zsh
+    handler) cases, with deletion repairs requiring approval; the help
+    fallback list adds nats-server. Clients installed earlier under /tmp
+    (eas, sam, oci, heroku, nats, cdk) were not on PATH in this run and
+    were reported as skipped, not passed.
+    Validation: 382 default tests (335 unit, 43 CLI, corpus, three rule
+    fixtures), rustfmt, macOS Clippy, and release build pass. No Linux,
+    Windows, FreeBSD, Docker, or cross-target checks were run.
+    PARTIAL (2026-10-06, macOS): installed_hashicorp_clients_repair_typos_
+    without_servers_or_token_helpers covers vault, bao, nomad, consul,
+    boundary, waypoint, terraform, and packer (22 repairs; destructive
+    repairs need approval) with every server address naming a live listener
+    and vault's configuration naming a marker token helper: zero
+    connections, no helper run. Valid arguments missing from predictor
+    lists (vault engine names, terraform workspaces) produce no candidates.
+    All nineteen opt-in tests pass serially.
+    PARTIAL (2026-10-06, macOS): installed_backup_and_dotfile_tools_repair_
+    typos_without_opening_repositories covers restic, rclone, chezmoi (cobra,
+    audited), borg and tarsnap (bash handlers), stow (zsh's `_stow`),
+    borgmatic, duplicity, tmutil, direnv, dotbot, and yadm (trusted help):
+    twenty repairs with their decided/asked and approval outcomes, a real
+    encrypted borg repository that gains no lock file, a marker password
+    command for borg/restic/rclone that never runs (including against an
+    encrypted rclone configuration), and a listening address no probe
+    reaches. With the earlier scratch installs on PATH (cdk, sam, oci,
+    heroku, nats, eas) and NOTYPO_TEST_PWSH, _CLICK_PYTHON, _KINGPIN_FIXTURE,
+    _LARAVEL_DIR, _SYMFONY_AUTOLOAD, and _AWS_V1 set, all twenty opt-in tests
+    pass serially; only the .NET check reports itself unverified (no SDK),
+    and docker is excluded by NOTYPO_TEST_SKIP_CLIS. Validation: 344 unit,
+    43 CLI, corpus, and three rule fixture tests; rustfmt and macOS Clippy.
+    PARTIAL (2026-10-06, macOS): five more opt-in checks: security tools
+    and secret managers, CI/CD and Kubernetes development tools, git
+    helpers/TUIs/remote access, migration tools and AI assistants
+    (NOTYPO_TEST_MIGRATION_PATH, prepended, names scratch npm/pip installs),
+    and network/service tools. With the scratch installs and fixture
+    variables set, 25 of 25 opt-in tests pass serially except where a tool
+    is absent: the .NET SDK (installed into the session scratchpad with
+    dotnet-install.sh, its check passed, then removed to free disk) and
+    knex/typeorm (scratch npm install removed for disk space) report
+    themselves unverified; docker is excluded. The disk filled once during
+    installs (npm: ENOSPC); this task's cached Homebrew downloads (3 GiB)
+    and scratch directories were removed. Validation: 352 unit, 43 CLI,
+    corpus (5 s, was 66 s before the bash registration index), and three
+    rule fixture tests; rustfmt and macOS Clippy.
+    PARTIAL (2026-10-06, macOS): restored prerequisites for the full installed
+    suite. The official .NET SDK 10.0.401 osx-arm64 archive was checked
+    against Microsoft's published SHA-512 and extracted to
+    ~/.local/share/notypo/dotnet, with ~/.local/bin/dotnet linking to it.
+    Knex 3.3.0 and Alembic 1.20.0 were restored to the existing scratch npm
+    prefix and Python virtualenv. LLM 0.31.1 in that virtualenv imported
+    `httpx` despite its dependencies now installing `httpx2`; installing
+    httpx 0.28.1/httpcore 1.0.9 restores --help/--version. Mako 1.4.3 and
+    SQLAlchemy 2.1.3 are Alembic's restored dependencies. New dependency
+    names are appended in app.txt; the three application names were already
+    listed. These are macOS installations; no service was started.
+    Validation after positional binding (2026-10-06, macOS): all 26 opt-in
+    installed checks pass serially with the scratch installs and fixture
+    variables, including the restored SDK, migration tools, and LLM.
+    Docker is explicitly excluded; there are no missing-tool skips in that
+    run. The AWS v1 variable names /tmp/notypo-aws-v1/bin (a directory),
+    not its aws executable. Current default checks pass all 404 tests
+    (357 unit, 43 CLI, corpus, three rule fixture tests) plus both benchmark
+    smoke runs. The socket-binding test now runs and passes; no test is
+    filtered. After the final incomplete-parameter context guard, the real
+    PowerShell installed check and default suite pass again. Formatting,
+    macOS all-target/all-feature Clippy, release build, package verification,
+    and publish --dry-run --allow-dirty --locked pass. The 103-file archive
+    includes PowerShell source and fixtures and excludes plan/benchmarks/
+    benches. No crate is uploaded. No Docker, foreign runtime, or foreign
+    cross-target check is run; provider/closure/app inventory work stays open.
 
 6. CONTROL PROBES, CACHES, AND LATENCY
 
@@ -2681,6 +4128,13 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     separately from the bounded answer descriptor.
     engine::probe; probes run one at a time. Legacy rules keep their own
     subprocess helpers.
+    (2026-10-06, macOS) Probes without ZLE's private terminal now start a
+    new session (setsid) instead of only a new process group, so they have
+    no controlling terminal: a program that opens /dev/tty for a passphrase
+    (borg, ssh, gpg, rclone) fails at once instead of printing on the
+    user's terminal and stopping until the timeout. Process-tree cleanup
+    still signals the child's process group. Unit fixture, run under a real
+    pseudo-terminal: before the change the probe opened /dev/tty.
 [x] DONE: Spawn programs with explicit argument arrays; never interpolate
     candidate text into a discovery shell command.
 [x] DONE: Allow audited built-in probes under a defined trust policy;
@@ -2905,6 +4359,9 @@ executes it once. Aborting or a denied safety decision executes nothing.
     (2026-10-05: native completers' TabExpansion2 answers are covered: real
     pwsh fixtures, tests/cli.rs, and the opt-in rustup/mdbook/elan/dua
     check; parameter-value completers of PowerShell commands are not.)
+    (2026-10-06: named parameter callbacks now have unit and real installed
+    PowerShell coverage, including literal/resource/enum values and
+    mid-command context. The protocol limits above remain open.)
 [x] DONE: Verify context separation and graceful outcomes for absent CLIs,
     absent completers, expired credentials, offline mode, denied API reads,
     extension changes, and slow or malformed completion output.
@@ -2943,6 +4400,28 @@ executes it once. Aborting or a denied safety decision executes nothing.
     benchmarks/compare.py/results.md compare the default pipeline
     with Python thefuck 3.32 (6-33x faster, 6.8 MiB vs 40.5 MiB). Remaining
     shell/protocol paths and provider-stage measurements are still pending.
+    PARTIAL (2026-10-06, macOS): the current release comparison is saved in
+    benchmarks/current-comparison.json/.md. Twenty fresh processes per cell,
+    three warmups, randomized case/order, identical environment/history,
+    and every expected correction checked. Common corrections are 4.0-13.9x
+    faster than local Python thefuck 3.32; help startup is 32.6x faster.
+    Captured Git typo: 30.52 vs 266.34 ms; mkdir parent repair: 20.37 vs
+    279.28 ms; missing executable: 68.09 vs 299.71 ms. Five wait4 RSS samples
+    give Rust 8.66 MiB vs Python 40.72 MiB (about 4.7x), with OS-dependent
+    child accounting rather than aggregate process-tree memory. These are
+    warm-filesystem local CLI fixtures, not a broad correction-accuracy or
+    cloud-completer comparison. Generic native completer startup remains
+    separately measured in benchmarks/protocol-results.md.
+    The benchmark environment was recreated locally from cached compatible
+    wheels; setuptools 84 supplies upstream's distutils on Python 3.14.
+    The old /usr/bin/time -l memory method and CPU-brand sysctl are denied
+    in this sandbox. The harness now uses wait4 and platform.processor();
+    no approval bypass or upstream-source modification was used. Dependency
+    names are recorded in plan/app.txt, retaining its current simple format.
+    Current checks: 400 available default tests, 31 focused PowerShell unit
+    tests and the installed parameter callback fixture, rustfmt, macOS
+    Clippy, and release build pass. The Unix socket test remains filtered;
+    Windows/Linux/FreeBSD/Docker runtime or cross-target checks were not run.
     PARTIAL (2026-10-05): benchmarks/structured.py --protocols measures the
     newer bridges against installed apps (11 processes per mode, median ms
     cold/warm, macOS): pip 230/230, npm 181/181, cargo 74/74, clap sofka
@@ -2965,11 +4444,71 @@ executes it once. Aborting or a denied safety decision executes nothing.
     peak RSS, the child PowerShell's). structured.py --protocols builds the
     session variable with the integration function's own code; rows are in
     benchmarks/protocol-results.md.
+    PARTIAL (2026-10-06, macOS): named PowerShell parameter callback
+    correction uses two probes (metadata and callback), with 15 samples
+    per mode. Median cold/warm 751.821/699.909 ms, p95 811.329/736.558 ms,
+    peak RSS 154.6 MiB. The fixture is captured by the shell integration;
+    PowerShell binds the preceding scope to select the resource value.
+    Every suggestion is checked and never executed; resource edits require
+    confirmation. No authenticated resource lookup is measured.
+    PARTIAL (2026-10-06, macOS): positional PowerShell callback correction
+    with a later named argument uses three request-local probes (metadata,
+    static binding, callback). With 15 samples per mode, median cold/warm
+    903.587/870.335 ms, p95 908.931/1015.021 ms, peak RSS 155.6 MiB.
+    PowerShell 7.6.6 selects Target in `Get-NotypoBench wesst-one -Scope
+    west` and the callback sees Scope=west. Every corrected value is checked,
+    needs confirmation, and is never executed. The row and reproduction
+    are in benchmarks/protocol-results.md; no authenticated lookup is timed.
+    Latest optimized macOS stage run (20 batches): nested two-typo
+    correction 0.961/0.968 ms median/p95, executable-typo correction
+    1.869/1.886 ms, valid-command inspection 0.0254/0.0258 ms. Known-program
+    work remains below the existing ~2 ms budget.
+    PARTIAL (2026-10-05, macOS): Symfony Console/Composer option repair is
+    655/645 ms cold/warm median (11 processes per mode), 1052/699 ms p95,
+    five probes in both modes, 35.8 MiB peak RSS. Probes verify native
+    completion metadata and annotate option arity from JSON help; replies
+    are request-local. The result is in benchmarks/protocol-results.md.
+    The optimized macOS stage benchmark passes after this bridge: nested
+    two-typo correction 0.963/0.965 ms median/p95, valid-command inspection
+    0.0256/0.0260 ms, and executable-typo correction 6.03/6.20 ms. The last
+    case includes installed executable discovery rather than only ranking.
+    PARTIAL (2026-10-05, macOS): kingpin checks use 15 cold/warm processes
+    per mode. Median ms cold/warm: promtool 106/96, Kopia 126/119, NATS
+    (fisk) 66/61; p95 522/116, 132/120, and 72/64 ms respectively. All
+    use four request-local probes and repeat them when warm. Peak RSS is
+    53.8/35.9/28.8 MiB. Results and callback limits are recorded in
+    benchmarks/protocol-results.md; no corrected operation is executed.
+    PARTIAL (2026-10-05, macOS): Click timings use 15 samples per mode.
+    SAM CLI 1.166.2/Click 8.1.8: median 1721/1712 ms cold/warm, p95
+    1761/1798 ms, four probes, peak RSS 108.2 MiB. OCI CLI 3.94.1/Click
+    8.4.2: median 3156/3173 ms, p95 3542/3530 ms, nine probes, 94.1 MiB.
+    Both use simulated shell-captured failure context (TF_HISTORY/status 1)
+    with replay disabled; OCI needs trusted help to establish the command
+    path because its root completion exits 1. Its option edit comes from
+    native completion, with Bash replies handling multiline descriptions.
+    Warm requests repeat probes; startup dominates. Neither operation runs.
+    Results and reproduction are in benchmarks/protocol-results.md and
+    benchmarks/structured.py --protocols --case Click.
+    PARTIAL (2026-10-06, macOS): RabbitMQ 4.3.6 with 15 samples per mode.
+    Command repair: median 530/531 ms cold/warm, p95 900/539 ms, one probe.
+    Option repair: median 1444/1442 ms, p95 1473/1530 ms, three probes.
+    Peak RSS 99.5 MiB. Each probe starts an Erlang VM; answers stay in
+    request memory, so warm runs repeat them. Reproduce with
+    benchmarks/structured.py --protocols --case RabbitMQ.
+    PARTIAL (2026-10-06, macOS): the probes added that day, 15 samples per
+    mode (median ms cold/warm, probes): vault (audited posener) 253/187,
+    4/3; helm (audited cobra, alias confirmation) 92/92, 3/3; restic
+    (cobra boolean-flag check) 222/195, 8/7; tmux through zsh's handler
+    1342/1337, 5/5 (was about 800 ms with 3 probes: each ZLE probe costs
+    about 270 ms). Arity probes are skipped when no argument follows the
+    option. Rows and notes in benchmarks/protocol-results.md.
 [x] DONE: Set latency/memory budgets from measurements; preserve the
     inexpensive common-command path and report quality/performance tradeoffs.
-    Engine work stays under ~2 ms per correction; probes are bounded by
-    probe_timeout (3 s each, 9 s total). Native completer startup remains the
-    dominant cost on the default pipeline; legacy rule evaluation is unchanged.
+    Known-program engine work stays under ~2 ms per correction; executable
+    typo correction also discovers installed programs (~6 ms in the latest
+    macOS stage run). Probes are bounded by probe_timeout (3 s each, 9 s
+    total). Native completer startup remains the dominant cost on the default
+    pipeline; legacy rule evaluation is unchanged.
 [x] DONE: Run cargo fmt --all -- --check; cargo test --locked --all-targets;
     cargo clippy --locked --all-targets --all-features -- -D warnings; and
     relevant benchmarks. Keep Linux Clippy verification in CI.
@@ -3002,6 +4541,27 @@ executes it once. Aborting or a denied safety decision executes nothing.
     Rechecked 2026-10-05 after the PowerShell completer bridge: 93 files,
     powershell_completer.rs included, plan/benchmarks/benches excluded; the
     packaged sources build (macOS). No crate was uploaded.
+    Rechecked 2026-10-05 after Symfony Console and interpreted PHP support:
+    94 files, symfony.rs included, plan/benchmarks/benches excluded; the
+    packaged sources build on macOS. Package verification and publish
+    --dry-run --allow-dirty --locked pass; no crate was uploaded.
+    Rechecked 2026-10-05 after the kingpin callback boundary: 97 files,
+    including the new Go fixture's source/manifest/checksums; protocol
+    modules included and plan/benchmarks/benches excluded. Offline package
+    verification builds the packaged sources on macOS. Publish --dry-run
+    needs an uncached registry HTTP lookup and cannot complete offline;
+    the online dry-run also fails because the sandbox cannot resolve
+    index.crates.io. No upload is attempted.
+    Rechecked 2026-10-05 after Click literal values/descriptions: 98 files,
+    including tests/data/click/cli.py, with plan/benchmarks/benches excluded.
+    Offline package verification builds the packaged sources on macOS
+    (2.2 MiB, 480.6 KiB compressed). The current shortened README is
+    preserved. Publish dry-run's previously verified registry-resolution
+    block remains; no upload is attempted.
+    Rechecked 2026-10-06 after the RabbitMQ CLI bridge: 103 files with
+    rabbitmq.rs and the earlier uncommitted PowerShell/shell modules and
+    fixtures; plan/benchmarks/benches excluded. Offline package verification
+    builds the packaged sources on macOS. No upload is attempted.
 [ ] NOT DONE: Complete default-engine rollout validation against corpus,
     execution policy, platform checks, and performance criteria. Retire migrated
     legacy paths gradually with documented compatibility behavior.

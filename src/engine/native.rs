@@ -14,7 +14,7 @@
 use super::probe::{self, Budget, Capture, Probe, ProbeError};
 use crate::shlex;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -22,6 +22,7 @@ use std::{env, fs};
 
 mod bash;
 mod cargo;
+mod clang;
 mod clap;
 mod click;
 mod dotnet;
@@ -37,6 +38,8 @@ mod oclif;
 mod pip;
 pub mod powershell;
 mod powershell_completer;
+mod powershell_values;
+mod rabbitmq;
 mod symfony;
 mod urfave;
 mod yargs;
@@ -109,6 +112,18 @@ pub struct Capabilities {
     pub trust: Trust,
 }
 
+/// What a list of words in a command's argument slot is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgumentList {
+    /// Predictions of a partial kind (vault's fixed engine names): the
+    /// typed word, which they lack, is an argument they never judge.
+    Unjudged,
+    /// Values offered again after any of them (make targets, dig's record
+    /// types, mtr's placeholders): judged, but a repair from them is a
+    /// resource the user must approve.
+    Resources,
+}
+
 /// Why notypo may run an app's completer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Trust {
@@ -120,6 +135,16 @@ pub enum Trust {
     Audited,
     /// `trusted_completers` names the app or its identity.
     UserTrusted,
+}
+
+/// Literal arguments retain whether quoting made a dash-prefixed word
+/// data rather than a parameter. The target word is omitted.
+#[derive(Clone, Copy, Debug)]
+pub struct ValueContext<'a> {
+    pub words: &'a [&'a str],
+    pub following: &'a [&'a str],
+    pub literal_arguments: (&'a [usize], &'a [usize]),
+    pub positional: bool,
 }
 
 pub trait NativeCompletionBackend: std::fmt::Debug {
@@ -157,6 +182,7 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
         _words: &[&str],
         _typed: &str,
         _next: Option<&str>,
+        _budget: &mut Budget,
     ) -> Option<bool> {
         None
     }
@@ -172,6 +198,11 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
     /// Only a protocol with a declared value grammar may interpret slashes
     /// as something other than paths or URIs.
     fn value_syntax_contains_slashes(&self, _words: &[&str]) -> bool {
+        false
+    }
+    /// A callback can depend on earlier bound arguments. Do not substitute
+    /// placeholders for expansions the shell has not evaluated.
+    fn values_require_literal_context(&self, _words: &[&str]) -> bool {
         false
     }
     /// Adapt a declared value list to compound values, preserving separators
@@ -211,6 +242,60 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
         self.complete(words, "", budget)
     }
 
+    /// Some binders inspect parameters after the slot being corrected too.
+    /// `following` contains those literal words, in their original order.
+    fn complete_values_with_following(
+        &self,
+        words: &[&str],
+        _following: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        self.complete_values(words, budget)
+    }
+
+    /// Positional arguments bound by the app, rather than subcommands.
+    fn supports_positional_values(&self) -> bool {
+        false
+    }
+
+    fn complete_value_context(
+        &self,
+        context: &ValueContext<'_>,
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        if context.positional {
+            self.complete_positionals_with_following(context.words, context.following, budget)
+        } else {
+            self.complete_values_with_following(context.words, context.following, budget)
+        }
+    }
+
+    fn complete_positionals_with_following(
+        &self,
+        _words: &[&str],
+        _following: &[&str],
+        _budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        Ok(Vec::new())
+    }
+
+    fn prepare_positional_value_candidates(
+        &self,
+        _context: &ValueContext<'_>,
+        _typed: &str,
+        items: Vec<CompletionItem>,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        Ok(items)
+    }
+
+    fn positional_candidate_is_resource(
+        &self,
+        _context: &ValueContext<'_>,
+        _item: &CompletionItem,
+    ) -> bool {
+        true
+    }
+
     /// The app's fixed values for that option, with resource lookups off,
     /// to tell enum values from resource names when lookups are on.
     fn complete_offline_values(
@@ -225,6 +310,27 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
     /// a command the app accepts (an alias or hidden name it doesn't list).
     /// `None` when the protocol can't tell.
     fn confirms(&self, _words: &[&str], _typed: &str, _budget: &mut Budget) -> Option<bool> {
+        None
+    }
+
+    /// Complete command lists that still omit aliases and hidden commands
+    /// (cobra's), so [`Self::confirms`] is worth asking about a word they
+    /// lack.
+    fn lists_omit_aliases(&self) -> bool {
+        false
+    }
+
+    /// Whether the words `listed` after `words` are the command's argument
+    /// predictions or values rather than its subcommands, for protocols that
+    /// answer both in one list. `None` when the protocol can't tell or the
+    /// words name subcommands.
+    fn lists_arguments(
+        &self,
+        _words: &[&str],
+        _typed: &str,
+        _listed: &[&str],
+        _budget: &mut Budget,
+    ) -> Option<ArgumentList> {
         None
     }
 
@@ -278,7 +384,7 @@ pub enum Flavor {
     Dotnet,
     /// Go apps built with urfave/cli: `app <commands> [-] <completion flag>`.
     Urfave,
-    /// Click 8 apps: `<VAR>=bash_complete` with COMP_WORDS/COMP_CWORD.
+    /// Click 8 apps: `<VAR>=zsh_complete` with COMP_WORDS/COMP_CWORD.
     Click,
     /// Go apps built with kingpin or fisk: `app --completion-bash <words>`.
     Kingpin,
@@ -290,8 +396,12 @@ pub enum Flavor {
     Oclif,
     /// Symfony Console apps (Composer, framework consoles): `app _complete`.
     Symfony,
+    /// RabbitMQ's CLI tools: `help` listings and `autocomplete -- --`.
+    RabbitMQ,
     /// Node.js's own option list, from `node --completion-bash`.
     Node,
+    /// The clang driver's `--autocomplete=<prefix>` (see [`clang`]).
+    Clang,
     /// A function registered by the app's bash completion script (opt-in).
     BashFunction,
     /// An installed fish completion script, using `complete --do-complete`.
@@ -316,9 +426,46 @@ const AUDITED_GO_APPS: &[(&str, Flavor)] = &[
     // Lists plugin commands by asking each installed CLI plugin for its
     // metadata, as `docker help` does.
     ("github.com/docker/cli/cmd/docker", Flavor::Cobra),
+    // Completion opens no repository and runs no password command; snapshot
+    // IDs are not completed.
+    ("github.com/restic/restic/cmd/restic", Flavor::Cobra),
+    // Its own command line is cobra; urfave/cli/v3 arrives through a
+    // dependency. Completion reads no source state: no templates, scripts,
+    // or hooks run.
+    ("chezmoi.io/chezmoi/v2", Flavor::Cobra),
+    // Completion lists remote names from the local configuration and never
+    // a remote's paths; decrypting an encrypted configuration would run
+    // the user's password command, which offline probes don't receive.
+    ("github.com/rclone/rclone", Flavor::Cobra),
+    // Its command line is cobra; go-flags arrives through a dependency.
+    // Outside a project its completion touches nothing; a devspace.yaml's
+    // command variables run, so projects need trusted_workspaces.
+    ("github.com/loft-sh/devspace", Flavor::Cobra),
+    // Completes no model names; never contacts or starts a model server.
+    ("github.com/ollama/ollama", Flavor::Cobra),
+    // caddycmd's cobra tree completes only command and flag names (no
+    // completion callbacks or pre-run hooks); urfave/cli arrives through
+    // smallstep. Module init only registers modules and reads CADDY_ADMIN.
+    ("github.com/caddyserver/caddy/v2/cmd/caddy", Flavor::Cobra),
     ("github.com/hashicorp/terraform", Flavor::Posener),
     ("github.com/hashicorp/packer", Flavor::Posener),
     ("github.com/opentofu/opentofu/cmd/tofu", Flavor::Posener),
+    // Their predictors ask the server (mounts, policies, jobs, ACL objects)
+    // and vault runs a configured token helper; the offline environment
+    // points every address at a missing socket and disables the helper.
+    ("github.com/hashicorp/vault", Flavor::Posener),
+    ("github.com/openbao/openbao/v2", Flavor::Posener),
+    ("github.com/hashicorp/nomad", Flavor::Posener),
+    ("github.com/hashicorp/consul", Flavor::Posener),
+    (
+        "github.com/hashicorp/boundary/cmd/boundary",
+        Flavor::Posener,
+    ),
+    // Archived at 0.11.4; its completion reads neither server nor project.
+    (
+        "github.com/hashicorp/waypoint/cmd/waypoint",
+        Flavor::Posener,
+    ),
 ];
 
 /// Raw probe answers within one run, keyed by the arguments that asked.
@@ -352,6 +499,8 @@ pub struct Backend {
     /// (Clippy limits `Discovery::Found`'s size on Windows targets).
     bridge: Option<Box<Bridge>>,
     memo: ProbeMemo,
+    /// cobra contexts whose answer let the shell complete files too.
+    cobra_files: Rc<RefCell<HashSet<Vec<String>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -359,6 +508,7 @@ enum Bridge {
     Yargs(yargs::Protocol),
     Oclif(oclif::Protocol),
     Symfony(symfony::Protocol),
+    RabbitMQ(rabbitmq::Protocol),
     /// A completion function the parent bash session defined in memory:
     /// its registration and the definitions from the same file.
     BashMemory(String),
@@ -410,6 +560,7 @@ impl Backend {
                 _ => Trust::UserTrusted,
             },
             memo: ProbeMemo::default(),
+            cobra_files: Rc::default(),
         }
     }
 
@@ -430,6 +581,13 @@ impl Backend {
     fn symfony(&self) -> Option<&symfony::Protocol> {
         match self.bridge.as_deref() {
             Some(Bridge::Symfony(protocol)) => Some(protocol),
+            _ => None,
+        }
+    }
+
+    fn rabbitmq(&self) -> Option<&rabbitmq::Protocol> {
+        match self.bridge.as_deref() {
+            Some(Bridge::RabbitMQ(protocol)) => Some(protocol),
             _ => None,
         }
     }
@@ -515,6 +673,7 @@ impl Backend {
                 | Flavor::Yargs
                 | Flavor::Oclif
                 | Flavor::Symfony
+                | Flavor::RabbitMQ
         ) {
             return None;
         }
@@ -657,6 +816,16 @@ pub fn discover_for_shell_with_budget(
     shell: crate::shells::Shell,
     budget: &mut Budget,
 ) -> Discovery {
+    // A compiler driver answering clang's protocol is clang under any name
+    // (macOS's cc and gcc); GCC rejects the request.
+    if clang::is_candidate(app_name(name))
+        && probe::is_trusted_location(path)
+        && clang::confirms(path, offline_env(Flavor::Clang), budget)
+    {
+        let mut backend = Backend::new(Flavor::Clang, app_name(name), path.to_owned());
+        backend.trust = Trust::Bridge;
+        return Discovery::Found(backend);
+    }
     let mut found = discover_for_shell(name, path, trusted, shell);
     if let Discovery::Found(backend) = &mut found
         && let Some(protocol) = &mut backend.cargo
@@ -698,6 +867,19 @@ pub fn discover_for_shell_with_budget(
         }
         return found;
     }
+    if let Discovery::Found(backend) = &mut found
+        && let Some(Bridge::RabbitMQ(protocol)) = backend.bridge.as_deref_mut()
+    {
+        protocol.trusted_help = trusted_help.to_vec();
+        let protocol = protocol.clone();
+        if !protocol.allowed(backend) {
+            return Discovery::NotTrusted(format!(
+                "{} is a RabbitMQ CLI tool, whose help starts the Erlang VM and loads plugins; add it to trusted_help as well to use it",
+                described(&backend.name, backend.identity.as_deref())
+            ));
+        }
+        return found;
+    }
     if !matches!(
         &found,
         Discovery::None
@@ -718,9 +900,20 @@ pub fn discover_for_shell_with_budget(
         Discovery::Found(backend) => backend.identity.clone(),
         _ => identity::identify(path),
     };
-    if !identity::is_trusted(trusted, app_name(name), app_identity.as_deref()) {
+    if !identity::is_trusted(trusted, name, app_identity.as_deref())
+        && !identity::is_trusted(trusted, app_name(name), app_identity.as_deref())
+    {
         return found;
     }
+    // Trusting a shell handler doesn't authorize starting its application to
+    // ask for help. Use the established help-probe permission separately.
+    let helped = !runs_on_long_help(name, path)
+        && trusted_help.iter().any(|trusted| {
+            trusted == "*"
+                || trusted == name
+                || trusted == app_name(name)
+                || Some(trusted) == app_identity.as_ref()
+        });
     // Prefer a direct bridge for installed dynamic scripts; no shell needs to
     // load or execute their registration code.
     if let Discovery::Found(backend) = &found
@@ -732,7 +925,12 @@ pub fn discover_for_shell_with_budget(
                 clap::backend(name, path, app_identity, protocol).with_helper(script.clone()),
             );
         }
-        if let Some(protocol) = click::Protocol::from_script(&text, name, path) {
+        if let Some(mut protocol) = click::Protocol::from_script(&text, name, path) {
+            // Root commands from trusted help are commands, not values that
+            // might name resources (mkdocs's bash script).
+            if helped {
+                protocol.read_root_commands(path, budget);
+            }
             return Discovery::Found(
                 click::backend(name, path, app_identity, protocol).with_helper(script.clone()),
             );
@@ -773,11 +971,6 @@ pub fn discover_for_shell_with_budget(
     {
         return found;
     }
-    // Trusting a shell handler doesn't authorize starting its application to
-    // ask for help. Use the established help-probe permission separately.
-    let helped = trusted_help
-        .iter()
-        .any(|trusted| trusted == "*" || trusted == name || Some(trusted) == app_identity.as_ref());
     // A Python console script may be a click app; its help says so. Python
     // apps don't generate clap scripts.
     let generated = if !helped {
@@ -818,6 +1011,71 @@ pub fn discover_for_shell_with_budget(
                 .unwrap_or_else(|| Discovery::Unavailable(format!("completion metadata: {error}"))),
             other => other,
         },
+    }
+}
+
+/// Programs that don't reject `--help` but go on to run: Apache's httpd
+/// starts the server, and apachectl hands words it doesn't know to httpd.
+/// No discovery asks them `--help`; their help comes only from the short
+/// flag their own man page documents.
+pub(crate) fn runs_on_long_help(name: &str, path: &Path) -> bool {
+    let apache = |name: &str| {
+        matches!(
+            app_name(name),
+            "httpd" | "apache2" | "apachectl" | "apache2ctl"
+        )
+    };
+    apache(name)
+        || [Some(path.to_owned()), fs::canonicalize(path).ok()]
+            .into_iter()
+            .flatten()
+            .any(|path| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(apache)
+            })
+}
+
+/// A literal PHP script, recognized without importing it.
+pub(crate) fn is_php_file(path: &Path) -> bool {
+    symfony::is_php_file(path)
+}
+
+pub(crate) fn is_php_interpreter_name(name: &str) -> bool {
+    let name = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    name == "php"
+        || name.strip_prefix("php").is_some_and(|version| {
+            version.starts_with(|c: char| c.is_ascii_digit())
+                && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
+}
+
+/// `php artisan` and `php bin/console`: metadata and completion use the
+/// same interpreter as the original line, never execute its operation.
+pub(crate) fn discover_php_script(
+    name: &str,
+    script: &Path,
+    interpreter: &Path,
+    trusted: &[String],
+    trusted_help: &[String],
+    budget: &mut Budget,
+) -> Discovery {
+    if !probe::is_trusted_location(script) || !probe::is_trusted_location(interpreter) {
+        return Discovery::Unavailable("PHP completion requires absolute resolved paths".into());
+    }
+    let permitted = |entries: &[String]| {
+        identity::is_trusted(entries, name, None)
+            || identity::is_trusted(entries, app_name(name), None)
+    };
+    if !permitted(trusted) || !permitted(trusted_help) {
+        return Discovery::NotTrusted(format!(
+            "PHP script {name} needs both trusted_completers and trusted_help to boot its completion application"
+        ));
+    }
+    match symfony::discover_with_interpreter(script, Some(interpreter), budget) {
+        Ok(Some(protocol)) => Discovery::Found(symfony::backend(name, script, None, protocol)),
+        Ok(None) => Discovery::None,
+        Err(error) => Discovery::Unavailable(error.to_string()),
     }
 }
 
@@ -1035,6 +1293,17 @@ fn discover_protocol(
             ))
         };
     }
+    // RabbitMQ's installed scripts name the tool; reading them runs nothing.
+    if let Some(tool) = identity.and_then(|identity| identity.strip_prefix("rabbitmq:")) {
+        return if identity::is_trusted(trusted, name, identity) {
+            Discovery::Found(rabbitmq::backend(name, path, tool.to_owned()))
+        } else {
+            Discovery::NotTrusted(format!(
+                "{} supports RabbitMQ CLI completion; add it to trusted_completers to use it",
+                described(name, identity)
+            ))
+        };
+    }
     if identity == Some("rust:cargo") {
         return if identity::is_trusted(trusted, name, identity) {
             found(Flavor::Cargo, path.to_owned())
@@ -1121,11 +1390,24 @@ enum GoRefusal {
     Ambiguous(String),
 }
 
+/// Builds whose command line is a library's, under a main module name that
+/// doesn't identify one app: xcaddy names every Caddy build's main module
+/// `caddy`, whatever plugins it adds (Homebrew's caddy is one). The library
+/// settles the protocol; trust still comes from trusted_completers.
+const GO_COMMAND_LIBRARIES: &[(&str, &str, Flavor)] =
+    &[("caddy", "github.com/caddyserver/caddy/v2", Flavor::Cobra)];
+
 fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Flavor, GoRefusal> {
     let audited = AUDITED_GO_APPS
         .iter()
         .find(|(app, _)| *app == module.path)
         .map(|(_, flavor)| *flavor);
+    let settled = audited.or_else(|| {
+        GO_COMMAND_LIBRARIES
+            .iter()
+            .find(|(path, library, _)| module.path == *path && module.uses(library))
+            .map(|(_, _, flavor)| *flavor)
+    });
     let posener = module.uses("github.com/posener/complete");
     let cobra = module.uses("github.com/spf13/cobra");
     let kingpin = kingpin::linked(module);
@@ -1135,7 +1417,7 @@ fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Fl
     // urfave/cli's or kingpin's flag). Only an audit settles which library
     // parses the command line when several are linked.
     let urfave = urfave::linked(module);
-    if audited.is_none() {
+    if settled.is_none() {
         if let Err(why) = &urfave {
             return Err(GoRefusal::Ambiguous(format!(
                 "{name} ({}) {why}",
@@ -1161,12 +1443,12 @@ fn go_flavor(module: &go::GoModule, name: &str, trusted: &[String]) -> Result<Fl
             )));
         }
     }
-    let flavor = if posener {
+    let flavor = if let Some(flavor) = settled {
+        flavor
+    } else if posener {
         Flavor::Posener
     } else if cobra {
         Flavor::Cobra
-    } else if let Some(flavor) = audited {
-        flavor
     } else if matches!(urfave, Ok(Some(_))) {
         Flavor::Urfave
     } else if kingpin {
@@ -1258,7 +1540,7 @@ const BLOCKED_PROXY: &str = "http://127.0.0.1:9";
 
 /// Variables that keep a completer offline: HTTP(S) clients get a proxy on
 /// the closed discard port, and AWS/Azure clients get no credentials.
-fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
+pub(crate) fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
     let set = |k: &str, v: &str| (OsString::from(k), Some(OsString::from(v)));
     let unset = |k: &str| (OsString::from(k), None);
     let mut env: Vec<_> = [
@@ -1273,7 +1555,135 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
     .map(|k| set(k, BLOCKED_PROXY))
     .chain(["NO_PROXY", "no_proxy"].map(unset))
     .collect();
+    // Node CLIs: update-notifier checks the npm registry and writes its state
+    // under HOME (docusaurus does even for --help).
+    env.push(set("NO_UPDATE_NOTIFIER", "1"));
+    // husky has no help: any run sets core.hooksPath and writes hooks,
+    // `husky --help` into a `--help` directory, unless this is 0.
+    env.push(set("HUSKY", "0"));
+    // Neovim writes ~/.local/state/nvim/nvim.log even for --help.
+    env.push(set(
+        "NVIM_LOG_FILE",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    ));
     let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    // HashiCorp clients and OpenBao default to loopback servers, which Go
+    // reaches without a proxy: vault's and nomad's predictors list mounts,
+    // policies, and jobs there with the user's token, and vault first runs
+    // a configured token helper. Agent addresses and client proxies take
+    // precedence over the address; zero retries keep failures immediate.
+    env.extend(
+        [
+            "VAULT_ADDR",
+            "BAO_ADDR",
+            "NOMAD_ADDR",
+            "CONSUL_HTTP_ADDR",
+            "BOUNDARY_ADDR",
+        ]
+        .map(|k| set(k, "unix:///nonexistent/notypo-offline.sock")),
+    );
+    env.extend([
+        set("VAULT_CONFIG_PATH", null),
+        set("BAO_CONFIG_PATH", null),
+        set("BOUNDARY_KEYRING_TYPE", "none"),
+    ]);
+    env.extend(
+        [
+            "VAULT_AGENT_ADDR",
+            "BAO_AGENT_ADDR",
+            "VAULT_PROXY_ADDR",
+            "BAO_PROXY_ADDR",
+            "VAULT_HTTP_PROXY",
+            "BAO_HTTP_PROXY",
+            "VAULT_MAX_RETRIES",
+            "BAO_MAX_RETRIES",
+            "VAULT_TOKEN",
+            "BAO_TOKEN",
+            "NOMAD_TOKEN",
+            "CONSUL_HTTP_TOKEN",
+            "CONSUL_HTTP_TOKEN_FILE",
+            "CONSUL_GRPC_ADDR",
+            "BOUNDARY_TOKEN",
+        ]
+        .map(unset),
+    );
+    // Backup tools never get a repository password or a way to ask for one,
+    // and borg reaches no remote repository.
+    env.push(set("BORG_RSH", "false"));
+    env.extend(
+        [
+            "BORG_PASSPHRASE",
+            "BORG_PASSCOMMAND",
+            "BORG_PASSPHRASE_FD",
+            "BORG_NEW_PASSPHRASE",
+            "RESTIC_PASSWORD",
+            "RESTIC_PASSWORD_FILE",
+            "RESTIC_PASSWORD_COMMAND",
+            // rclone's completion decrypts an encrypted configuration to
+            // list remotes, running the user's password command.
+            "RCLONE_PASSWORD_COMMAND",
+            "RCLONE_CONFIG_PASS",
+        ]
+        .map(unset),
+    );
+    env.push(set("RCLONE_ASK_PASSWORD", "false"));
+    // Password managers stay locked: no 1Password session, service account,
+    // Connect server, or biometric unlock through the desktop app, and no
+    // Bitwarden session or API key.
+    env.push(set("OP_BIOMETRIC_UNLOCK_ENABLED", "false"));
+    env.extend(
+        [
+            "OP_SERVICE_ACCOUNT_TOKEN",
+            "OP_CONNECT_HOST",
+            "OP_CONNECT_TOKEN",
+            "BW_SESSION",
+            "BW_CLIENTID",
+            "BW_CLIENTSECRET",
+            "BW_PASSWORD",
+        ]
+        .map(unset),
+    );
+    env.extend(std::env::vars_os().filter_map(|(key, _)| {
+        key.to_str()
+            .is_some_and(|key| key.starts_with("OP_SESSION_"))
+            .then_some((key, None))
+    }));
+    // AI assistants' API keys: help and completion need none.
+    env.extend(
+        [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_GENAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "MISTRAL_API_KEY",
+            "GROQ_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "OLLAMA_API_KEY",
+        ]
+        .map(unset),
+    );
+    // Teleport's tsh checks for managed client-tool updates (and locks
+    // ~/.tsh/bin) even to print help.
+    env.push(set("TELEPORT_TOOLS_VERSION", "off"));
+    // garden reports usage and checks for releases on every command.
+    env.extend([
+        set("GARDEN_DISABLE_ANALYTICS", "true"),
+        set("GARDEN_DISABLE_VERSION_CHECK", "true"),
+    ]);
+    // gh 2.102 records a device id (and reports usage) on every command;
+    // DO_NOT_TRACK is the shared convention other tools honor too.
+    env.extend([set("GH_TELEMETRY", "0"), set("DO_NOT_TRACK", "1")]);
+    // Block's goose writes a log file under its state root on every run,
+    // even for --help; with its root on the null device it only warns.
+    // Its keyring holds provider keys and is never opened.
+    env.extend([
+        set("GOOSE_PATH_ROOT", null),
+        set("GOOSE_DISABLE_KEYRING", "1"),
+    ]);
+    // Node's fetch honors the blocked proxy only when asked to (snyk's
+    // wrapper, bw, and other Node programs run through handlers and help).
+    env.push(set("NODE_USE_ENV_PROXY", "1"));
     match flavor {
         Flavor::Dotnet => {
             env.extend([
@@ -1360,12 +1770,11 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
             unset("PYTHONSTARTUP"),
         ]),
         Flavor::Node => env.extend([unset("NODE_OPTIONS"), unset("NODE_REPL_EXTERNAL_MODULE")]),
+        // The driver prepends or rewrites arguments from this variable.
+        Flavor::Clang => env.push(unset("CCC_OVERRIDE_OPTIONS")),
         Flavor::Yargs => env.extend([
             unset("NODE_OPTIONS"),
             unset("NODE_REPL_EXTERNAL_MODULE"),
-            // Node's fetch honors the blocked proxy only when asked to.
-            set("NODE_USE_ENV_PROXY", "1"),
-            set("NO_UPDATE_NOTIFIER", "1"),
             set("NO_COLOR", "1"),
             set("FORCE_COLOR", "0"),
             set("KUBECONFIG", null),
@@ -1490,10 +1899,161 @@ fn offline_env(flavor: Flavor) -> Vec<(OsString, Option<OsString>)> {
             set("KUBECONFIG", null),
             set("DOCKER_HOST", "unix:///nonexistent/notypo-offline.sock"),
         ]),
+        // Crash dumps stay unwritten; user VM flags could start
+        // distribution or evaluate code before the CLI parses its words.
+        Flavor::RabbitMQ => env.extend([
+            set("ERL_CRASH_DUMP_BYTES", "0"),
+            unset("ERL_AFLAGS"),
+            unset("ERL_ZFLAGS"),
+        ]),
         // oclif manifests are read, never run.
         Flavor::Argcomplete | Flavor::Git | Flavor::Posener | Flavor::Oclif => {}
     }
     env
+}
+
+/// The environment for `--help` and man probes of trusted programs: their
+/// startup code gets what handwritten completion handlers get (no proxy,
+/// cluster, daemon, server address, or repository password), and no pager.
+/// dig and its relatives take query options after `+` (`+short`,
+/// `+timeout=5`); zsh's _dig lists them only for a `+` prefix.
+fn plus_option(program: &str, word: &str) -> bool {
+    matches!(
+        Path::new(program).file_name().and_then(|n| n.to_str()),
+        Some("dig" | "delv" | "mdig" | "kdig")
+    ) && word.len() > 1
+        && word.starts_with('+')
+        && word[1..].starts_with(|c: char| c.is_ascii_alphabetic())
+}
+
+pub(crate) fn help_env() -> Vec<(OsString, Option<OsString>)> {
+    let mut env = offline_env(Flavor::BashFunction);
+    env.push(("PAGER".into(), Some("cat".into())));
+    env
+}
+
+/// Apps whose own completion handlers run the app on its data stores or
+/// devices, by the name the handlers call. borg's bash, zsh, and fish
+/// handlers list archives with `borg list` (and keys with `borg config`),
+/// which locks the repository, can run BORG_PASSCOMMAND, and reaches remote
+/// repositories over ssh. zsh's _adb lists device serials with `adb devices
+/// -l`, which starts adb's server (listening on port 5037) and writes its
+/// RSA key pair to ~/.android. Their handlers' fixed words are all notypo
+/// uses.
+const CLOSED_APPS: &[(&str, &str)] = &[("borg", "python:borg"), ("adb", "")];
+
+/// Inside such an app's handler, the app is a private stub that fails: it
+/// shadows the real program on PATH for every call the handler makes (zsh's
+/// `_borg` calls the command word, so the typed name is stubbed too).
+fn close_data_stores(
+    env: &mut Vec<(OsString, Option<OsString>)>,
+    name: &str,
+    identity: Option<&str>,
+) -> Result<(), CompletionError> {
+    let Some((program, _)) = CLOSED_APPS
+        .iter()
+        .find(|(program, id)| *program == name || identity == Some(*id))
+    else {
+        return Ok(());
+    };
+    let refuse = |why: String| {
+        CompletionError::Unsupported(format!(
+            "{program}'s handler would run {program} on its data or devices, and {why}"
+        ))
+    };
+    if !cfg!(unix) {
+        return Err(refuse("no stub can replace it here".into()));
+    }
+    stub_programs(env, program, &[program, name]).map_err(refuse)
+}
+
+/// Go modules whose package initialization starts a helper on every run,
+/// even for `--help` or a completion request; probes replace the helper
+/// with a failing stub. On macOS, mkcert looks for NSS with `brew --prefix
+/// nss`, and hugo links mkcert as bep/mclib for `server --tlsAuto`.
+/// Homebrew then writes its caches and can outlast the probe.
+const STARTUP_HELPERS: &[(&str, &str)] = &[
+    ("filippo.io/mkcert", "brew"),
+    ("github.com/bep/mclib", "brew"),
+];
+
+thread_local! {
+    static STARTUP_MEMO: RefCell<HashMap<PathBuf, Vec<&'static str>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The PATH a probe of `program` needs when the app starts helpers at
+/// startup: their stubs first, then `env`'s or the inherited PATH.
+pub(crate) fn startup_stubs(
+    program: &Path,
+    env: &[(OsString, Option<OsString>)],
+) -> Option<OsString> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let real = fs::canonicalize(program).ok()?;
+    let helpers = STARTUP_MEMO.with(|memo| {
+        memo.borrow_mut()
+            .entry(real.clone())
+            .or_insert_with(|| {
+                go::module(&real).map_or_else(Vec::new, |module| {
+                    STARTUP_HELPERS
+                        .iter()
+                        .filter(|(library, _)| module.path == *library || module.uses(library))
+                        .map(|(_, helper)| *helper)
+                        .collect()
+                })
+            })
+            .clone()
+    });
+    if helpers.is_empty() {
+        return None;
+    }
+    let mut env = env.to_vec();
+    // Without a stub, a PATH that names no directory keeps the helper from
+    // being found.
+    Some(match stub_programs(&mut env, "startup", &helpers) {
+        Ok(()) => env
+            .into_iter()
+            .rev()
+            .find(|(name, _)| name == "PATH")
+            .and_then(|(_, value)| value)?,
+        Err(_) => "/nonexistent".into(),
+    })
+}
+
+/// Puts failing stubs named `stubs` first on the probe's PATH.
+fn stub_programs(
+    env: &mut Vec<(OsString, Option<OsString>)>,
+    dir: &str,
+    stubs: &[&str],
+) -> Result<(), String> {
+    let dir = crate::utils::cache_dir().join("stubs").join(dir);
+    let write = || -> std::io::Result<()> {
+        fs::create_dir_all(&dir)?;
+        for stub in stubs {
+            let path = dir.join(stub);
+            fs::write(&path, "#!/bin/sh\nexit 1\n")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+            }
+        }
+        Ok(())
+    };
+    write().map_err(|error| format!("its stub could not be written: {error}"))?;
+    let inherited = env
+        .iter()
+        .rev()
+        .find(|(name, _)| name == "PATH")
+        .and_then(|(_, value)| value.clone())
+        .or_else(|| std::env::var_os("PATH"))
+        .unwrap_or_default();
+    let path = std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&inherited)))
+        .map_err(|error| error.to_string())?;
+    env.push(("PATH".into(), Some(path)));
+    Ok(())
 }
 
 /// The environment for resource lookups the user allowed: their own
@@ -1595,7 +2155,9 @@ impl NativeCompletionBackend for Backend {
             Flavor::Yargs => "yargs",
             Flavor::Oclif => "oclif",
             Flavor::Symfony => "symfony",
+            Flavor::RabbitMQ => "rabbitmq",
             Flavor::Node => "node",
+            Flavor::Clang => "clang",
             Flavor::BashFunction => "bash",
             Flavor::FishScript => "fish",
             Flavor::ZshFunction => "zsh",
@@ -1665,6 +2227,27 @@ impl NativeCompletionBackend for Backend {
         }
         if let Some(protocol) = self.symfony() {
             return protocol.capabilities(self.trust);
+        }
+        if let Some(protocol) = self.rabbitmq() {
+            return protocol.capabilities(self.trust);
+        }
+        if self.flavor == Flavor::Clang {
+            // Every driver option is listed, warnings included; other words
+            // are input files.
+            return Capabilities {
+                subcommands: false,
+                options: true,
+                option_arity: false,
+                values: true,
+                resources: false,
+                option_prefix: "-",
+                short_options: true,
+                complete_options: true,
+                complete_subcommands: true,
+                descriptions: true,
+                query_dialect: None,
+                trust: self.trust,
+            };
         }
         Capabilities {
             subcommands: true,
@@ -1747,6 +2330,9 @@ impl NativeCompletionBackend for Backend {
         if let Some(protocol) = &self.go_flags {
             return protocol.option_separator(typed);
         }
+        if plus_option(&self.name, typed) {
+            return Some('=');
+        }
         self.dotnet.as_ref().and_then(|protocol| {
             protocol
                 .option_syntax(typed)
@@ -1755,6 +2341,9 @@ impl NativeCompletionBackend for Backend {
     }
 
     fn is_short_option(&self, typed: &str) -> bool {
+        if plus_option(&self.name, typed) {
+            return false;
+        }
         self.go_flags.as_ref().map_or_else(
             || typed.len() > 1 && !typed.starts_with("--"),
             |protocol| protocol.is_short_option(typed),
@@ -1781,7 +2370,9 @@ impl NativeCompletionBackend for Backend {
         if let Some(protocol) = &self.go_flags {
             return protocol.option_prefix(typed);
         }
-        if self.flavor == Flavor::Dotnet && typed.starts_with('/') {
+        if plus_option(&self.name, typed) {
+            "+"
+        } else if self.flavor == Flavor::Dotnet && typed.starts_with('/') {
             "/"
         } else {
             self.capabilities().option_prefix
@@ -1790,6 +2381,7 @@ impl NativeCompletionBackend for Backend {
 
     fn is_option(&self, words: &[&str], item: &CompletionItem) -> bool {
         item.is_option()
+            || plus_option(&self.name, &item.value)
             || self
                 .go_flags
                 .as_ref()
@@ -1805,7 +2397,25 @@ impl NativeCompletionBackend for Backend {
         words: &[&str],
         typed: &str,
         next: Option<&str>,
+        budget: &mut Budget,
     ) -> Option<bool> {
+        // dig's `+name=value` options attach their values.
+        if plus_option(&self.name, typed) {
+            return Some(false);
+        }
+        // Arity only matters when an argument follows the option.
+        let argument_follows = next.is_some_and(|next| !next.starts_with('-'));
+        if self.flavor == Flavor::Cobra {
+            return (argument_follows && self.cobra_flag_is_boolean(words, typed, budget))
+                .then_some(false);
+        }
+        if matches!(
+            self.flavor,
+            Flavor::BashFunction | Flavor::ZshFunction | Flavor::FishScript
+        ) {
+            return (argument_follows && self.handler_flag_is_boolean(words, typed, budget))
+                .then_some(false);
+        }
         self.dotnet.as_ref()?.requires_value(words, typed, next)
     }
 
@@ -1827,9 +2437,25 @@ impl NativeCompletionBackend for Backend {
         if let Some(protocol) = self.symfony() {
             return protocol.capabilities_for(words, self.trust);
         }
+        if let Some(protocol) = self.rabbitmq() {
+            return protocol.capabilities_for(words, self.trust);
+        }
         let mut capabilities = self.capabilities();
         if matches!(self.flavor, Flavor::Pip | Flavor::Npm) && words.is_empty() {
             capabilities.complete_subcommands = true;
+        }
+        // A cobra root lists its commands (rclone's says files may follow,
+        // but its commands are all there is); deeper, a level where files
+        // are also valid is partial.
+        if self.flavor == Flavor::Cobra
+            && !words.is_empty()
+            && self
+                .cobra_files
+                .borrow()
+                .iter()
+                .any(|context| context.iter().map(String::as_str).eq(words.iter().copied()))
+        {
+            capabilities.complete_subcommands = false;
         }
         capabilities
     }
@@ -1846,6 +2472,9 @@ impl NativeCompletionBackend for Backend {
     }
 
     fn candidate_is_resource(&self, words: &[&str], item: &CompletionItem) -> bool {
+        if let Some(protocol) = &self.click {
+            return protocol.resource(words, item);
+        }
         if self.flavor == Flavor::GoFlags {
             // This wire format cannot distinguish command names from
             // callback-provided filenames or other local resources.
@@ -1873,11 +2502,13 @@ impl NativeCompletionBackend for Backend {
     }
 
     fn value_syntax_contains_slashes(&self, words: &[&str]) -> bool {
-        self.flavor == Flavor::GoFlags
-            || self
-                .cargo
-                .as_ref()
-                .is_some_and(|protocol| protocol.feature_value(words))
+        matches!(
+            self.flavor,
+            Flavor::GoFlags | Flavor::Symfony | Flavor::Click
+        ) || self
+            .cargo
+            .as_ref()
+            .is_some_and(|protocol| protocol.feature_value(words))
     }
 
     fn prepare_value_candidates(
@@ -1938,7 +2569,7 @@ impl NativeCompletionBackend for Backend {
         }
         if matches!(
             self.flavor,
-            Flavor::Pip | Flavor::Npm | Flavor::Urfave | Flavor::Kingpin
+            Flavor::Pip | Flavor::Npm | Flavor::Urfave | Flavor::Kingpin | Flavor::RabbitMQ
         ) {
             return Err(CompletionError::Unsupported(format!(
                 "{} does not enumerate finite option-value choices",
@@ -1970,6 +2601,7 @@ impl NativeCompletionBackend for Backend {
                 | Flavor::Yargs
                 | Flavor::Oclif
                 | Flavor::Symfony
+                | Flavor::RabbitMQ
         ) {
             return self.complete_values(words, budget);
         }
@@ -1980,7 +2612,14 @@ impl NativeCompletionBackend for Backend {
         self.flavor == Flavor::Node
     }
 
+    fn lists_omit_aliases(&self) -> bool {
+        self.flavor == Flavor::Cobra
+    }
+
     fn confirms(&self, words: &[&str], typed: &str, budget: &mut Budget) -> Option<bool> {
+        if self.flavor == Flavor::Cobra {
+            return self.cobra_confirms(words, typed, budget);
+        }
         if let Some(protocol) = self.yargs() {
             return protocol.confirms(self, words, typed, budget);
         }
@@ -1998,6 +2637,61 @@ impl NativeCompletionBackend for Backend {
         }
         self.urfave.as_ref()?.confirms(self, words, typed, budget)
     }
+
+    /// posener/complete answers a command's subcommands, its argument
+    /// predictions (vault's fixed engine names, terraform's workspaces), and
+    /// its flags together. A listed subcommand selects another command,
+    /// which answers differently than the same command does after `typed`;
+    /// a listed argument leaves the command at the same position answering
+    /// as it does after any other argument (terraform then predicts
+    /// directories either way). Shell handlers mix them the same way: mtr's
+    /// offers the placeholders `ip_address hostname` wherever a host goes.
+    fn lists_arguments(
+        &self,
+        words: &[&str],
+        typed: &str,
+        listed: &[&str],
+        budget: &mut Budget,
+    ) -> Option<ArgumentList> {
+        if !matches!(
+            self.flavor,
+            Flavor::Posener | Flavor::BashFunction | Flavor::ZshFunction | Flavor::FishScript
+        ) {
+            return None;
+        }
+        let word = *listed.iter().find(|word| !word.starts_with('-'))?;
+        let mut after = |next: &str| -> Option<Vec<String>> {
+            let words: Vec<&str> = words.iter().copied().chain([next]).collect();
+            let mut names: Vec<String> = self
+                .complete(&words, "", budget)
+                .ok()?
+                .into_iter()
+                .map(|item| item.value)
+                .filter(|value| !value.starts_with('-'))
+                .collect();
+            names.sort();
+            Some(names)
+        };
+        let deeper = after(word)?;
+        // The same words again after one of them: values or placeholders.
+        let mut level: Vec<String> = listed
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .map(|word| word.to_string())
+            .collect();
+        level.sort();
+        let posener = self.flavor == Flavor::Posener;
+        if !deeper.is_empty() && deeper == level {
+            return Some(if posener {
+                ArgumentList::Unjudged
+            } else {
+                ArgumentList::Resources
+            });
+        }
+        // A handler's subcommand and an unknown word can both complete
+        // files; only posener's answers are compared that way.
+        (posener && deeper == after(typed)?).then_some(ArgumentList::Unjudged)
+    }
 }
 
 impl Backend {
@@ -2012,6 +2706,9 @@ impl Backend {
             return Err(CompletionError::Unsupported(
                 "git completion does not list option values".into(),
             ));
+        }
+        if self.flavor == Flavor::Clang {
+            return clang::complete(&self.completer, words, prefix, env, budget);
         }
         if self.flavor == Flavor::Node {
             // Every other word is a file: the script and its arguments.
@@ -2083,6 +2780,12 @@ impl Backend {
             })?;
             return protocol.complete(self, words, prefix, budget);
         }
+        if self.flavor == Flavor::RabbitMQ {
+            let protocol = self.rabbitmq().ok_or_else(|| {
+                CompletionError::Unsupported("no RabbitMQ CLI tool was identified".into())
+            })?;
+            return protocol.complete(self, words, prefix, budget);
+        }
         if self.flavor == Flavor::Yargs {
             let protocol = self.yargs().ok_or_else(|| {
                 CompletionError::Unsupported("no yargs completion evidence is known".into())
@@ -2094,6 +2797,23 @@ impl Backend {
                 CompletionError::Unsupported("no click completion variable is known".into())
             })?;
             return protocol.complete(self, words, prefix, budget);
+        }
+        if matches!(
+            self.flavor,
+            Flavor::BashFunction
+                | Flavor::FishScript
+                | Flavor::ZshFunction
+                | Flavor::PowerShellCompleter
+        ) {
+            close_data_stores(&mut env, &self.name, self.identity.as_deref())?;
+            // A handler that calls the app starts its helpers too.
+            if let Some(path) = self
+                .application
+                .as_deref()
+                .and_then(|app| startup_stubs(app, &env))
+            {
+                env.push(("PATH".into(), Some(path)));
+            }
         }
         if let Some(registration) = self.powershell_memory() {
             let key = ["powershell-completer"]
@@ -2199,7 +2919,9 @@ impl Backend {
             | Flavor::Yargs
             | Flavor::Oclif
             | Flavor::Symfony
-            | Flavor::Node => {
+            | Flavor::RabbitMQ
+            | Flavor::Node
+            | Flavor::Clang => {
                 unreachable!("these queries use their own bridge")
             }
             Flavor::Azure | Flavor::Argcomplete | Flavor::Posener => line.len(),
@@ -2260,6 +2982,114 @@ impl Backend {
     /// cobra's hidden `__complete` command: the words are passed as
     /// arguments (no shell parsing), the answer is `word<TAB>description`
     /// lines and a final `:<directive>` line.
+    /// cobra completes a flag's value after a flag that takes one; after a
+    /// boolean flag (one with a no-option default) it completes exactly what
+    /// it completes without the flag. Equal non-empty answers prove the flag
+    /// takes no value; anything else leaves its arity unknown.
+    fn cobra_flag_is_boolean(&self, words: &[&str], flag: &str, budget: &mut Budget) -> bool {
+        if !flag.starts_with('-') || flag.contains('=') || flag == "-" || flag == "--" {
+            return false;
+        }
+        let Some(after_flag) = self.cobra_answer(words, Some(flag), "", budget) else {
+            return false;
+        };
+        !after_flag.0.is_empty() && self.cobra_answer(words, None, "", budget) == Some(after_flag)
+    }
+
+    /// Shell handlers don't say which options take values, but complete a
+    /// value after one that does (mtr's handler offers `ADDRESS` after
+    /// `--address`) and, after one that doesn't, what they complete without
+    /// it (its placeholder words `ip_address hostname`). Equal non-empty
+    /// answers prove the option takes no value.
+    fn handler_flag_is_boolean(&self, words: &[&str], flag: &str, budget: &mut Budget) -> bool {
+        if !flag.starts_with('-') || flag.contains('=') || flag == "-" || flag == "--" {
+            return false;
+        }
+        let mut answer = |words: &[&str]| -> Option<String> {
+            let key: Vec<&str> = ["handler-words"]
+                .into_iter()
+                .chain(words.iter().copied())
+                .collect();
+            self.memoized(&key, || {
+                let mut values: Vec<String> = self
+                    .complete(words, "", budget)?
+                    .into_iter()
+                    .map(|item| item.value)
+                    .collect();
+                values.sort();
+                Ok(values.join("\n"))
+            })
+            .ok()
+        };
+        let with: Vec<&str> = words.iter().copied().chain([flag]).collect();
+        let Some(after) = answer(&with).filter(|answer| !answer.is_empty()) else {
+            return false;
+        };
+        answer(words) == Some(after)
+    }
+
+    /// cobra lists neither aliases nor hidden commands, but resolves them:
+    /// the flags offered after such a word are its command's (every command
+    /// offers at least its help flag). After a word naming nothing, the root
+    /// finds no command and offers nothing, and any other level takes the
+    /// word as an argument and offers its own flags again.
+    fn cobra_confirms(&self, words: &[&str], typed: &str, budget: &mut Budget) -> Option<bool> {
+        if typed.is_empty() || typed.starts_with('-') || typed.contains(char::is_control) {
+            return None;
+        }
+        let Some(child) = self.cobra_answer(words, Some(typed), "-", budget) else {
+            return Some(false);
+        };
+        if child.0.is_empty() {
+            return Some(false);
+        }
+        let parent = self.cobra_answer(words, None, "-", budget)?;
+        Some(child.0 != parent.0)
+    }
+
+    /// cobra's sorted answer words and directive for `words` (plus `extra`)
+    /// and `prefix`, or `None` if it fails or reports a completion error.
+    fn cobra_answer(
+        &self,
+        words: &[&str],
+        extra: Option<&str>,
+        prefix: &str,
+        budget: &mut Budget,
+    ) -> Option<(Vec<String>, String)> {
+        let args: Vec<&str> = ["__complete"]
+            .into_iter()
+            .chain(words.iter().copied())
+            .chain(extra)
+            .chain([prefix])
+            .collect();
+        let text = self
+            .memoized(&args, || {
+                run_stdout(
+                    &self.completer,
+                    args[..].iter().map(OsString::from).collect(),
+                    offline_env(Flavor::Cobra),
+                    budget,
+                    true,
+                )
+            })
+            .ok()?;
+        let mut lines: Vec<&str> = text.lines().collect();
+        let directive = lines.pop().filter(|line| line.starts_with(':'))?.to_owned();
+        if directive[1..]
+            .trim()
+            .parse::<u32>()
+            .is_ok_and(|bits| bits & 1 != 0)
+        {
+            return None;
+        }
+        let mut words: Vec<String> = lines
+            .into_iter()
+            .map(|line| line.split('\t').next().unwrap_or(line).to_owned())
+            .collect();
+        words.sort();
+        Some((words, directive))
+    }
+
     fn complete_cobra(
         &self,
         words: &[&str],
@@ -2283,6 +3113,14 @@ impl Backend {
             return Err(CompletionError::Unsupported(
                 "the app reported a completion error here".into(),
             ));
+        }
+        // Without ShellCompDirectiveNoFileComp (bit 4), the shell offers
+        // files besides the answer: rclone's remotes after `copy` are not
+        // the only valid arguments, local paths are too.
+        if directive & 4 == 0 && prefix.is_empty() {
+            self.cobra_files
+                .borrow_mut()
+                .insert(words.iter().map(|word| word.to_string()).collect());
         }
         normalize_bounded(lines.into_iter(), Flavor::Cobra, budget.max_candidates)
     }
@@ -2479,6 +3317,50 @@ esac
             "no matches is not an error"
         );
         assert_eq!(budget.spawned(), 2);
+    }
+
+    #[test]
+    fn offline_probes_cannot_reach_hashicorp_servers_tokens_or_token_helpers() {
+        use std::ffi::OsStr;
+        let socket = Some(OsString::from("unix:///nonexistent/notypo-offline.sock"));
+        let null = Some(OsString::from(if cfg!(windows) {
+            "NUL"
+        } else {
+            "/dev/null"
+        }));
+        for flavor in [Flavor::Posener, Flavor::Cobra, Flavor::BashFunction] {
+            let env: HashMap<_, _> = offline_env(flavor).into_iter().collect();
+            for key in [
+                "VAULT_ADDR",
+                "BAO_ADDR",
+                "NOMAD_ADDR",
+                "CONSUL_HTTP_ADDR",
+                "BOUNDARY_ADDR",
+            ] {
+                assert_eq!(env.get(OsStr::new(key)), Some(&socket), "{flavor:?} {key}");
+            }
+            assert_eq!(env.get(OsStr::new("VAULT_CONFIG_PATH")), Some(&null));
+            assert_eq!(env.get(OsStr::new("BAO_CONFIG_PATH")), Some(&null));
+            for key in [
+                "VAULT_AGENT_ADDR",
+                "BAO_AGENT_ADDR",
+                "VAULT_HTTP_PROXY",
+                "VAULT_MAX_RETRIES",
+                "VAULT_TOKEN",
+                "BAO_TOKEN",
+                "NOMAD_TOKEN",
+                "CONSUL_HTTP_TOKEN",
+                "BOUNDARY_TOKEN",
+            ] {
+                assert_eq!(env.get(OsStr::new(key)), Some(&None), "{flavor:?} {key}");
+            }
+        }
+        // Lookups the user allowed keep their own servers and credentials.
+        assert!(
+            network_env(Flavor::Posener)
+                .iter()
+                .all(|(key, _)| !key.to_string_lossy().contains("VAULT"))
+        );
     }
 
     #[test]
@@ -2785,6 +3667,80 @@ esac
             go_flavor(&module("example.com/tool", &[]), "tool", &["*".into()]),
             Err(GoRefusal::NoProtocol)
         ));
+        // Caddy links urfave/cli through smallstep. Its own module is
+        // audited; an xcaddy build (`caddy`, plugins unknown) is settled by
+        // the library it builds but trusted only by the user.
+        let urfave = "github.com/urfave/cli";
+        let library = "github.com/caddyserver/caddy/v2";
+        assert_eq!(
+            go_flavor(
+                &module(
+                    "github.com/caddyserver/caddy/v2/cmd/caddy",
+                    &[cobra, urfave]
+                ),
+                "caddy",
+                &[]
+            ),
+            Ok(Flavor::Cobra)
+        );
+        let xcaddy = module("caddy", &[cobra, urfave, library]);
+        assert!(matches!(
+            go_flavor(&xcaddy, "caddy", &[]),
+            Err(GoRefusal::NotTrusted(_))
+        ));
+        assert_eq!(
+            go_flavor(&xcaddy, "caddy", &["caddy".into()]),
+            Ok(Flavor::Cobra)
+        );
+        assert!(matches!(
+            go_flavor(
+                &module("caddy", &[cobra, urfave]),
+                "caddy",
+                &["caddy".into()]
+            ),
+            Err(GoRefusal::Ambiguous(_))
+        ));
+    }
+
+    /// mkcert's package init runs `brew --prefix nss` on macOS, linked as a
+    /// program or as bep/mclib (hugo): probes of such apps find a failing
+    /// stub first on PATH, and other apps keep their PATH.
+    #[test]
+    fn apps_that_start_helpers_at_startup_get_failing_stubs() {
+        let dir = Dir::new("startup-helpers");
+        let write = |name: &str, module: &str, dependencies: &[&str]| {
+            let path = dir.0.join(name);
+            fs::write(&path, go::fake_binary(module, dependencies)).unwrap();
+            path
+        };
+        let mkcert = write("mkcert", "filippo.io/mkcert", &[]);
+        let hugo = write(
+            "hugo",
+            "github.com/gohugoio/hugo",
+            &["github.com/spf13/cobra", "github.com/bep/mclib"],
+        );
+        let other = write("tool", "example.com/tool", &["github.com/spf13/cobra"]);
+        let env = vec![("PATH".into(), Some("/usr/bin:/bin".into()))];
+        for app in [&mkcert, &hugo] {
+            let path = startup_stubs(app, &env);
+            if !cfg!(target_os = "macos") {
+                assert_eq!(path, None);
+                continue;
+            }
+            let path = path.unwrap();
+            let mut dirs = std::env::split_paths(&path);
+            let stubs = dirs.next().unwrap();
+            assert!(stubs.ends_with("stubs/startup"), "{stubs:?}");
+            let brew = fs::read_to_string(stubs.join("brew")).unwrap();
+            assert_eq!(brew, "#!/bin/sh\nexit 1\n");
+            assert_eq!(
+                dirs.collect::<Vec<_>>(),
+                [PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+                "the probe's own PATH follows"
+            );
+        }
+        assert_eq!(startup_stubs(&other, &env), None);
+        assert_eq!(startup_stubs(&dir.0.join("missing"), &env), None);
     }
 
     #[test]

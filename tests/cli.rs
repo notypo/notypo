@@ -2780,11 +2780,11 @@ root=$(dirname "$(dirname "$0")")
 [ "$1" = -m ] && [ "$2" = clickfix ] || exit 8
 shift 2
 printf '[%s]%s|%s|%s\n' "$*" "$_CLICKFIX_COMPLETE" "$COMP_CWORD" "$COMP_WORDS" >> "$root/calls"
-[ "$#" = 0 ] && [ "$_CLICKFIX_COMPLETE" = bash_complete ] || { touch "$root/operation-marker"; exit 2; }
+[ "$#" = 0 ] && [ "$_CLICKFIX_COMPLETE" = zsh_complete ] || { touch "$root/operation-marker"; exit 2; }
 [ "$HTTPS_PROXY" = http://127.0.0.1:9 ] && [ "$PYTHONDONTWRITEBYTECODE" = 1 ] || exit 8
 case "$COMP_CWORD|$COMP_WORDS" in
-  '2|clickfix deploy') printf 'plain,status\n';;
-  *) printf 'plain,db:migrate\nplain,deploy\n';;
+  '2|clickfix deploy') printf 'plain\nstatus\nShow status\n';;
+  *) printf 'plain\ndb:migrate\nRun migrations\nplain\ndeploy\nDeploy an app\n';;
 esac
 "#,
     )
@@ -2846,13 +2846,18 @@ _clickfix_completion_setup;
     assert_eq!(untrusted["probes"], 0, "{untrusted}");
     assert!(!workspace.0.join("calls").exists());
     for (source, expected, decision) in [
-        ("clickfix deplyo", "clickfix deploy", "allow"),
-        ("clickfix deploy statsu", "clickfix deploy status", "allow"),
+        ("clickfix deplyo", "clickfix deploy", "confirm"),
+        (
+            "clickfix deploy statsu",
+            "clickfix deploy status",
+            "confirm",
+        ),
     ] {
         let report = report(r#"["python:clickfix"]"#, source);
         let candidate = &report["candidates"][0];
         assert_eq!(candidate["command"], expected, "{report}");
         assert_eq!(candidate["safety"]["decision"], decision, "{report}");
+        assert!(candidate["edits"][0]["description"].is_string(), "{report}");
         assert!(
             candidate["edits"]
                 .as_array()
@@ -2868,15 +2873,13 @@ _clickfix_completion_setup;
             .spawn()
             .unwrap(),
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        "clickfix deploy"
-    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
     let calls = fs::read_to_string(workspace.0.join("calls")).unwrap();
     assert!(
         calls
             .lines()
-            .all(|line| line.starts_with("[]bash_complete|")),
+            .all(|line| line.starts_with("[]zsh_complete|")),
         "only completion requests, without arguments: {calls}"
     );
     assert!(!workspace.0.join("operation-marker").exists());

@@ -180,8 +180,22 @@ fn is_correction_call(line: &str, alias: &str) -> bool {
 }
 
 fn render_terminal(output: &str) -> String {
-    let cols = terminal::size().ws_col.clamp(1, 4096);
-    let rows = output.split('\n').count().clamp(1, 4096) as u16;
+    render_terminal_at_width(output, terminal::size().ws_col.clamp(2, 4096))
+}
+
+fn render_terminal_at_width(output: &str, cols: u16) -> String {
+    // Wrapped lines need additional screen rows. UTF-8 byte lengths bound
+    // character widths; tabs can advance up to eight columns. Keep a spare
+    // row so a one-line screen never hits vt100's scroll-on-wrap edge case.
+    let rows = output
+        .split('\n')
+        .fold(1usize, |rows, line| {
+            let columns = line.bytes().fold(0usize, |columns, byte| {
+                columns.saturating_add(if byte == b'\t' { 8 } else { 1 })
+            });
+            rows.saturating_add(columns.div_ceil(usize::from(cols)).max(1))
+        })
+        .clamp(2, 4096) as u16;
     let mut parser = vt100::Parser::new(rows, cols, 0);
     // Text-only loggers can supply LF without the CR normally emitted by a
     // PTY. Treat both forms as the line endings visible on the terminal.
@@ -202,6 +216,32 @@ mod tests {
             "permission denied\nλσ"
         );
         assert_eq!(render_terminal("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn renders_wrapped_lines_without_losing_text_or_panicking() {
+        let command = format!(
+            "aws ec2 describe-instances {}",
+            "--filter 'a b' ".repeat(30)
+        );
+        assert_eq!(render_terminal_at_width(&command, 80), command.trim());
+        let unicode = "õun/üks ".repeat(60);
+        assert_eq!(render_terminal_at_width(&unicode, 80), unicode.trim());
+        assert_eq!(render_terminal_at_width("a\tend", 80), "a       end");
+    }
+
+    #[test]
+    fn matches_captured_commands_longer_than_the_terminal_width() {
+        let command = format!(
+            "aws ec2 describ-instances --filter '{}'",
+            "a b ".repeat(1100)
+        );
+        let mark = logs::USER_COMMAND_MARK;
+        let log = format!("{mark}$ {command}\r\nunknown command\r\n{mark}$ fuck");
+        assert_eq!(
+            output_for_script(&command, mark, &log, "fuck"),
+            Some(format!("$ {command}\nunknown command"))
+        );
     }
 
     #[test]

@@ -529,9 +529,181 @@ impl Suggestions for EngineSuggestions<'_, '_> {
     }
 }
 
+/// Passwords typed on a command line, which reports never show: archive
+/// passwords (7-Zip's and rar's `-p<pwd>`, rar's `-hp<pwd>`, zip's and
+/// unzip's `-P <pwd>`, unar/lsar's `-p`/`-password`, ouch's and dtrx's
+/// `-p`), MySQL's attached `-p<pwd>`, sshpass's `-p`,
+/// openssl's `pass:` values, curl's `-u user:password`, and any
+/// `--password`/`--passphrase` value, or that of an option named like an
+/// API key, token, or secret (`--anthropic-api-key`, `--api-key
+/// provider=KEY`, and aider's `--set-env NAME=VALUE`).
+fn secrets<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for line in lines {
+        let Ok(words) = crate::shlex::split(line) else {
+            continue;
+        };
+        let words: Vec<String> = words.into_iter().map(|word| word.into_owned()).collect();
+        let program = words
+            .first()
+            .map(|word| word.rsplit(['/', '\\']).next().unwrap_or(word).to_owned())
+            .unwrap_or_default();
+        let attached = |word: &str, flag: &str| {
+            word.strip_prefix(flag)
+                .filter(|rest| !rest.is_empty() && !word.starts_with("--"))
+                .map(str::to_owned)
+        };
+        // `--api-key provider=KEY` and `--set-env NAME=VALUE` hold the
+        // secret after `=`.
+        let keyed = |name: &str| matches!(name, "--api-key" | "--set-env");
+        let secret_option = |name: &str| {
+            let name = name.to_ascii_lowercase();
+            name.starts_with("--")
+                && ["api-key", "api_key", "apikey", "-token", "-secret"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+                || keyed(&name)
+        };
+        let mut words = words.iter().skip(1);
+        while let Some(word) = words.next() {
+            let mut take = |value: Option<String>| {
+                if let Some(value) = value.filter(|value| !value.is_empty()) {
+                    found.push(value);
+                }
+            };
+            if let Some((name, value)) = word.split_once('=')
+                && secret_option(name)
+            {
+                take(Some(value.to_owned()));
+                if keyed(name) {
+                    take(value.split_once('=').map(|(_, key)| key.to_owned()));
+                }
+                continue;
+            }
+            if secret_option(word) {
+                let value = words.next().cloned();
+                if keyed(word) {
+                    take(
+                        value
+                            .as_deref()
+                            .and_then(|value| value.split_once('='))
+                            .map(|(_, key)| key.to_owned()),
+                    );
+                }
+                take(value);
+                continue;
+            }
+            if let Some((name, value)) = word.split_once('=')
+                && ["--password", "--passphrase", "--passwd", "--pass"].contains(&name)
+            {
+                take(Some(value.to_owned()));
+                continue;
+            }
+            if ["--password", "--passphrase", "--passwd"].contains(&word.as_str()) {
+                take(words.next().cloned());
+                continue;
+            }
+            match program.as_str() {
+                "7z" | "7za" | "7zr" | "7zz" => take(attached(word, "-p")),
+                "rar" | "unrar" => take(attached(word, "-hp").or_else(|| attached(word, "-p"))),
+                "zip" | "unzip" | "zipcloak" | "funzip" if word == "-P" => {
+                    take(words.next().cloned())
+                }
+                "mysql" | "mariadb" | "mysqldump" | "mysqladmin" | "mysqlimport" => {
+                    take(attached(word, "-p"))
+                }
+                "sshpass" | "ouch" | "dtrx" if word == "-p" => take(words.next().cloned()),
+                "sshpass" | "ouch" | "dtrx" => take(attached(word, "-p")),
+                // XADMaster's options are whole words with separate values.
+                "unar" | "lsar" if word == "-p" || word == "-password" => {
+                    take(words.next().cloned())
+                }
+                "openssl" => take(word.strip_prefix("pass:").map(str::to_owned)),
+                "curl" if word == "-u" || word == "--user" => take(
+                    words
+                        .next()
+                        .and_then(|user| user.split_once(':'))
+                        .map(|(_, password)| password.to_owned()),
+                ),
+                "curl" => take(
+                    attached(word, "-u")
+                        .and_then(|user| user.split_once(':').map(|(_, p)| p.to_owned())),
+                ),
+                _ => {}
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    // Mask longer secrets first, so one containing another stays hidden.
+    found.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    found
+}
+
+/// `text` with every secret that stands as a whole word (not inside a
+/// longer word) replaced by `***`.
+fn mask(text: &str, secrets: &[String]) -> String {
+    let mut text = text.to_owned();
+    for secret in secrets {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(secret.as_str()) {
+            let before = rest[..at].chars().next_back();
+            let after = rest[at + secret.len()..].chars().next();
+            let inside = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric());
+            out.push_str(&rest[..at]);
+            // An attached flag (`-psecret`) still masks its value.
+            let attached_flag = before.is_some_and(|c| c.is_alphabetic())
+                && rest[..at]
+                    .rsplit(' ')
+                    .next()
+                    .is_some_and(|w| w.starts_with('-'));
+            if (!inside(before) || attached_flag) && !inside(after) {
+                out.push_str("***");
+            } else {
+                out.push_str(secret);
+            }
+            rest = &rest[at + secret.len()..];
+        }
+        out.push_str(rest);
+        text = out;
+    }
+    text
+}
+
+fn mask_json(value: &mut serde_json::Value, secrets: &[String]) {
+    match value {
+        serde_json::Value::String(text) => *text = mask(text, secrets),
+        serde_json::Value::Array(items) => {
+            items.iter_mut().for_each(|item| mask_json(item, secrets))
+        }
+        serde_json::Value::Object(map) => {
+            map.values_mut().for_each(|item| mask_json(item, secrets))
+        }
+        _ => {}
+    }
+}
+
+/// The secrets on the failed line and on every candidate a report lists.
+fn report_secrets(failure: &FailureContext, report: &Report) -> Vec<String> {
+    let listed = match &report.outcome {
+        Outcome::Unsafe(c) => c.as_slice(),
+        other => other.candidates(),
+    };
+    secrets(
+        std::iter::once(failure.source.as_str())
+            .chain(listed.iter().map(|candidate| candidate.script.as_str())),
+    )
+}
+
 /// The `--explain` report: what was known, what each source found, and why
-/// candidates were ranked and gated as they were.
+/// candidates were ranked and gated as they were. Passwords are masked.
 fn explain(failure: &FailureContext, report: &Report) -> String {
+    let secrets = report_secrets(failure, report);
+    mask(&explain_unmasked(failure, report), &secrets)
+}
+
+fn explain_unmasked(failure: &FailureContext, report: &Report) -> String {
     let mut out = String::new();
     let unknown = || "unknown".to_owned();
     let _ = writeln!(out, "command:     {}", failure.source);
@@ -622,7 +794,14 @@ fn explain(failure: &FailureContext, report: &Report) -> String {
 }
 
 /// The `--json` report. Field names are part of the CLI's interface.
+/// Passwords are masked.
 fn report_json(failure: &FailureContext, report: &Report) -> serde_json::Value {
+    let mut value = report_json_unmasked(failure, report);
+    mask_json(&mut value, &report_secrets(failure, report));
+    value
+}
+
+fn report_json_unmasked(failure: &FailureContext, report: &Report) -> serde_json::Value {
     use serde_json::json;
     let (kind, listed) = match &report.outcome {
         Outcome::Suggestion(c) => ("suggestion", c.as_slice()),
@@ -781,6 +960,51 @@ mod tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_mask_passwords_typed_on_the_command_line() {
+        let found = secrets([
+            "7z x -psecret1 a.7z",
+            "zip -P hunter2 out.zip file",
+            "rar x -hpveiled a.rar",
+            "mysql -pdbpass -u root",
+            "mysql -p -u root",
+            "openssl enc -pass pass:sslpass -in f",
+            "curl -u alice:curlpass https://example.com",
+            "tool --password=eqpass --passphrase phrase9",
+            "unar -password unarpass a.rar",
+            "lsar -p lsarpass a.rar",
+            "ouch -p ouchpass decompress a.7z",
+            "dtrx -pdtrxpass a.zip",
+            "aider --anthropic-api-key sk-ant-1 --openai-api-key=sk-2 x.py",
+            "aider --api-key deepseek=sk-3 --set-env AZURE_API_KEY=sk-4",
+            "gh --GITHUB-TOKEN tok5",
+        ]);
+        for secret in [
+            "secret1", "hunter2", "veiled", "dbpass", "sslpass", "curlpass", "eqpass", "phrase9",
+            "unarpass", "lsarpass", "ouchpass", "dtrxpass", "sk-ant-1", "sk-2", "sk-3", "sk-4",
+            "tok5",
+        ] {
+            assert!(found.iter().any(|s| s == secret), "{secret}: {found:?}");
+        }
+        assert!(!found.iter().any(|s| s == "-u" || s == "root"), "{found:?}");
+        // Option names and prompt text are not secrets.
+        let found_aider = secrets(["aider --thinking-tokens 5 --message token x.py"]);
+        assert!(found_aider.is_empty(), "{found_aider:?}");
+        let masked = mask(
+            "command: 7z x -psecret1 a.7z; `hunter2x` stays; zip -P hunter2 out.zip",
+            &found,
+        );
+        assert_eq!(
+            masked,
+            "command: 7z x -p*** a.7z; `hunter2x` stays; zip -P *** out.zip"
+        );
+        let mut value =
+            serde_json::json!({"command": "zip -P hunter2 o.zip", "notes": ["after `-P hunter2`"]});
+        mask_json(&mut value, &found);
+        assert_eq!(value["command"], "zip -P *** o.zip");
+        assert_eq!(value["notes"][0], "after `-P ***`");
+    }
 
     #[cfg(unix)]
     #[test]

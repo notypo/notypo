@@ -13,6 +13,16 @@
 //! command words the app listed (or a word whose answer differs from its
 //! parent's, for unlisted aliases), never options, their values, or `@file`
 //! arguments, which kingpin expands by reading the file.
+//!
+//! Argument hints may open repositories or connect to a server, even at a
+//! command group: kingpin implicitly descends into default commands before
+//! completing. Its help flag does not reliably disable that descent for
+//! custom applications. Commands therefore come from context-sensitive help,
+//! whose renderer reparses without defaults. Completion is asked only for
+//! option names with a final `--`, never for arguments or option values; help
+//! removes flags belonging only to implicitly selected default commands.
+//! Including `--help` also suppresses the library's default value setters;
+//! application pre-actions still run under the user's explicit trust.
 
 use super::{Backend, Capabilities, CompletionError, CompletionItem, Flavor, Trust};
 use crate::engine::probe::{self, Budget, Capture, Probe};
@@ -38,6 +48,107 @@ pub(super) struct Protocol {
 #[derive(Debug, PartialEq, Eq)]
 struct Level {
     words: Vec<CompletionItem>,
+    scope: Scope,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Scope {
+    usage: String,
+    has_commands: bool,
+    commands: Vec<CompletionItem>,
+    options: Vec<CompletionItem>,
+}
+
+impl Scope {
+    fn parse(text: &str) -> Result<Self, CompletionError> {
+        let text = crate::engine::docs::strip_formatting(text);
+        let lines: Vec<_> = text.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim_start().to_ascii_lowercase().starts_with("usage:"))
+            .ok_or_else(|| CompletionError::Failed("kingpin help has no usage summary".into()))?;
+        let mut usage = lines[start].trim().to_owned();
+        for line in &lines[start + 1..] {
+            if line.trim().is_empty() || !line.starts_with(char::is_whitespace) {
+                break;
+            }
+            usage.push(' ');
+            usage.push_str(line.trim());
+        }
+        let usage = usage.split_whitespace().collect::<Vec<_>>().join(" ");
+        let heading = lines.iter().position(|line| {
+            let line = line.trim().to_ascii_lowercase();
+            matches!(line.as_str(), "commands:" | "subcommands:")
+                || (line.starts_with("commands (") && line.ends_with("):"))
+        });
+        let has_commands =
+            usage.split_whitespace().any(|word| word == "<command>") && heading.is_some();
+        let mut commands: Vec<CompletionItem> = Vec::new();
+        if has_commands {
+            let path: Vec<_> = usage
+                .split_whitespace()
+                .skip(2)
+                .take_while(|word| !word.starts_with(['[', '<', '-']))
+                .collect();
+            let mut indentation = None;
+            let mut tree_parent = None;
+            for line in &lines[heading.unwrap() + 1..] {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if matches!(
+                    trimmed,
+                    "Flags:" | "Global Flags:" | "Args:" | "Command Aliases:"
+                ) {
+                    break;
+                }
+                let indent = line.len() - line.trim_start().len();
+                let words: Vec<_> = trimmed.split_whitespace().collect();
+                // Compact templates print a repeated parent row followed by
+                // indented children, instead of a full path on every row.
+                if !path.is_empty() && words == path {
+                    tree_parent = Some(indent);
+                    indentation = None;
+                    continue;
+                }
+                let command = if let Some(parent) = tree_parent {
+                    if indent <= parent || indent != *indentation.get_or_insert(indent) {
+                        continue;
+                    }
+                    words.first()
+                } else {
+                    if !words.starts_with(&path) || indent != *indentation.get_or_insert(indent) {
+                        continue;
+                    }
+                    words.get(path.len())
+                };
+                let Some(command) = command else {
+                    continue;
+                };
+                let command = command.trim_end_matches('*');
+                if command.is_empty()
+                    || command.starts_with(['[', '<', '-'])
+                    || command.contains(char::is_control)
+                    || commands.iter().any(|item| item.value == command)
+                {
+                    continue;
+                }
+                commands.push(CompletionItem {
+                    value: command.to_owned(),
+                    takes_value: None,
+                    description: None,
+                });
+            }
+        }
+        let options = crate::engine::docs::options(&text.replace("--[no-]", "--"));
+        Ok(Self {
+            usage,
+            has_commands,
+            commands,
+            options,
+        })
+    }
 }
 
 struct Walk<'a> {
@@ -57,7 +168,10 @@ fn private_dir() -> Result<PathBuf, CompletionError> {
 impl Protocol {
     pub fn allowed(&self, backend: &Backend) -> bool {
         self.trusted_help.iter().any(|trusted| {
-            trusted == "*" || *trusted == backend.name || Some(trusted) == backend.identity.as_ref()
+            trusted == "*"
+                || *trusted == backend.name
+                || *trusted == super::app_name(&backend.name)
+                || Some(trusted) == backend.identity.as_ref()
         })
     }
 
@@ -82,14 +196,11 @@ impl Protocol {
         &self,
         backend: &Backend,
         path: &[&str],
-        options: bool,
         budget: &mut Budget,
     ) -> Result<String, CompletionError> {
-        let mut args: Vec<&str> = vec![FLAG];
+        let mut args: Vec<&str> = vec![FLAG, "--help"];
         args.extend_from_slice(path);
-        if options {
-            args.push("--");
-        }
+        args.push("--");
         let mut key = vec!["kingpin"];
         key.extend_from_slice(&args);
         if !self.allowed(backend) {
@@ -128,6 +239,53 @@ impl Protocol {
         })
     }
 
+    fn scope(
+        &self,
+        backend: &Backend,
+        path: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Scope, CompletionError> {
+        if !self.allowed(backend) {
+            return Err(CompletionError::Failed(format!(
+                "kingpin help needs {} in trusted_help",
+                backend.name
+            )));
+        }
+        let mut args = vec!["--help"];
+        args.extend_from_slice(path);
+        let mut key = vec!["kingpin-help"];
+        key.extend_from_slice(&args);
+        let dir = private_dir()?;
+        let text = backend.memoized(&key, || {
+            let output = probe::run_in(
+                &Probe {
+                    program: &backend.completer,
+                    args: args.iter().map(Into::into).collect(),
+                    env: super::offline_env(Flavor::Kingpin),
+                    capture: Capture::Combined,
+                },
+                &dir,
+                budget,
+            )
+            .map_err(super::probe_error)?;
+            if output.status != Some(0) {
+                return Err(CompletionError::Failed(format!(
+                    "kingpin help exited with {:?}",
+                    output.status
+                )));
+            }
+            if output.truncated {
+                return Err(CompletionError::Failed(
+                    "kingpin help output exceeded the probe limit".into(),
+                ));
+            }
+            String::from_utf8(output.data).map_err(|_| {
+                CompletionError::Failed("kingpin help output is not valid UTF-8".into())
+            })
+        })?;
+        Scope::parse(&text)
+    }
+
     fn parse(text: &str, limit: usize) -> Result<Vec<CompletionItem>, CompletionError> {
         let mut items: Vec<CompletionItem> = Vec::new();
         for word in text.lines().filter(|line| !line.is_empty()) {
@@ -159,12 +317,13 @@ impl Protocol {
         path: &[&str],
         budget: &mut Budget,
     ) -> Result<Level, CompletionError> {
-        let items = Self::parse(
-            &self.raw(backend, path, false, budget)?,
-            budget.max_candidates,
-        )?;
+        let scope = self.scope(backend, path, budget)?;
+        if scope.commands.len() > budget.max_candidates {
+            return Err(super::over_limit());
+        }
         Ok(Level {
-            words: items.into_iter().filter(|item| !item.is_option()).collect(),
+            words: scope.commands.clone(),
+            scope,
         })
     }
 
@@ -204,6 +363,12 @@ impl Protocol {
                     positional: true,
                 });
             }
+            if !level.scope.has_commands {
+                return Ok(Walk {
+                    path,
+                    positional: true,
+                });
+            }
             let listed = level.words.iter().any(|item| item.value == word);
             let mut child = path.clone();
             child.push(word);
@@ -212,10 +377,10 @@ impl Protocol {
                 level = self.level(backend, &path, budget)?;
                 continue;
             }
-            // Aliases and hidden commands are not listed. A word naming no
-            // command gets its parent's answer again.
+            // Aliases and hidden commands are not listed. Help resolves
+            // them without invoking the command's argument hints.
             let answer = self.level(backend, &child, budget)?;
-            if answer != level {
+            if answer.scope.usage != level.scope.usage {
                 path = child;
                 level = answer;
                 continue;
@@ -250,16 +415,28 @@ impl Protocol {
         let walk = self.walk(backend, words, budget)?;
         let mut items = if prefix.starts_with('-') {
             let limit = budget.max_candidates;
-            Self::parse(&self.raw(backend, &walk.path, true, budget)?, limit)?
+            let scope = self.scope(backend, &walk.path, budget)?;
+            Self::parse(&self.raw(backend, &walk.path, budget)?, limit)?
                 .into_iter()
-                .filter(CompletionItem::is_option)
+                .filter(|item| {
+                    scope
+                        .options
+                        .iter()
+                        .any(|option| item.value == option.value)
+                })
                 .collect()
         } else if walk.positional {
             return Err(CompletionError::Unsupported(
                 "kingpin lists nothing after an argument it does not know".into(),
             ));
         } else {
-            self.level(backend, &walk.path, budget)?.words
+            let level = self.level(backend, &walk.path, budget)?;
+            if !level.scope.has_commands {
+                return Err(CompletionError::Unsupported(
+                    "kingpin argument hints may open a repository or contact a server".into(),
+                ));
+            }
+            level.words
         };
         items.retain(|item| item.value.starts_with(prefix));
         Ok(items)
@@ -286,10 +463,13 @@ impl Protocol {
             return None;
         }
         let level = self.level(backend, &walk.path, budget).ok()?;
+        if !level.scope.has_commands {
+            return None;
+        }
         let mut child = walk.path.clone();
         child.push(typed);
-        let answer = self.level(backend, &child, budget).ok()?;
-        Some(answer != level)
+        let answer = self.scope(backend, &child, budget).ok()?;
+        Some(answer.usage != level.scope.usage)
     }
 }
 
@@ -305,28 +485,52 @@ mod tests {
 
     const MODULE: &str = "example.com/kingpin-fixture";
 
-    /// Answers like kingpin 2.4.0 did for a fixture app: the flag first,
-    /// commands per level (aliases unlisted), `help` at the root, every long
-    /// flag after `--`, and an unknown word falling back to its parent.
+    /// Models context-sensitive help and completion separately. A command
+    /// leaf's argument completer writes a marker, even without arguments.
     const APP: &str = r#"#!/bin/sh
 root=$(dirname "$0")
 [ "$HTTPS_PROXY" = http://127.0.0.1:9 ] && [ "$KUBECONFIG" = /dev/null ] || exit 8
 printf '<%s>' "$@" >> "$root/queries"
 printf '|%s\n' "$PWD" >> "$root/queries"
-[ "$1" = --completion-bash ] || { touch "$root/operation-marker"; exit 9; }
-shift
 touch default-value-file
 if [ -f "$root/mode" ]; then
   case "$(cat "$root/mode")" in
-    usage) printf 'usage: fixture [<flags>] <command>\n'; exit 0;;
+    usage) printf 'not a help document\n'; exit 0;;
     failed) exit 1;;
   esac
 fi
-case "$*" in
-  '--') printf -- '--help\n--config\n--log-file';;
+case "$1" in
+  --help)
+    shift
+    case "$*" in
+      deploy|d) printf 'usage: fixture deploy [<flags>] <command> [<args> ...]\n\nSubcommands:\n  deploy status <target>\n  deploy rollback\n';;
+      'deploy status'|'d status'|'deploy s'|'d s') printf 'usage: fixture deploy status [<flags>] <target>\n\nArgs:\n  <target> Target\n';;
+      'deploy rollback'|'d rollback') printf 'usage: fixture deploy rollback [<flags>]\n';;
+      'db:migrate') printf 'usage: fixture db:migrate [<flags>]\n';;
+      *) printf 'usage: fixture [<flags>] <command> [<args> ...]\n\nCommands:\n  help\n  deploy\n  db:migrate\n';;
+    esac
+    printf '\nFlags:\n  --help                 Help\n  --config=CONFIG        Config file\n  --log-file=LOG-FILE     Log file\n'
+    case "$*" in
+      deploy|d) printf '  --region=REGION        Region\n';;
+      'deploy status'|'d status'|'deploy s'|'d s') printf '  --output=OUTPUT        Output\n';;
+    esac
+    exit 0;;
+  --completion-bash)
+    shift
+    [ "$1" = --help ] || { touch "$root/default-command-marker"; exit 9; }
+    shift;;
+  *) touch "$root/operation-marker"; exit 9;;
+esac
+query=
+for word in "$@"; do
+  [ -z "$word" ] || query="${query:+$query }$word"
+done
+case "$query" in
+  '--') printf -- '--help\n--config\n--log-file\n--default-leaf-only';;
   'deploy --'|'d --') printf -- '--region\n--help\n--config\n--log-file';;
+  'deploy status --'|'d status --'|'deploy s --'|'d s --') printf -- '--output\n--help\n--config\n--log-file';;
   'deploy'|'d') printf 'status\nrollback';;
-  'deploy status'|'d status') ;;
+  'deploy status'|'d status'|'deploy s'|'d s') touch "$root/hint-marker"; printf 'prod\nstaging';;
   *) printf 'help\ndeploy\ndb:migrate';;
 esac
 "#;
@@ -370,7 +574,7 @@ esac
             ),
             ["--region", "--help", "--config", "--log-file"]
         );
-        // `d` is not listed, but its answer differs from the root's.
+        // `d` is not listed, but its help names the deploy group.
         assert_eq!(
             values(&backend.complete(&["d"], "", &mut budget).unwrap()),
             ["status", "rollback"]
@@ -394,11 +598,19 @@ esac
         assert!(
             queries
                 .lines()
-                .all(|line| line.starts_with("<--completion-bash>")),
+                .all(|line| line.starts_with("<--completion-bash><--help>")
+                    || line.starts_with("<--help>")),
             "{queries}"
         );
         assert!(
             !queries.contains("<--config>") && !queries.contains("@args-file"),
+            "{queries}"
+        );
+        assert!(
+            queries
+                .lines()
+                .filter(|line| line.starts_with("<--completion-bash>"))
+                .all(|line| line.contains("<-->|")),
             "{queries}"
         );
         let private =
@@ -410,10 +622,16 @@ esac
             "{queries}"
         );
         assert!(!dir.0.join("bin/operation-marker").exists());
+        assert!(!dir.0.join("bin/hint-marker").exists());
+        assert!(!dir.0.join("bin/default-command-marker").exists());
         let capabilities = backend.capabilities();
         assert!(!capabilities.complete_subcommands && !capabilities.short_options);
         assert_eq!(capabilities.option_prefix, "--");
         assert_eq!(backend.cache_identity(), None);
+        assert_eq!(
+            values(&backend.complete(&[], "--", &mut budget).unwrap()),
+            ["--help", "--config", "--log-file"]
+        );
     }
 
     #[test]
@@ -428,7 +646,7 @@ esac
         assert!(queries(&dir).is_empty());
         let identity = backend(&dir, &[MODULE]);
         assert!(identity.complete(&[], "", &mut budget).is_ok());
-        for (mode, why) in [("usage", "not one word"), ("failed", "exited")] {
+        for (mode, why) in [("usage", "no usage"), ("failed", "exited")] {
             let dir = Dir::new("kingpin-failures");
             let backend = backend(&dir, &["fixture"]);
             dir.script("bin/mode", mode);
@@ -438,6 +656,57 @@ esac
                 "{mode}: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn leaf_aliases_and_options_never_query_argument_hints() {
+        let dir = Dir::new("kingpin-leaf-hints");
+        let backend = backend(&dir, &["fixture"]);
+        let mut budget = budget();
+        assert_eq!(backend.confirms(&["deploy"], "s", &mut budget), Some(true));
+        for words in [
+            &["deploy", "status"][..],
+            &["deploy", "s"],
+            &["deploy", "status", "prod"],
+        ] {
+            assert!(matches!(
+                backend.complete(words, "", &mut budget),
+                Err(CompletionError::Unsupported(_))
+            ));
+            assert!(
+                values(&backend.complete(words, "--", &mut budget).unwrap()).contains(&"--output")
+            );
+        }
+        assert!(!dir.0.join("bin/hint-marker").exists());
+        assert!(!queries(&dir).contains("<prod>"));
+        assert!(!dir.0.join("bin/operation-marker").exists());
+        assert!(!dir.0.join("bin/default-command-marker").exists());
+    }
+
+    #[test]
+    fn usage_and_command_sections_both_identify_a_group() {
+        let group = Scope::parse(
+            "\x1b[1musage:\x1b[0m fixture deploy [<flags>]\n    <command> [<args> ...]\n\nSubcommands:\n  deploy status\n",
+        )
+        .unwrap();
+        assert!(group.has_commands);
+        assert_eq!(
+            group.usage,
+            "usage: fixture deploy [<flags>] <command> [<args> ...]"
+        );
+        for text in [
+            "usage: fixture show <resource>\n\nSubcommands:\nA description only.\n",
+            "usage: fixture help <command>\n\nArgs:\n<command> Command to describe\n",
+        ] {
+            assert!(!Scope::parse(text).unwrap().has_commands);
+        }
+        assert!(Scope::parse("Commands:\n  deploy status\n").is_err());
+        let root = Scope::parse("usage: kopia [<flags>] <command> [<args> ...]\n\nCommands (use --help-full to list all commands):\nsnapshot restore* [<flags>] <object>\n    Restore a snapshot\nsnapshot list\n    List snapshots\nrepository status\n    Repository status\n").unwrap();
+        assert_eq!(values(&root.commands), ["snapshot", "repository"]);
+        let alias = Scope::parse("usage: fixture deploy <command> [<args> ...]\n\nSubcommands:\n  deploy status [<flags>]  Show status\n  deploy rollback        Roll back\n\nGlobal Flags:\n  --help   Help\n").unwrap();
+        assert_eq!(values(&alias.commands), ["status", "rollback"]);
+        let compact = Scope::parse("usage: kopia snapshot fix <command> [<args> ...]\n\nSubcommands:\n  snapshot fix\n      invalid-files [<flags>]\n      remove-files [<flags>]\n").unwrap();
+        assert_eq!(values(&compact.commands), ["invalid-files", "remove-files"]);
     }
 
     #[test]

@@ -22,7 +22,7 @@ compinit -u -D || exit 3
 zmodload zsh/zutil || exit 3
 if [[ $1 == file ]]; then
     typeset -g notypo_function=${2:t}
-    autoload -Uz -- "$2" || exit 3
+    autoload -Uz +X -- "$2" || exit 3
 elif [[ $1 == text ]]; then
     eval "$2" >/dev/null 2>&1 || exit 3
     typeset -g notypo_function=$3
@@ -33,10 +33,16 @@ fi
 typeset -ga notypo_matches=()
 typeset -gi notypo_called=0 notypo_status=0
 _notypo_handler() {
-    local notypo_collect=1
+    local notypo_collect=1 notypo_before=${functions[$notypo_function]-}
     notypo_called=1
     "$notypo_function" "$@"
     notypo_status=$?
+    # A file that only defines its handler (bitwarden's `_bw`) defines it on
+    # the first Tab and completes on the second; so does this.
+    if (( ! ${#notypo_matches} )) && [[ ${functions[$notypo_function]-} != $notypo_before ]]; then
+        "$notypo_function" "$@"
+        notypo_status=$?
+    fi
     return $notypo_status
 }
 compdef _notypo_handler "$4" || exit 3
@@ -52,10 +58,25 @@ compadd() {
             [[ -n ${notypo_flags[$notypo_flag]-} ]] && notypo_simple=0
         done
         [[ -n $IPREFIX || -n $ISUFFIX ]] && notypo_simple=0
-        [[ -n ${notypo_flags[-S]-} && ${notypo_flags[-S]} != ' ' ]] && notypo_simple=0
+        # _arguments adds an option that takes a value with an `=` suffix
+        # (attached-only values too, so arity stays unknown): option names
+        # (`-x`, or dig's `+timeout`) are kept as names. Other words with
+        # that suffix (ssh's `-o StrictHostKeyChecking=`) keep the `=`, so
+        # their typed value continues them.
+        local notypo_valued=0
+        if [[ -n ${notypo_flags[-S]-} && ${notypo_flags[-S]} != ' ' ]]; then
+            [[ ${notypo_flags[-S]} == '=' ]] && notypo_valued=1 || notypo_simple=0
+        fi
         if (( notypo_simple )); then
             builtin compadd -O notypo_added "$@"
-            notypo_matches+=( "${notypo_added[@]}" )
+            if (( notypo_valued )); then
+                for notypo_flag in "${notypo_added[@]}"; do
+                    [[ $notypo_flag == [-+]?* ]] && notypo_matches+=( "$notypo_flag" ) ||
+                        notypo_matches+=( "$notypo_flag=" )
+                done
+            else
+                notypo_matches+=( "${notypo_added[@]}" )
+            fi
         fi
     fi
     builtin compadd "$@"
@@ -329,6 +350,59 @@ mod tests {
     }
 
     #[test]
+    fn options_whose_values_follow_an_equals_sign_are_listed() {
+        let Some(zsh) = crate::utils::which("zsh") else {
+            return;
+        };
+        let dir = Dir::new("zsh-equals");
+        // clap's generated scripts declare valued options as `--name=`, which
+        // _arguments adds with an `=` suffix. Other suffixed words keep it.
+        let script = dir.script(
+            "_tool",
+            "#compdef tool\nif [[ $words[CURRENT] == -* ]]; then\n  _arguments '--name=[Name]:name:_default' '--level=-[Level]:level:(1 2)' '--quiet[Quiet]'\nelse\n  compadd -S = -- KEY\n  compadd -- build\nfi\n",
+        );
+        let backend = Backend::new(Flavor::ZshFunction, "tool", zsh).with_helper(script);
+        let mut budget = budget();
+        let options = backend.complete(&[], "--", &mut budget).unwrap();
+        assert!(options.iter().all(|item| item.takes_value.is_none()));
+        let mut options = values(options);
+        options.sort();
+        assert_eq!(options, ["--level", "--name", "--quiet"]);
+        assert_eq!(
+            values(backend.complete(&[], "", &mut budget).unwrap()),
+            ["KEY=", "build"]
+        );
+        // dig's query options: `+timeout=` keeps its name like `--name=`.
+        let script = dir.script(
+            "_dig",
+            "#compdef dig\nlocal -a args\n[[ -prefix + ]] && args=('*+timeout=[Timeout]:seconds' '*+'{no,}'short[Short]')\n_arguments -s $args '-p+[Port]:port' '*:name:'\n",
+        );
+        let dig = Backend::new(
+            Flavor::ZshFunction,
+            "dig",
+            crate::utils::which("zsh").unwrap(),
+        )
+        .with_helper(script);
+        let mut plus = values(dig.complete(&["example.com"], "+", &mut budget).unwrap());
+        plus.sort();
+        assert_eq!(plus, ["+noshort", "+short", "+timeout"]);
+        // Only a `+` prefix lists them, so that is what dig's words ask.
+        assert_eq!(dig.option_prefix("+shrot"), "+");
+        assert!(!dig.is_short_option("+shrot"));
+        assert_eq!(dig.option_separator("+tiemout=5"), Some('='));
+        assert_eq!(
+            dig.option_requires_value(&[], "+short", Some("x"), &mut budget),
+            Some(false)
+        );
+        let chmod = Backend::new(
+            Flavor::ZshFunction,
+            "chmod",
+            crate::utils::which("zsh").unwrap(),
+        );
+        assert_eq!(chmod.option_separator("+x"), None);
+    }
+
+    #[test]
     fn session_handlers_name_their_function_and_carry_definitions() {
         let text = "compdef _tool tool\ncompdef _other other\n#notypo-functions\n_tool () {\n\t_tool_commands\n}\n";
         let (definitions, function) = memory_in(text, "tool").unwrap();
@@ -401,6 +475,43 @@ mod tests {
         assert!(!dir.0.join("config-marker").exists());
         assert!(!dir.0.join(".zcompdump").exists());
         assert!(!Path::new("marker").exists());
+    }
+
+    /// bitwarden's `_bw` only defines functions, `_bw` among them: zsh
+    /// completes from the second Tab. A handler that keeps its definition
+    /// runs once.
+    #[test]
+    fn handlers_that_define_themselves_are_called_again_once() {
+        let Some(zsh) = crate::utils::which("zsh") else {
+            return;
+        };
+        let dir = Dir::new("zsh-self-defining");
+        let calls = dir.0.join("calls");
+        let quoted = crate::shlex::quote(calls.to_str().unwrap());
+        let script = dir.script(
+            "_tool",
+            &format!(
+                "#compdef _tool tool\nfunction _tool {{\n  print call >> {quoted}\n  compadd -- build deploy\n}}\nfunction _tool_helper {{ :; }}\n"
+            ),
+        );
+        let backend = Backend::new(Flavor::ZshFunction, "tool", zsh.clone()).with_helper(script);
+        let words: Vec<String> = backend
+            .complete(&[], "", &mut budget())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.value)
+            .collect();
+        assert_eq!(words, ["build", "deploy"]);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "call\n");
+        let once = dir.0.join("once");
+        let quoted = crate::shlex::quote(once.to_str().unwrap());
+        let plain = dir.script(
+            "_plain",
+            &format!("#compdef plain\nprint call >> {quoted}\n_files\n"),
+        );
+        let backend = Backend::new(Flavor::ZshFunction, "plain", zsh).with_helper(plain);
+        let _ = backend.complete(&[], "", &mut budget());
+        assert_eq!(std::fs::read_to_string(&once).unwrap(), "call\n");
     }
 
     #[test]

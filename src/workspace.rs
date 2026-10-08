@@ -1,8 +1,10 @@
 //! Workspace trust. Some programs evaluate project files from the working
 //! directory just to list what they can do: make runs a Makefile's
 //! `$(shell ...)`, rake and fastlane load Ruby, gradle, sbt, and lein run
-//! build scripts, gulp and grunt load JavaScript, and flask imports the
-//! application. notypo runs such listings (completion handlers, `--help`
+//! build scripts, gulp and grunt load JavaScript, flask imports the
+//! application, devspace runs its configuration's command variables, and
+//! garden's root help resolves the project's configuration to list its
+//! custom commands. notypo runs such listings (completion handlers, `--help`
 //! probes, and the legacy rules that list tasks) only in directories that
 //! `trusted_workspaces` names, and never runs a program that lives in an
 //! untrusted directory to list anything.
@@ -86,6 +88,40 @@ const EVALUATORS: &[(&[&str], &[&str], bool)] = &[
     (&["composer"], &["composer.json"], true),
     // Also `FLASK_APP`, which can name an application anywhere.
     (&["flask"], &[".flaskenv", "app.py", "wsgi.py"], false),
+    // Runs the configuration's `vars` commands for completion and --help.
+    (&["devspace"], &["devspace.yaml", "devspace.yml"], false),
+    // Even --help loads `.sequelizerc` (JavaScript) and the project's package.
+    (&["sequelize", "sequelize-cli"], &[".sequelizerc"], false),
+    // Even --help loads conftest.py files and plugins the configuration
+    // names (`-p` in addopts, with `pythonpath`).
+    (
+        &["pytest", "py.test"],
+        &[
+            "conftest.py",
+            "pytest.ini",
+            ".pytest.ini",
+            "pyproject.toml",
+            "tox.ini",
+            "setup.cfg",
+        ],
+        true,
+    ),
+    // A repository's configuration can enable extensions (Python) that
+    // load for help and for the handler's `hg debugcomplete`.
+    (&["hg", "chg"], &[".hg/hgrc"], true),
+    // Even --help loads the site's configuration to register plugin commands.
+    (
+        &["docusaurus"],
+        &[
+            "docusaurus.config.ts",
+            "docusaurus.config.mts",
+            "docusaurus.config.cts",
+            "docusaurus.config.js",
+            "docusaurus.config.mjs",
+            "docusaurus.config.cjs",
+        ],
+        false,
+    ),
 ];
 
 /// The name a program goes by: its file name, without Windows' executable
@@ -140,6 +176,26 @@ fn project_file(program: &str, cwd: &Path) -> Option<PathBuf> {
                     .map(|file| dir.join(file))
                 })
                 .find(|path| path.exists())
+        });
+    }
+    if name == "garden" {
+        // garden finds its project root upwards: `project.garden.yml`,
+        // `garden.yml`, or any `*.garden.yml` configuration.
+        return cwd.ancestors().find_map(|dir| {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+                .ok()?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                        ["garden.yml", "garden.yaml"].contains(&n)
+                            || n.ends_with(".garden.yml")
+                            || n.ends_with(".garden.yaml")
+                    })
+                })
+                .collect();
+            entries.sort();
+            entries.into_iter().next()
         });
     }
     let (_, files, upward) = EVALUATORS
@@ -246,6 +302,27 @@ mod tests {
     }
 
     #[test]
+    fn garden_configurations_in_parent_directories_require_workspace_trust() {
+        let root = Dir::new("garden");
+        let nested = root.0.join("services/api");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(untrusted_project("garden", &nested, &[]), None);
+        for file in ["project.garden.yml", "garden.yml", "api.garden.yaml"] {
+            std::fs::write(root.0.join(file), "kind: Project\n").unwrap();
+            let why = untrusted_project("/opt/homebrew/bin/garden", &nested, &[]).unwrap();
+            assert!(why.contains(file), "{why}");
+            assert_eq!(
+                untrusted_project("garden", &nested, &[root.0.display().to_string()]),
+                None
+            );
+            std::fs::remove_file(root.0.join(file)).unwrap();
+        }
+        // A file that merely mentions garden is no configuration.
+        std::fs::write(root.0.join("garden.yml.bak"), "").unwrap();
+        assert_eq!(untrusted_project("garden", &nested, &[]), None);
+    }
+
+    #[test]
     fn dotnet_project_and_parent_imports_require_workspace_trust() {
         let root = Dir::new("dotnet");
         let project = root.0.join("app");
@@ -322,6 +399,18 @@ mod tests {
         assert_eq!(untrusted_project("just", &project, none), None);
         assert_eq!(untrusted_project("make", &root.0, none), None);
         assert_eq!(untrusted_project("/bin/ls", &project, none), None);
+        // pytest loads conftest.py for --help, from parent directories too.
+        std::fs::write(project.join("conftest.py"), "").unwrap();
+        assert!(untrusted_project("pytest", &nested, none).is_some());
+        // A Mercurial repository's own configuration names extensions.
+        std::fs::create_dir_all(project.join(".hg")).unwrap();
+        std::fs::write(project.join(".hg/hgrc"), "[extensions]\n").unwrap();
+        assert!(untrusted_project("hg", &nested, none).is_some());
+        assert_eq!(untrusted_project("hg", &root.0, none), None);
+        // docusaurus loads the site's configuration even for --help.
+        std::fs::write(project.join("docusaurus.config.mjs"), "").unwrap();
+        assert!(untrusted_project("docusaurus", &project, none).is_some());
+        assert_eq!(untrusted_project("docusaurus", &nested, none), None);
 
         for trusted in [
             vec![project.display().to_string()],

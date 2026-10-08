@@ -17,6 +17,7 @@ compare.py.
 """
 
 import argparse
+import io
 import json
 import math
 import os
@@ -27,6 +28,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import tarfile
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,10 +50,13 @@ CASES = [
 
 def run(command, env):
     """One process: wall seconds, peak RSS in KiB, and the parsed report."""
-    args = [str(BINARY), "--json", "--force-command", command]
+    args = [str(BINARY), "--json"]
+    if env.get("TF_HISTORY") != command:
+        args.extend(["--force-command", command])
     started = time.perf_counter()
     proc = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            cwd=env.get("NOTYPO_BENCH_CWD"))
     out = proc.stdout.read()
     _, status, usage = os.wait4(proc.pid, 0)
     elapsed = time.perf_counter() - started
@@ -95,8 +101,36 @@ PROTOCOL_CASES = [
     ("cobra protocol (k9s, user-trusted)", "k9s", "k9s --readoly", "k9s --readonly",
      ["github.com/derailed/k9s"], []),
     ("bash handler protocol (bq)", "bq", "bq qeury x", "bq query x", ["bq"], []),
+    ("Click protocol (SAM)", "sam", "sam build --use-contaner",
+     "sam build --use-container", ["python:samcli"], ["python:samcli"]),
+    ("Click protocol (OCI)", "oci", "oci os bucket list --namespce x",
+     "oci os bucket list --namespace x", ["python:oci_cli"], ["python:oci_cli"]),
     ("oclif manifests (eas)", "eas", "eas build --platfrom ios", "eas build --platform ios",
      [], []),
+    ("Symfony Console protocol (Composer)", "composer", "composer install --dry-rnu",
+     "composer install --dry-run", ["composer"], ["composer"]),
+    ("kingpin protocol (promtool)", "promtool", "promtool check config --syntax-onyl prometheus.yml",
+     "promtool check config --syntax-only prometheus.yml",
+     ["github.com/prometheus/prometheus/cmd/promtool"], ["promtool"]),
+    ("kingpin protocol (kopia)", "kopia", "kopia snapshot restore --paralell 4 object-id output",
+     "kopia snapshot restore --parallel 4 object-id output", ["github.com/kopia/kopia"], ["kopia"]),
+    ("kingpin/fisk protocol (nats)", "nats", "nats stream ls --jsoon",
+     "nats stream ls --json", ["github.com/nats-io/natscli/nats"], ["nats"]),
+    ("RabbitMQ CLI protocol (command)", "rabbitmqctl", "rabbitmqctl lsit_queues",
+     "rabbitmqctl list_queues", ["rabbitmq:rabbitmqctl"], ["rabbitmq:rabbitmqctl"]),
+    ("RabbitMQ CLI protocol (option)", "rabbitmqctl",
+     "rabbitmqctl delete_queue --if-emtpy orders", "rabbitmqctl delete_queue --if-empty orders",
+     ["rabbitmq:rabbitmqctl"], ["rabbitmq:rabbitmqctl"]),
+    # 2026-10-06: posener argument-slot checks, cobra alias confirmation and
+    # boolean-flag detection, and shell-handler arity checks add probes.
+    ("posener protocol (vault, audited)", "vault", "vault secrets lsit", "vault secrets list",
+     [], []),
+    ("cobra protocol (helm, audited, alias check)", "helm", "helm instal x", "helm install x",
+     [], []),
+    ("cobra boolean flag (restic, audited)", "restic", "restic backup --exclud x .",
+     "restic backup --exclude x .", [], []),
+    ("zsh handler protocol (tmux)", "tmux", "tmux attahc -t x", "tmux attach -t x",
+     ["tmux"], []),
 ]
 
 
@@ -107,8 +141,20 @@ def protocol_cases():
             "NOTYPO_TRUSTED_COMPLETERS": json.dumps(completers),
             "NOTYPO_TRUSTED_HELP": json.dumps(help_),
             "NOTYPO_DISABLED_SOURCES": "help:man:history:legacy",
+            "NOTYPO_REPLAY_FOR_DIAGNOSIS": "false",
             "HOMEBREW_NO_AUTO_UPDATE": "1",
         }
+        if label.startswith("Click protocol"):
+            # Match the installed-client checks and a shell-captured failure.
+            # OCI's root protocol fails; failure context permits checking its
+            # later option without treating an unknown root word as invalid.
+            overrides["NOTYPO_EXIT_STATUS"] = "1"
+            overrides["TF_HISTORY"] = command
+            overrides["TF_ALIAS"] = "fuck"
+        if app == "oci":
+            # Its unsupported root reply needs the trusted help fallback to
+            # establish the existing command path before native option repair.
+            overrides["NOTYPO_DISABLED_SOURCES"] = "man:history:legacy"
         cases.append((label, app, command, overrides, expected))
     return cases + powershell_cases()
 
@@ -153,7 +199,50 @@ def powershell_cases():
             "NOTYPO_DISABLED_SOURCES": "help:man:history:legacy",
         }
         cases.append((label, app, command, overrides, expected))
+    command = "Get-NotypoBench -Scope west -Target wesst-one"
+    cases.append(("PowerShell parameter callback protocol", pwsh, command, {
+        "TF_SHELL": "powershell",
+        "NOTYPO_POWERSHELL": pwsh,
+        "NOTYPO_POWERSHELL_PARAMETERS": session_parameters(pwsh, command),
+        "NOTYPO_TRUSTED_COMPLETERS": json.dumps(["Get-NotypoBench"]),
+        "NOTYPO_DISABLED_SOURCES": "help:man:history:legacy",
+        "NOTYPO_REPLAY_FOR_DIAGNOSIS": "false",
+    }, "Get-NotypoBench -Scope west -Target west-one"))
+    command = "Get-NotypoBench wesst-one -Scope west"
+    cases.append(("PowerShell positional callback protocol", pwsh, command, {
+        "TF_SHELL": "powershell",
+        "NOTYPO_POWERSHELL": pwsh,
+        "NOTYPO_POWERSHELL_PARAMETERS": session_parameters(pwsh, command),
+        "NOTYPO_TRUSTED_COMPLETERS": json.dumps(["Get-NotypoBench"]),
+        "NOTYPO_DISABLED_SOURCES": "help:man:history:legacy",
+        "NOTYPO_REPLAY_FOR_DIAGNOSIS": "false",
+    }, "Get-NotypoBench west-one -Scope west"))
     return cases
+
+
+def session_parameters(pwsh, line):
+    """Capture a callback-bearing function with the integration's own code.
+    It has no operation to run; the body throws if accidentally invoked."""
+    definitions = """function Get-NotypoBench {
+        [CmdletBinding()] param([Parameter(Position=0)][ValidateSet('west','east')][string]$Scope,
+            [Parameter(Position=1)][ArgumentCompleter({
+                param($cmd,$parameter,$word,$ast,$bound)
+                $bound['Scope'] + '-one'
+            })][string]$Target)
+        throw 'the benchmark command must never run'
+    }"""
+    capture = (ROOT / "src" / "shells" / "powershell_parameters.ps1").read_text()
+    script = (". ([scriptblock]::Create($env:NOTYPO_BENCH_DEFINITIONS))\n"
+              "$history = $env:NOTYPO_BENCH_LINE\n" + capture + "\n"
+              "[Console]::Out.Write($env:NOTYPO_POWERSHELL_PARAMETERS)")
+    text = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-Command", script],
+                          capture_output=True, text=True, check=True,
+                          env=dict(os.environ, NOTYPO_BENCH_DEFINITIONS=definitions,
+                                   NOTYPO_BENCH_LINE=line)).stdout
+    snapshot = json.loads(text)
+    if snapshot["commands"][0]["portable"] is not True:
+        raise RuntimeError("PowerShell did not capture the benchmark function")
+    return text
 
 
 def session_completions(pwsh, generator, line):
@@ -223,6 +312,58 @@ esac
     return cases, marker
 
 
+def archive_fixtures(root):
+    """Real installed readers list local fixture archives; no extraction runs."""
+    work = root / "archives"
+    work.mkdir()
+    with tarfile.open(work / "backup.tar", "w") as archive:
+        entry = tarfile.TarInfo("docs/report.txt")
+        entry.size = 1
+        archive.addfile(entry, io.BytesIO(b"x"))
+    for name in ["photos.zip", "app.jar"]:
+        with zipfile.ZipFile(work / name, "w") as archive:
+            archive.writestr("docs/report.txt", "x")
+
+    def member(name, data):
+        header = f"{name:<16}{0:<12}{0:<6}{0:<6}{644:<8}{len(data):<10}`\n".encode()
+        return header + data + (b"\n" if len(data) % 2 else b"")
+
+    # A BSD/System V archive; member names have no directories.
+    (work / "libfoo.a").write_bytes(b"!<arch>\n" + member("report.o", b"x"))
+    # jar needs a JDK; macOS's /usr/bin/jar is a stub without one.
+    jdk = os.environ.get("NOTYPO_TEST_JDK")
+    path = os.pathsep.join(p for p in [jdk, os.environ.get("PATH", os.defpath)] if p)
+    cases = []
+    for app, mode, archive, member_name in [
+            ("tar", "xf", "backup.tar", "docs/reprot.txt"),
+            ("gtar", "xf", "backup.tar", "docs/reprot.txt"),
+            ("unzip", "", "photos.zip", "docs/reprot.txt"),
+            ("zipinfo", "", "photos.zip", "docs/reprot.txt"),
+            ("7z", "x", "photos.zip", "docs/reprot.txt"),
+            ("unar", "", "photos.zip", "docs/reprot.txt"),
+            ("ar", "x", "libfoo.a", "reprot.o"),
+            ("jar", "xf", "app.jar", "docs/reprot.txt")]:
+        command = " ".join(word for word in [app, mode, archive, member_name] if word)
+        overrides = {
+            "NOTYPO_BENCH_CWD": str(work),
+            "XDG_CONFIG_HOME": str(root / "config"),
+            "NOTYPO_TRUSTED_COMPLETERS": json.dumps([app]),
+            "NOTYPO_TRUSTED_HELP": "[]",
+            "NOTYPO_DISABLED_SOURCES": "help:man:history:legacy",
+            "NOTYPO_REPLAY_FOR_DIAGNOSIS": "false",
+            "NOTYPO_EXIT_STATUS": "1",
+            "TF_HISTORY": command,
+            "PATH": path,
+        }
+        if app == "jar" and subprocess.run([shutil.which("jar", path=path) or "jar", "--version"],
+                                           capture_output=True).returncode != 0:
+            print("skip archive members (jar): no JDK (set NOTYPO_TEST_JDK)")
+            continue
+        cases.append((f"archive members ({app})", app, command, overrides,
+                      command.replace("reprot", "report")))
+    return cases, work
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--samples", type=int, default=15)
@@ -230,6 +371,8 @@ def main():
     parser.add_argument("--shell-fixtures", action="store_true", help="include isolated fish/Zsh handlers")
     parser.add_argument("--protocols", action="store_true",
                         help="include installed apps behind the newer protocol bridges")
+    parser.add_argument("--archive-fixtures", action="store_true",
+                        help="include installed archive readers and isolated local archives")
     parser.add_argument("--case", help="only run labels containing this text")
     options = parser.parse_args()
     if options.samples < 1:
@@ -242,11 +385,15 @@ def main():
         scratch = Path(scratch)
         cases = [(label, app, command, {}, None) for label, app, command in CASES]
         marker = None
+        archives = None
         if options.shell_fixtures:
             fixtures, marker = shell_fixtures(scratch)
             cases.extend(fixtures)
         if options.protocols:
             cases.extend(protocol_cases())
+        if options.archive_fixtures:
+            fixtures, archives = archive_fixtures(scratch)
+            cases.extend(fixtures)
         for label, app, command, overrides, expected in cases:
             if options.case and options.case not in label:
                 continue
@@ -290,6 +437,9 @@ def main():
             print(json.dumps(row))
         if marker is not None and marker.exists():
             sys.exit("the shell fixture operation was executed")
+        if archives is not None and any(
+                (archives / name).exists() for name in ["docs", "report.o", "META-INF"]):
+            sys.exit("the archive fixture was extracted")
 
     fixture_only = bool(rows) and all(r["case"].endswith(" shell handler") for r in rows)
     protocol_only = bool(rows) and all(" protocol" in r["case"] for r in rows)
@@ -330,8 +480,11 @@ def main():
             "",
             "Installed apps behind the newer bridges, each with the trust it needs",
             "(`trusted_completers`, plus `trusted_help` for Cargo, Sofka's generator,",
-            "and lefthook's urfave/cli v3 hooks); help, man, history, and legacy",
-            "sources are off. The harness checks every suggestion; none is executed.",
+            "lefthook's urfave/cli v3 hooks, Click/Symfony app discovery, kingpin's",
+            "and RabbitMQ's metadata); fallback help, man, history, and legacy",
+            "sources are off except OCI's trusted help fallback for its unsupported root reply.",
+            "Click rows use a simulated shell-captured failure (history and status 1); replay is off.",
+            "The harness checks every suggestion; none is executed.",
             "These bridges keep answers in request memory, so warm runs repeat their",
             "probes; cobra answers for command-only contexts reach the disk cache.",
             "The bq case runs the Cloud SDK's bash helper, which starts Python for",

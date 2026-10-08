@@ -146,8 +146,74 @@ const REMOTE: &[&str] = &[
 ];
 /// Programs that write to, move, or change the files named as arguments.
 const WRITERS: &[&str] = &[
-    "cp", "mv", "ln", "install", "rsync", "scp", "tee", "touch", "chmod", "chown", "chgrp", "tar",
-    "unzip", "patch", "sed", "truncate",
+    "cp",
+    "mv",
+    "ln",
+    "install",
+    "rsync",
+    "scp",
+    "tee",
+    "touch",
+    "chmod",
+    "chown",
+    "chgrp",
+    "tar",
+    "unzip",
+    "patch",
+    "sed",
+    "truncate",
+    // Archivers create or extract what their arguments name; in-place
+    // compressors replace or delete their input files.
+    "bsdtar",
+    "gtar",
+    "zip",
+    "7z",
+    "7za",
+    "7zr",
+    "7zz",
+    "rar",
+    "unrar",
+    "unar",
+    "ditto",
+    "cpio",
+    "bsdcpio",
+    "ar",
+    "jar",
+    "pax",
+    "gzip",
+    "gunzip",
+    "pigz",
+    "unpigz",
+    "bzip2",
+    "bunzip2",
+    "pbzip2",
+    "xz",
+    "unxz",
+    "lzma",
+    "unlzma",
+    "zstd",
+    "unzstd",
+    "zstdmt",
+    "lz4",
+    "unlz4",
+    "brotli",
+    "compress",
+    "uncompress",
+    "lzip",
+    "plzip",
+    "lunzip",
+    "clzip",
+    "lzop",
+    "pixz",
+    "ouch",
+    "atool",
+    "aunpack",
+    "apack",
+    "arepack",
+    "unsquashfs",
+    "mksquashfs",
+    "cabextract",
+    "dtrx",
 ];
 const INTERPRETERS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "fish", "python", "python3", "perl", "ruby", "node",
@@ -267,10 +333,40 @@ const POWERSHELL_WRITERS: &[&str] = &[
     "export-csv",
     "epcsv",
     "export-clixml",
+    "expand-archive",
+    "compress-archive",
 ];
 
 fn base(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
+}
+
+/// GNU's `g` prefix and uutils' `uu-` prefix do not relax the policy for
+/// file-writing and destructive tools. Only existing policy names are
+/// normalized, so unrelated programs such as git and gh keep their names.
+fn coreutils_policy_name(program: &str) -> &str {
+    // gzip/gunzip are programs in their own right, not GNU-prefixed zip
+    // and unzip; their existing compression policy takes precedence.
+    if DESTRUCTIVE_PROGRAMS.contains(&program)
+        || WRITERS.contains(&program)
+        || FORCE_SHORT.contains(&program)
+    {
+        return program;
+    }
+    let plain = program
+        .strip_prefix("uu-")
+        .or_else(|| program.strip_prefix('g'));
+    plain
+        .and_then(|plain| {
+            DESTRUCTIVE_PROGRAMS
+                .iter()
+                .chain(WRITERS)
+                .chain(FORCE_SHORT)
+                .chain(&["find", "crontab"])
+                .copied()
+                .find(|&known| known == plain)
+        })
+        .unwrap_or(program)
 }
 
 /// Literal words of a command, with opaque words as their source text.
@@ -500,7 +596,19 @@ fn assess_resolved(
         } else {
             resolve(all[p]).unwrap_or_else(|| base(all[p]))
         };
-        let args = &all[p + 1..];
+        let mut args = &all[p + 1..];
+        // A multicall invocation runs its first argument as the applet;
+        // file-target and force/recursion checks apply to that applet.
+        let program = if matches!(program, "coreutils" | "uu-coreutils" | "busybox")
+            && args.first().is_some_and(|name| !name.starts_with('-'))
+        {
+            let applet = args[0];
+            args = &args[1..];
+            applet
+        } else {
+            program
+        };
+        let program = coreutils_policy_name(program);
         let verbs = operations::verbs(program, args);
         if new.dialect == parser::Dialect::PowerShell {
             if POWERSHELL_DESTRUCTIVE.contains(&program)
@@ -632,6 +740,23 @@ fn assess_resolved(
                 }
             }
         }
+        // chezmoi and stow write the files their targets name, and scanners
+        // probe their hosts and repositories; a repaired target needs
+        // approval, a repaired operation alone not.
+        if changed && let Some(targets) = operations::targets(program, args) {
+            // Any word of the original line: a misspelled operation or option
+            // name (`nikto -hots example.com`) still named the same target.
+            let before: Vec<&str> = original
+                .commands
+                .get(index)
+                .map(|old| words(old, &original.source))
+                .unwrap_or_default();
+            for target in targets {
+                if !before.contains(&target) {
+                    gate.flag(Decision::Confirm, format!("{program} now targets {target}"));
+                }
+            }
+        }
         if changed && REMOTE.contains(&program) {
             gate.flag(
                 Decision::Confirm,
@@ -641,7 +766,7 @@ fn assess_resolved(
         if changed && matches!(program, "eval" | "source" | ".") {
             gate.flag(Decision::Confirm, format!("{program} runs shell text"));
         }
-        if INTERPRETERS.contains(&program) {
+        if INTERPRETERS.contains(&program) || super::native::is_php_interpreter_name(program) {
             let pipeline = new.pipeline_of(index);
             let downloads = new.commands[pipeline.start..index].iter().any(|c| {
                 effective_program(&c.words)
@@ -721,6 +846,14 @@ fn is_destructive_git(verbs: &[&str], args: &[&str]) -> bool {
         Some(&"checkout") => has(&["--", ".", "-f", "--force"]),
         Some(&"branch") => has(&["-D", "-d", "--delete"]),
         Some(&"stash") => verbs.get(1).is_some_and(|v| matches!(*v, "drop" | "clear")),
+        // git-extras and git-branchless commands (git-* helpers on PATH)
+        // that discard work, rewrite or push history, or replace a clone.
+        Some(
+            &"obliterate" | &"undo" | &"clear" | &"clear-soft" | &"reset-file" | &"force-clone"
+            | &"sync" | &"squash" | &"abort" | &"rename-tag" | &"rename-branch" | &"release"
+            | &"hide" | &"move" | &"restack" | &"reword" | &"amend" | &"submit",
+        ) => true,
+        Some(&"absorb") => has(&["--and-rebase", "-r"]),
         _ => false,
     }
 }
@@ -728,6 +861,98 @@ fn is_destructive_git(verbs: &[&str], args: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefixed_and_multicall_tools_keep_destructive_and_write_target_policy() {
+        for command in [
+            "uu-rm file",
+            "grm file",
+            "uu-rmdir directory",
+            "gshred file",
+            "uu-chmod -R 755 directory",
+            "gchown -R user directory",
+            "gzip -f input",
+            "gunzip -f input.gz",
+            "uu-coreutils rm file",
+            "coreutils chmod -R 755 directory",
+            "busybox kill 123",
+            "/opt/tools/uu-coreutils cp -R input output",
+        ] {
+            let gate = assess_replay(command);
+            assert_eq!(gate.decision, Decision::Confirm, "{command}: {gate:?}");
+        }
+        for (original, candidate) in [
+            ("uu-cp input outptu", "uu-cp input output"),
+            ("gcp input outptu", "gcp input output"),
+            (
+                "uu-coreutils cp input outptu",
+                "uu-coreutils cp input output",
+            ),
+            ("busybox tee outptu", "busybox tee output"),
+        ] {
+            let gate = assess(&parser::parse(original), candidate, &[]);
+            assert_eq!(gate.decision, Decision::Confirm, "{candidate}: {gate:?}");
+            assert!(
+                gate.reasons
+                    .iter()
+                    .any(|reason| reason.contains("now targets output"))
+            );
+        }
+        for command in [
+            "uu-cat input",
+            "gcat input",
+            "uu-coreutils cat input",
+            "git status",
+            "gh pr list",
+        ] {
+            assert_eq!(
+                assess_replay(command).decision,
+                Decision::Allow,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_helper_commands_that_rewrite_or_discard_need_approval() {
+        for command in [
+            "git obliterate secrets.txt",
+            "git undo 2",
+            "git clear",
+            "git reset-file README.md",
+            "git force-clone https://example.com/repo dir",
+            "git sync",
+            "git squash feature",
+            "git rename-branch old new",
+            "git release 1.0",
+            "git absorb --and-rebase",
+            "git move -s abc -d main",
+            "git restack",
+            "git delete-branch feature",
+        ] {
+            let gate = assess(&parser::parse(&format!("{command}x")), command, &[]);
+            assert_eq!(
+                gate.decision,
+                Decision::Confirm,
+                "{command}: {:?}",
+                gate.reasons
+            );
+        }
+        for command in [
+            "git summary",
+            "git absorb",
+            "git effort",
+            "git branchless init --help",
+        ] {
+            let gate = assess(&parser::parse(&format!("{command}x")), command, &[]);
+            assert_eq!(
+                gate.decision,
+                Decision::Allow,
+                "{command}: {:?}",
+                gate.reasons
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -1023,6 +1248,22 @@ mod tests {
         );
         let gate = check("sudo sytemctl status x", "sudo systemctl status x");
         assert_eq!(gate.decision, Decision::Allow, "{:?}", gate.reasons);
+    }
+
+    #[test]
+    fn attached_seven_zip_extraction_targets_need_confirmation_when_changed() {
+        for program in ["7z", "7za", "7zr", "7zz"] {
+            let before = format!("{program} x archive.7z -ooutpt -t7z -mx=9");
+            let after = format!("{program} x archive.7z -ooutput -t7z -mx=9");
+            let gate = check(&before, &after);
+            assert_eq!(gate.decision, Decision::Confirm, "{gate:?}");
+            assert!(
+                gate.reasons
+                    .iter()
+                    .any(|reason| reason.contains("now targets -ooutput")),
+                "{gate:?}"
+            );
+        }
     }
 
     #[test]

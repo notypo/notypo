@@ -8,10 +8,10 @@ import os
 from pathlib import Path
 import platform
 import random
-import re
 import statistics
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from time import perf_counter_ns
 
@@ -42,6 +42,25 @@ def source_hash():
         digest.update(str(path.relative_to(ROOT)).encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def memory_run(argv, env, cwd, expected):
+    """Per-process RSS from wait4, without privileged macOS task inspection.
+    A file drains stderr independently of stdout, so neither pipe can fill."""
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=errors)
+        stdout = process.stdout.read().decode()
+        _, status, usage = os.wait4(process.pid, 0)
+        process.returncode = os.waitstatus_to_exitcode(status)
+        process.stdout.close()
+        errors.seek(0)
+        stderr = errors.read().decode()
+        if process.returncode:
+            raise subprocess.CalledProcessError(process.returncode, argv, stdout, stderr)
+        if stdout.strip() != expected or "[WARN]" in stderr:
+            raise RuntimeError(f"memory sample: unexpected correction {stdout!r}; {stderr}")
+        return usage.ru_maxrss / 1024**2
 
 
 def main():
@@ -178,8 +197,7 @@ def main():
         for name, argv in implementations.items():
             values = []
             for _ in range(5):
-                measured = run(["/usr/bin/time", "-l"] + argv + case["args"], case["env"], work)
-                values.append(int(re.search(r"(\d+)\s+maximum resident set size", measured.stderr)[1]) / 1024**2)
+                values.append(memory_run(argv + case["args"], case["env"], work, case["expected"]))
             memory[name] = summarize(values)
     metadata = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -187,7 +205,7 @@ def main():
         "python": run([python, "--version"], env, work).stdout.strip(),
         "rustc": run(["rustc", "--version"], env, work).stdout.strip(),
         "python_dependencies": json.loads(run([python, "-m", "pip", "list", "--format=json"], env, work).stdout),
-        "cpu": run(["sysctl", "-n", "machdep.cpu.brand_string"], env, work).stdout.strip() if platform.system() == "Darwin" else platform.processor(),
+        "cpu": platform.processor() or platform.machine(),
         "python_source_sha256": source_hash(),
         "rust_binary_sha256": hashlib.sha256(Path(rust).read_bytes()).hexdigest(),
         "rust_binary_bytes": Path(rust).stat().st_size,
@@ -223,10 +241,10 @@ def main():
         report.append(f"| {name} | {measurement['python']['median']:.2f} | {measurement['rust']['median']:.2f} | {measurement['speedup']:.1f}× |")
     if memory:
         report += ["", "## Memory", "",
-                   f"Median peak resident memory for cd_parent_rerun over five separate `/usr/bin/time -l` runs: Python {memory['python']['median']:.2f} MiB; Rust {memory['rust']['median']:.2f} MiB.",
-                   "This measures the correction process, not aggregate memory of its child processes."]
+                   f"Median peak resident memory for cd_parent_rerun over five separate `wait4` samples: Python {memory['python']['median']:.2f} MiB; Rust {memory['rust']['median']:.2f} MiB.",
+                   "RSS is the process usage reported by the OS; child accounting depends on the OS. This is not aggregate process-tree memory."]
     report += ["", "Results describe warm local macOS runs, not cold disk startup or other platforms. CLI gains include native startup, rule loading, PATH handling, terminal parsing and rerun optimizations; they do not isolate language execution speed.",
-               "Raw samples, dependency versions and source/binary fingerprints are in results.json.", ""]
+               f"Raw samples, dependency versions and source/binary fingerprints are in {args.output.name}.", ""]
     report_path = args.output.with_suffix(".md")
     report_path.write_text("\n".join(report))
     print("\n" + "\n".join(report), flush=True)

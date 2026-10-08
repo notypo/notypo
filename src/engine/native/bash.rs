@@ -16,8 +16,10 @@
 
 use super::{CompletionError, CompletionItem, run_stdout};
 use crate::engine::probe::Budget;
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const DRIVER: &str = r#"case $1 in
   file) source "$2" >/dev/null 2>&1 || exit 3;;
@@ -74,15 +76,23 @@ pub(super) fn script_for(name: &str) -> Option<PathBuf> {
 /// bash-completion sources every file in `bash_completion.d` at startup,
 /// and one file may register several commands (the Cloud SDK's registers
 /// gcloud, bq, and gsutil). Find a file whose text registers `name` with a
-/// function. Files are only read here; nothing is sourced.
+/// function. Files are only read here; nothing is sourced. The directories
+/// are indexed once per process: discovery asks about every candidate
+/// program, and Homebrew's directory alone can hold dozens of scripts.
 fn registering_script(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
-    let registers = |line: &str| {
-        crate::shlex::split(line.trim()).is_ok_and(|words| {
-            words.first().is_some_and(|word| word == "complete")
-                && words.iter().any(|word| word == "-F")
-                && words.last().is_some_and(|word| word == name)
-        })
-    };
+    type Index = HashMap<String, PathBuf>;
+    static INDEXES: OnceLock<Mutex<HashMap<Vec<PathBuf>, Index>>> = OnceLock::new();
+    let mut indexes = INDEXES.get_or_init(Mutex::default).lock().ok()?;
+    let index = indexes
+        .entry(dirs.to_vec())
+        .or_insert_with(|| index_registrations(dirs));
+    index.get(name).cloned()
+}
+
+/// The first file (by directory, then name) registering each command as the
+/// last word of a `complete ... -F function ...` line.
+fn index_registrations(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
+    let mut index: HashMap<String, PathBuf> = HashMap::new();
     for dir in dirs {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
@@ -97,12 +107,27 @@ fn registering_script(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
             if !path.is_file() || path.metadata().map_or(true, |m| m.len() > 1024 * 1024) {
                 continue;
             }
-            if std::fs::read_to_string(&path).is_ok_and(|text| text.lines().any(registers)) {
-                return Some(path);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in text.lines().map(str::trim) {
+                // Only registrations are worth splitting.
+                if !line.starts_with("complete") || !line.contains("-F") {
+                    continue;
+                }
+                if let Ok(words) = crate::shlex::split(line)
+                    && words.first().is_some_and(|word| word == "complete")
+                    && words.iter().any(|word| word == "-F")
+                    && let Some(name) = words.last()
+                {
+                    index
+                        .entry(name.to_string())
+                        .or_insert_with(|| path.clone());
+                }
             }
         }
     }
-    None
+    index
 }
 
 /// Where the registering code comes from.
@@ -173,11 +198,14 @@ pub(super) fn complete(
     ];
     args.extend(words.iter().map(OsString::from));
     args.push(prefix.into());
+    // A script that registers nothing (yadm's needs git's handler loaded
+    // first) is broken, not a statement that nothing here is a command:
+    // documentation still applies.
     let text = run_stdout(bash, args, env, budget, true).map_err(|error| match error {
         CompletionError::Failed(why)
             if ["exited with Some(4)", "exited with Some(5)"].contains(&why.as_str()) =>
         {
-            CompletionError::Unsupported(format!(
+            CompletionError::Failed(format!(
                 "{shown} registers no usable completion function for {name}"
             ))
         }
@@ -267,7 +295,7 @@ mod tests {
         );
         assert!(matches!(
             complete(&bash, &Source::Text("true\n"), "tool", &[], "", Vec::new(), &mut budget),
-            Err(CompletionError::Unsupported(why)) if why.contains("your bash session")
+            Err(CompletionError::Failed(why)) if why.contains("your bash session")
         ));
     }
 
@@ -310,8 +338,40 @@ complete -F _tool tool
         .with_helper(broken);
         assert!(matches!(
             backend.complete(&[], "", &mut budget),
-            Err(CompletionError::Unsupported(_))
+            Err(CompletionError::Failed(_))
         ));
+    }
+
+    /// borg's handlers list archives with `borg list`, which would lock
+    /// the repository and could run BORG_PASSCOMMAND or ssh.
+    #[test]
+    fn borg_handlers_call_a_stub_instead_of_borg() {
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let dir = Dir::new("bash-borg");
+        let marker = dir.0.join("resolved");
+        let script = dir.script(
+            "completions/borg",
+            &format!(
+                "_borg() {{\n  COMPREPLY=(create delete list)\n  type -P borg > {}\n  borg list repo:: && COMPREPLY=(opened)\n}}\ncomplete -F _borg borg\n",
+                crate::shlex::quote(marker.to_str().unwrap())
+            ),
+        );
+        let backend = Backend::new(Flavor::BashFunction, "borg", bash).with_helper(script);
+        let mut budget = Budget::new(Duration::from_secs(10), Duration::from_secs(5), 8);
+        let words: Vec<String> = backend
+            .complete(&["delete", "repo::a1"], "", &mut budget)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.value)
+            .collect();
+        assert_eq!(words, ["create", "delete", "list"]);
+        let resolved = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            Path::new(resolved.trim()).starts_with(crate::utils::cache_dir().join("stubs/borg")),
+            "{resolved}"
+        );
     }
 
     #[test]

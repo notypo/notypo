@@ -1419,7 +1419,12 @@ esac
             .unwrap();
         assert_eq!(flag.takes_value, Some(true));
         assert_eq!(
-            backend.option_requires_value(&["new"], "--debug:virtual-hive", Some("--output")),
+            backend.option_requires_value(
+                &["new"],
+                "--debug:virtual-hive",
+                Some("--output"),
+                &mut Budget::new(Duration::from_secs(1), Duration::from_secs(1), 1)
+            ),
             Some(false)
         );
         let schema: Value = serde_json::from_str(SCHEMA).unwrap();

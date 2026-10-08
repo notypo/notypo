@@ -99,7 +99,7 @@ fn names_path(report: &str, path: &str) -> bool {
 
 pub fn diagnose_output(output: &str) -> OutputDiagnosis {
     let mut diagnosis = OutputDiagnosis::default();
-    let patterns: [(ProblemKind, &regex::Regex); 23] = [
+    let patterns: [(ProblemKind, &regex::Regex); 28] = [
         (
             ProblemKind::CommandNotFound,
             regex!(r"(?m)(?:^|: )(?:line \d+: |\d+: )?([^\s:'`]+): (?:command )?not found\s*$"),
@@ -192,6 +192,25 @@ pub fn diagnose_output(output: &str) -> OutputDiagnosis {
             regex!(r"(?m)([^\s:'`]+): No such file or directory"),
         ),
         (ProblemKind::MissingPath, regex!(r"cannot access '([^']+)'")),
+        // Archivers name the file they couldn't open their own way: bsdtar,
+        // GNU tar, unzip, zip, and zstd.
+        (
+            ProblemKind::MissingPath,
+            regex!(r"Failed to open '([^']+)'"),
+        ),
+        (
+            ProblemKind::MissingPath,
+            regex!(r"(?m)([^\s:'`]+): Cannot open: No such file or directory"),
+        ),
+        (
+            ProblemKind::MissingPath,
+            regex!(r"cannot find or open ([^,\s]+),"),
+        ),
+        (ProblemKind::MissingPath, regex!(r"name not matched: (\S+)")),
+        (
+            ProblemKind::MissingPath,
+            regex!(r"can't stat ([^\s:]+) : No such file"),
+        ),
     ];
     for (kind, pattern) in patterns {
         for caps in pattern.captures_iter(output) {
@@ -602,6 +621,32 @@ mod tests {
             ),
             (
                 "cat: fiel.txt: No such file or directory",
+                ProblemKind::MissingPath,
+                "fiel.txt",
+            ),
+            // Archivers: bsdtar, GNU tar, unzip, zip, zstd.
+            (
+                "tar: Error opening archive: Failed to open 'backpu.tar.gz'",
+                ProblemKind::MissingPath,
+                "backpu.tar.gz",
+            ),
+            (
+                "tar: backpu.tar.gz: Cannot open: No such file or directory",
+                ProblemKind::MissingPath,
+                "backpu.tar.gz",
+            ),
+            (
+                "unzip:  cannot find or open photso.zip, photso.zip.zip or photso.zip.ZIP.",
+                ProblemKind::MissingPath,
+                "photso.zip",
+            ),
+            (
+                "\tzip warning: name not matched: fiel.txt",
+                ProblemKind::MissingPath,
+                "fiel.txt",
+            ),
+            (
+                "zstd: can't stat fiel.txt : No such file or directory -- ignored",
                 ProblemKind::MissingPath,
                 "fiel.txt",
             ),

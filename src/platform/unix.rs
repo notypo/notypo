@@ -36,6 +36,22 @@ pub(crate) fn open_pty(size: &libc::winsize) -> io::Result<(File, File)> {
     Ok((master, slave))
 }
 
+/// Starts the child in a new session, without a controlling terminal: a
+/// program that opens /dev/tty to prompt (borg's or ssh's passphrase, gpg)
+/// fails at once instead of writing to the user's terminal and stopping.
+/// The session's process group has the child's id, as with process_group(0).
+pub(crate) fn new_session(process: &mut Command) {
+    // SAFETY: setsid is async-signal-safe.
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 pub(crate) fn controlling_terminal(process: &mut Command) {
     // SAFETY: only async-signal-safe calls run between fork and exec. The
     // caller must attach the PTY slave to the child's stdin before spawn.
