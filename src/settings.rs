@@ -33,6 +33,29 @@ pub struct Settings {
     /// Used by the `fix_file` rule (`@default_settings` in Python).
     pub fixlinecmd: String,
     pub fixcolcmd: Option<String>,
+    /// Candidate sources the correction engine must not use (see
+    /// [`crate::engine::Source::setting_name`]).
+    pub disabled_sources: Vec<String>,
+    /// Programs whose generic completion protocol may be probed; `*` trusts
+    /// every program that declares one. Built-in backends need no entry.
+    pub trusted_completers: Vec<String>,
+    /// Programs the engine may run with `--help`, including documented nested
+    /// subcommands, to read options and values; `*` trusts all. Running a
+    /// program is never free of risk.
+    pub trusted_help: Vec<String>,
+    /// Directories (and everything below them) where programs may evaluate
+    /// project files to list their commands, such as make reading a
+    /// Makefile; `*` trusts every directory (see [`crate::workspace`]).
+    pub trusted_workspaces: Vec<String>,
+    /// Seconds a single discovery probe (such as a native completer) may run.
+    pub probe_timeout: f64,
+    /// Lets the structured engine rerun the failed command to read its
+    /// output when none was captured, if the safety gate allows the command.
+    pub replay_for_diagnosis: bool,
+    /// Lets native completers look up resource names (instances, buckets,
+    /// clusters) with the user's credentials. Read-only, but it reaches the
+    /// network, so it is off by default.
+    pub network_completion: bool,
 }
 
 impl Default for Settings {
@@ -62,6 +85,13 @@ impl Default for Settings {
             excluded_search_path_prefixes: Vec::new(),
             fixlinecmd: "{editor} {file} +{line}".into(),
             fixcolcmd: None,
+            disabled_sources: Vec::new(),
+            trusted_completers: Vec::new(),
+            trusted_help: Vec::new(),
+            trusted_workspaces: Vec::new(),
+            probe_timeout: 3.0,
+            replay_for_diagnosis: false,
+            network_completion: false,
         }
     }
 }
@@ -94,6 +124,13 @@ const DEFAULTS_DOC: &str = "# rules = [<const: All rules enabled>]
 # num_close_matches = 3
 # env = {'LC_ALL': 'C', 'LANG': 'C', 'GIT_TRACE': '1'}
 # excluded_search_path_prefixes = []
+# disabled_sources = []
+# trusted_completers = []
+# trusted_help = []
+# trusted_workspaces = []
+# probe_timeout = 3
+# replay_for_diagnosis = False
+# network_completion = False
 ";
 
 impl Settings {
@@ -137,8 +174,12 @@ impl Settings {
         settings
     }
 
-    /// Applies `THEFUCK_*` variables. Like the Python dict comprehension,
-    /// one bad value discards the whole env layer.
+    pub fn is_source_enabled(&self, name: &str) -> bool {
+        !self.disabled_sources.iter().any(|s| s == name)
+    }
+
+    /// Applies `THEFUCK_*` (and notypo's own `NOTYPO_*`) variables. Like the
+    /// Python dict comprehension, one bad value discards the whole env layer.
     pub fn apply_env(&mut self, var: impl Fn(&str) -> Option<String>) -> Result<(), String> {
         let mut next = self.clone();
         let int = |v: &str| -> Result<i64, String> {
@@ -203,6 +244,30 @@ impl Settings {
         }
         if let Some(v) = var("THEFUCK_EXCLUDED_SEARCH_PATH_PREFIXES") {
             next.excluded_search_path_prefixes = list(&v);
+        }
+        if let Some(v) = var("NOTYPO_DISABLED_SOURCES") {
+            next.disabled_sources = list(&v).into_iter().filter(|s| !s.is_empty()).collect();
+        }
+        if let Some(v) = var("NOTYPO_TRUSTED_COMPLETERS") {
+            next.trusted_completers = completion_trust_from_env(&v);
+        }
+        if let Some(v) = var("NOTYPO_TRUSTED_HELP") {
+            next.trusted_help = completion_trust_from_env(&v);
+        }
+        if let Some(v) = var("NOTYPO_TRUSTED_WORKSPACES") {
+            next.trusted_workspaces = paths_from_env(&v);
+        }
+        if let Some(v) = var("NOTYPO_PROBE_TIMEOUT") {
+            next.probe_timeout = v
+                .trim()
+                .parse()
+                .map_err(|_| format!("could not convert string to float: '{v}'"))?;
+        }
+        if let Some(v) = var("NOTYPO_REPLAY_FOR_DIAGNOSIS") {
+            next.replay_for_diagnosis = flag(&v);
+        }
+        if let Some(v) = var("NOTYPO_NETWORK_COMPLETION") {
+            next.network_completion = flag(&v);
         }
         *self = next;
         Ok(())
@@ -306,6 +371,21 @@ impl Settings {
                 Some(s) => self.fixlinecmd = s.to_owned(),
                 None => return false,
             },
+            "disabled_sources" | "trusted_completers" | "trusted_help" | "trusted_workspaces" => {
+                let Some(list) = strings(v) else { return false };
+                match key {
+                    "disabled_sources" => self.disabled_sources = list,
+                    "trusted_completers" => self.trusted_completers = list,
+                    "trusted_workspaces" => self.trusted_workspaces = list,
+                    _ => self.trusted_help = list,
+                }
+            }
+            "probe_timeout" => match v.as_f64() {
+                Some(n) => self.probe_timeout = n,
+                None => return false,
+            },
+            "replay_for_diagnosis" => self.replay_for_diagnosis = v.truthy(),
+            "network_completion" => self.network_completion = v.truthy(),
             "fixcolcmd" => match v {
                 V::None => self.fixcolcmd = None,
                 other => match other.as_str() {
@@ -317,6 +397,33 @@ impl Settings {
         }
         true
     }
+}
+
+fn completion_trust_from_env(value: &str) -> Vec<String> {
+    // Keep the established colon-separated list of names. Namespaced
+    // identities need an unambiguous representation, so also accept JSON.
+    let entries = if value.trim_start().starts_with('[') {
+        serde_json::from_str::<Vec<String>>(value).unwrap_or_default()
+    } else {
+        value.split(':').map(str::to_owned).collect()
+    };
+    entries
+        .into_iter()
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// Directories in the platform's path-list form (`:` on Unix, `;` on
+/// Windows), or a JSON array.
+fn paths_from_env(value: &str) -> Vec<String> {
+    let entries: Vec<String> = if value.trim_start().starts_with('[') {
+        serde_json::from_str(value).unwrap_or_default()
+    } else {
+        std::env::split_paths(value)
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect()
+    };
+    entries.into_iter().filter(|e| !e.is_empty()).collect()
 }
 
 fn rules_from_env(v: &str) -> (bool, Vec<String>) {
@@ -720,6 +827,60 @@ no_colors = True
         assert!(s.is_rule_enabled("git_push", || true));
         assert!(!s.is_rule_enabled("git_push", || false));
         assert!(s.is_rule_enabled("my_rule", || false));
+    }
+
+    #[test]
+    fn completion_trust_environment_preserves_namespaced_identities() {
+        for (value, expected) in [
+            (r#"["python:pip"]"#, vec!["python:pip"]),
+            (r#"["npm:@scope/tool"]"#, vec!["npm:@scope/tool"]),
+            (
+                r#"["tool","python:pip","npm:npm","other"]"#,
+                vec!["tool", "python:pip", "npm:npm", "other"],
+            ),
+            ("npm:python:pip", vec!["npm", "python", "pip"]),
+            ("::tool::*:", vec!["tool", "*"]),
+            ("python", vec!["python"]),
+            ("npm:", vec!["npm"]),
+            ("", vec![]),
+            (r#"["", "*"]"#, vec!["*"]),
+            (r#"["python:pip", 4]"#, vec![]),
+            ("[broken", vec![]),
+        ] {
+            assert_eq!(completion_trust_from_env(value), expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn structured_engine_settings() {
+        let mut s = Settings::default();
+        s.apply_file(
+            "disabled_sources = ['stderr']\ntrusted_completers = ['mytool']\ntrusted_help = ['cargo']\ntrusted_workspaces = ['~/code']\nprobe_timeout = 1.5\nreplay_for_diagnosis = True\n",
+        );
+        assert_eq!(s.trusted_workspaces, ["~/code"]);
+        assert!(!s.is_source_enabled("stderr"));
+        assert!(s.is_source_enabled("native"));
+        assert_eq!(s.trusted_completers, ["mytool"]);
+        assert_eq!(s.trusted_help, ["cargo"]);
+        assert_eq!(s.probe_timeout, 1.5);
+        assert!(s.replay_for_diagnosis);
+
+        let env: HashMap<&str, &str> = [
+            ("NOTYPO_DISABLED_SOURCES", "native:legacy"),
+            ("NOTYPO_PROBE_TIMEOUT", "0.25"),
+            ("NOTYPO_REPLAY_FOR_DIAGNOSIS", "false"),
+            ("NOTYPO_TRUSTED_WORKSPACES", r#"["/work/a", "C:\\work"]"#),
+        ]
+        .into();
+        s.apply_env(|k| env.get(k).map(|v| v.to_string())).unwrap();
+        assert_eq!(s.trusted_workspaces, ["/work/a", "C:\\work"]);
+        assert_eq!(s.disabled_sources, ["native", "legacy"]);
+        assert_eq!(s.probe_timeout, 0.25);
+        assert!(!s.replay_for_diagnosis);
+        assert!(
+            s.apply_env(|k| (k == "NOTYPO_PROBE_TIMEOUT").then(|| "soon".into()))
+                .is_err()
+        );
     }
 
     #[test]

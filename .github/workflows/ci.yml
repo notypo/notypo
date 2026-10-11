@@ -145,6 +145,14 @@ jobs:
               echo 'CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc' >> "$GITHUB_ENV"
               ;;
           esac
+      - name: Install shells for Linux integration tests
+        if: matrix.mode == 'native-test' && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bash zsh fish tcsh ksh
+      - name: Install fish for macOS integration tests
+        if: matrix.mode == 'native-test' && runner.os == 'macOS'
+        run: brew install fish
       - name: Run native tests
         if: matrix.mode == 'native-test'
         run: cargo test --locked --all-targets --target ${{ matrix.target }}
@@ -165,7 +173,7 @@ jobs:
           envs: CARGO_TERM_COLOR RUST_BACKTRACE CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
           prepare: |
             set -e
-            pkg install -y curl ca_root_nss bash zsh git
+            pkg install -y curl ca_root_nss bash zsh fish git
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
             sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal
           run: |

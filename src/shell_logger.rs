@@ -9,9 +9,8 @@ use crate::output_readers::LOG_SIZE;
 use crate::terminal::{self, RawMode};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 
@@ -74,61 +73,18 @@ pub fn log_shell(path: &Path) -> io::Result<ExitStatus> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "SHELL is not set"))?;
     let mut log = RollingLog::new(path)?;
     let size = terminal::size();
-    let (mut master, slave) = open_pty(&size)?;
+    let (mut master, slave) = crate::platform::unix::open_pty(&size)?;
     let mut process = Command::new(shell);
     process
         .stdin(slave.try_clone()?)
         .stdout(slave.try_clone()?)
         .stderr(slave);
-    // SAFETY: the hook uses only async-signal-safe libc calls between fork and
-    // exec. The child's standard input has already been attached to the slave.
-    unsafe {
-        process.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    crate::platform::unix::controlling_terminal(&mut process);
     let mut child = ShellProcess(process.spawn()?);
     drop(process);
     let _raw = RawMode::enter();
     relay(&mut master, &mut log, size)?;
     child.0.wait()
-}
-
-fn open_pty(size: &libc::winsize) -> io::Result<(File, File)> {
-    let mut master = -1;
-    let mut slave = -1;
-    let mut size = *size;
-    // SAFETY: valid fd output pointers and window size; unused name and termios
-    // pointers are null as permitted by openpty.
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            // Linux accepts a const pointer; macOS/BSD require a mutable one.
-            &raw mut size,
-        )
-    } == -1
-    {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: openpty returned distinct, newly owned descriptors.
-    let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
-    for file in [&master, &slave] {
-        // SAFETY: the File owns a valid descriptor. Do not leak the PTY master
-        // into the spawned shell, which would prevent EOF after it exits.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok((master, slave))
 }
 
 fn relay(master: &mut File, log: &mut RollingLog, mut size: libc::winsize) -> io::Result<()> {

@@ -17,6 +17,7 @@ const RESET: &str = "\x1b[0m";
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
 const BLUE: &str = "\x1b[34m";
+const DIM: &str = "\x1b[2m";
 const WARN: &str = "\x1b[41m\x1b[37m\x1b[1m";
 
 /// Applies `no_colors`/`debug` settings. Like colorama, colors are also
@@ -79,6 +80,40 @@ pub fn confirm_text(script: &str, side_effect: bool) {
         "{USER_COMMAND_MARK}\x1b[1K\r{b}{script}{r}{} [{g}enter{r}/{bl}↑{r}/{bl}↓{r}/{rd}ctrl+c{r}]",
         side_effect_suffix(side_effect)
     ));
+}
+
+/// Like [`confirm_text`], with dim detail lines (why the correction is
+/// offered, what needs approval) under the prompt. [`clear_details`] removes
+/// them once the user decides.
+pub fn confirm_details(script: &str, side_effect: bool, details: &[String]) {
+    let (b, r, g, bl, rd, dim) = (
+        color(BRIGHT),
+        color(RESET),
+        color(GREEN),
+        color(BLUE),
+        color(RED),
+        color(DIM),
+    );
+    let suffix = side_effect_suffix(side_effect);
+    let keys = " [enter/↑/↓/ctrl+c]";
+    let mut out = format!(
+        "{USER_COMMAND_MARK}\x1b[1K\r\x1b[J{b}{script}{r}{suffix} [{g}enter{r}/{bl}↑{r}/{bl}↓{r}/{rd}ctrl+c{r}]"
+    );
+    let width = (crate::terminal::size().ws_col as usize).max(20) - 3;
+    for detail in details {
+        let line: String = detail.chars().take(width).collect();
+        out += &format!("\r\n{dim}  {line}{r}");
+    }
+    if !details.is_empty() {
+        let column = script.chars().count() + suffix.len() + keys.chars().count();
+        out += &format!("\x1b[{}A\r\x1b[{column}C", details.len());
+    }
+    emit(&out);
+}
+
+/// Erases the detail lines drawn by [`confirm_details`].
+pub fn clear_details() {
+    emit("\x1b[J");
 }
 
 pub fn debug(msg: impl Display) {

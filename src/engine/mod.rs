@@ -1,0 +1,5722 @@
+//! The structured correction pipeline.
+//!
+//! ```text
+//! failure context → lossless parse → effective program → suspicious tokens
+//!   → candidates: native completion first, installed executables,
+//!     error-output hints → ranking → safety gate → outcome
+//! ```
+//!
+//! The installed app owns its command knowledge. When an app has a native
+//! completer, the engine asks it what is valid at each level of the command
+//! (an empty prefix enumerates the level) and only proposes words the app
+//! reports, so new commands and extensions work without a notypo release.
+//! Discovery never reruns the failed command. Legacy rules stay available
+//! as a fallback in [`crate::app`].
+
+pub mod aliases;
+mod archives;
+pub mod cache;
+mod data_help;
+pub mod diagnosis;
+pub mod docs;
+pub mod native;
+pub mod parser;
+pub mod probe;
+pub mod providers;
+pub mod ranking;
+pub mod safety;
+
+use self::diagnosis::{OutputDiagnosis, ProblemKind};
+use self::parser::{Script, Span};
+use self::probe::Budget;
+use self::providers::CandidateProvider;
+use self::ranking::ScoreBreakdown;
+use self::safety::{Decision, SafetyAssessment};
+use crate::shells::Shell;
+use crate::types::Context;
+use std::path::PathBuf;
+
+/// Where a piece of evidence came from. Each source can be disabled with the
+/// `disabled_sources` setting, using [`Source::setting_name`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Source {
+    NativeCompletion,
+    Executables,
+    Stderr,
+    History,
+    Filesystem,
+    Help,
+    ManPage,
+    LegacyRule,
+}
+
+impl Source {
+    pub fn setting_name(self) -> &'static str {
+        match self {
+            Source::NativeCompletion => "native",
+            Source::Executables => "executables",
+            Source::Stderr => "stderr",
+            Source::History => "history",
+            Source::Filesystem => "filesystem",
+            Source::Help => "help",
+            Source::ManPage => "man",
+            Source::LegacyRule => "legacy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TokenRole {
+    Executable,
+    Subcommand,
+    OptionName,
+    /// An option's value, such as a region or an output format.
+    OptionValue,
+    /// A positional value or resource selector, such as an archive member.
+    ArgumentValue,
+    Path,
+    /// A missing space: `cd..` is `cd ..`, `gitstatus` is `git status`.
+    Split,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Evidence {
+    pub source: Source,
+    pub detail: String,
+}
+
+/// A replacement of one word (or an option's name) of the original command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenEdit {
+    pub command: usize,
+    pub word: usize,
+    pub span: Span,
+    pub role: TokenRole,
+    pub from: String,
+    pub to: String,
+    /// Who vouched for `to`, such as `aws completion`.
+    pub via: String,
+    /// What the app says `to` does, when its completion describes it.
+    pub description: Option<String>,
+    /// `to` names a resource (an instance, bucket, local path, or installed
+    /// package), so the edit changes what the command acts on.
+    pub resource: bool,
+    pub score: ScoreBreakdown,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Candidate {
+    pub script: String,
+    pub edits: Vec<TokenEdit>,
+    pub evidence: Vec<Evidence>,
+    /// A ranking signal, not a probability.
+    pub score: f64,
+    pub safety: SafetyAssessment,
+    /// Only structural evidence: the shell never reported the failure.
+    pub weak: bool,
+    /// A corrected program's own completer accepted the following word.
+    pub confirmed: bool,
+}
+
+impl Candidate {
+    /// One line describing each change, for the selection prompt.
+    pub fn reason(&self) -> String {
+        self.edits
+            .iter()
+            .map(|e| match &e.description {
+                Some(description) => format!("{} → {} ({}: {description})", e.from, e.to, e.via),
+                None => format!("{} → {} ({})", e.from, e.to, e.via),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// What is known about the failed command. Unknown facts stay `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FailureContext {
+    pub source: String,
+    pub cwd: Option<PathBuf>,
+    pub exit_status: Option<i32>,
+    /// Exit statuses of the last pipeline's stages, when the shell gave them.
+    pub pipe_status: Option<Vec<i32>>,
+    pub output: CapturedOutput,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CapturedOutput {
+    #[default]
+    Unknown,
+    /// stdout and stderr interleaved, as a terminal log records them.
+    Combined {
+        text: String,
+        origin: OutputOrigin,
+    },
+    Separate {
+        stdout: String,
+        stderr: String,
+    },
+}
+
+impl CapturedOutput {
+    /// The text error diagnostics are read from.
+    pub fn diagnostic_text(&self) -> Option<&str> {
+        match self {
+            CapturedOutput::Unknown => None,
+            CapturedOutput::Combined { text, .. } => Some(text),
+            CapturedOutput::Separate { stderr, .. } => Some(stderr),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputOrigin {
+    ShellLogger,
+    InstantModeLog,
+    /// The command was rerun because `replay_for_diagnosis` allowed it.
+    Replay,
+    /// The shell's own error records for the history entry (PowerShell's
+    /// `$Error`), without the command's other output.
+    ShellErrors,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Outcome {
+    /// The first candidate is clearly best.
+    Suggestion(Vec<Candidate>),
+    /// Candidates are too close (or too weakly supported) to choose alone.
+    Ambiguous(Vec<Candidate>),
+    /// Every candidate was refused by the safety gate.
+    Unsafe(Vec<Candidate>),
+    UnsupportedSyntax(String),
+    /// Something looks wrong, but nothing valid is close enough.
+    InsufficientEvidence(String),
+    NoCorrection(String),
+}
+
+impl Outcome {
+    pub fn candidates(&self) -> &[Candidate] {
+        match self {
+            Outcome::Suggestion(c) | Outcome::Ambiguous(c) => c,
+            _ => &[],
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Outcome::Suggestion(c) => format!("suggestion: {}", c[0].script),
+            Outcome::Ambiguous(c) if c.len() == 1 => {
+                format!("needs confirmation: {} (weak evidence)", c[0].script)
+            }
+            Outcome::Ambiguous(c) => format!("{} close candidates; choose one", c.len()),
+            Outcome::Unsafe(c) => format!(
+                "refused: {}",
+                c.first()
+                    .map_or(String::new(), |c| c.safety.reasons.join("; "))
+            ),
+            Outcome::UnsupportedSyntax(why) => format!("unsupported syntax: {why}"),
+            Outcome::InsufficientEvidence(why) => format!("insufficient evidence: {why}"),
+            Outcome::NoCorrection(why) => format!("no correction: {why}"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Report {
+    pub outcome: Outcome,
+    /// Tokens found to be wrong, with the evidence against each.
+    pub suspicions: Vec<Suspicion>,
+    /// Capability limits, discovery results, and probe failures.
+    pub notes: Vec<String>,
+    pub probes: usize,
+}
+
+/// Reads the status the shell function captured before it ran anything.
+pub fn status_from_env() -> (Option<i32>, Option<Vec<i32>>) {
+    let status = std::env::var("NOTYPO_EXIT_STATUS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+    let pipe: Option<Vec<i32>> = std::env::var("NOTYPO_PIPESTATUS").ok().and_then(|s| {
+        s.split_whitespace()
+            .map(|n| n.parse().ok())
+            .collect::<Option<Vec<i32>>>()
+            .filter(|v| !v.is_empty())
+    });
+    (status, pipe)
+}
+
+/// Runs the pipeline for one failed command.
+pub fn correct(failure: &FailureContext, ctx: &Context) -> Report {
+    correct_with_backends(failure, ctx, Vec::new())
+}
+
+/// [`correct`], answering native completion for the named programs from
+/// the given backends instead of discovering them (tests, corpora, and
+/// embedders with their own protocol bridges).
+pub fn correct_with_backends(
+    failure: &FailureContext,
+    ctx: &Context,
+    backends: Vec<(String, std::rc::Rc<dyn native::NativeCompletionBackend>)>,
+) -> Report {
+    let mut run = Run::new(failure, ctx);
+    if let Some(native) = run.native.take() {
+        run.native = Some(backends.into_iter().fold(native, |n, (program, backend)| {
+            n.with_backend(&program, backend)
+        }));
+    }
+    let outcome = run.execute();
+    if let Some(native) = run.native.as_mut() {
+        native.persist();
+    }
+    Report {
+        outcome,
+        suspicions: run.suspicions,
+        probes: run.budget.spawned(),
+        notes: run.notes,
+    }
+}
+
+/// Rechecks, right before the shell runs a chosen candidate, the facts its
+/// edits relied on: programs it introduced still resolve to executable
+/// files, and paths it introduced still exist (as directories for `cd`).
+/// This narrows, but can't close, the window between discovery and
+/// execution; nothing here proves the command harmless.
+pub fn revalidate(
+    candidate: &Candidate,
+    failure: &FailureContext,
+    ctx: &Context,
+) -> Result<(), String> {
+    let dialect = parser::Dialect::for_shell(ctx.shell).unwrap_or_default();
+    let original = parser::parse_with_dialect(&failure.source, dialect);
+    let cwd = failure.cwd.clone().or_else(|| std::env::current_dir().ok());
+    for edit in &candidate.edits {
+        let words = original
+            .commands
+            .get(edit.command)
+            .map_or(&[][..], |c| &c.words[..]);
+        let program = diagnosis::effective_program(words);
+        let introduced = match edit.role {
+            TokenRole::Executable => Some(edit.to.as_str()),
+            // `gitstatus` → `git status` introduces `git`.
+            TokenRole::Split if program == Some(edit.word) => edit.to.split(' ').next(),
+            _ => None,
+        };
+        // PowerShell's commands live in its session and modules; rechecking
+        // one would mean starting PowerShell again.
+        let powershell = |name: &str| {
+            ctx.shell == Shell::Powershell
+                && ctx.which(name).is_none()
+                && (is_cmdlet_name(name)
+                    || ctx
+                        .shell
+                        .get_functions()
+                        .iter()
+                        .any(|f| f.eq_ignore_ascii_case(name)))
+        };
+        if let Some(name) = introduced
+            && !ctx.shell.get_builtin_commands().contains(&name)
+            && !ctx.aliases().contains_key(name)
+            && !ctx.shell.get_functions().contains(name)
+            && !powershell(name)
+        {
+            let installed = if name.contains('/') {
+                cwd.as_ref()
+                    .is_some_and(|cwd| crate::utils::is_executable_file(&cwd.join(name)))
+            } else {
+                // `which` is memoized for the run; stat the file it found again.
+                ctx.which(name)
+                    .is_some_and(|path| crate::utils::is_executable_file(&path))
+            };
+            if !installed {
+                return Err(format!("{name} is no longer installed"));
+            }
+        }
+        if edit.role == TokenRole::Path
+            && let Some(cwd) = &cwd
+        {
+            let path = cwd.join(&edit.to);
+            let directory = program
+                .and_then(|p| words[p].literal())
+                .is_some_and(|name| matches!(name, "cd" | "pushd"));
+            let present = if directory {
+                path.is_dir()
+            } else {
+                std::fs::symlink_metadata(&path).is_ok()
+            };
+            if !present {
+                return Err(format!("{} no longer exists", edit.to));
+            }
+            // `./scirpt.sh` → `./script.sh` names the program itself.
+            if program == Some(edit.word) && !crate::utils::is_executable_file(&path) {
+                return Err(format!("{} is no longer executable", edit.to));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How many competing interpretations are followed.
+const BEAM: usize = 3;
+/// Alternatives this far behind the best replacement are not followed.
+const BRANCH_WINDOW: f64 = 0.2;
+/// Discount for an interpretation that left a later invalid token unfixed.
+const UNRESOLVED_PENALTY: f64 = 0.8;
+/// Discount per later occurrence when a hint names a repeated token.
+const LATER_OCCURRENCE_PENALTY: f64 = 0.03;
+
+/// How strongly each kind of evidence says a token is wrong. Independent
+/// pieces combine as `1 - Π(1 - p)`.
+const APP_REJECTS: f64 = 0.9;
+/// The app's list is known to be partial (git's option helper).
+const APP_OMITS: f64 = 0.5;
+const NOT_ON_PATH: f64 = 0.6;
+const EXIT_127: f64 = 0.8;
+const OUTPUT_NAMES_IT: f64 = 0.85;
+const PATH_MISSING: f64 = 0.6;
+/// Ranking bonus for a corrected program that accepts the rest of the line.
+const CONTEXT_FITS: f64 = 0.1;
+/// A missing space ranks just below an equally close spelling fix.
+const SPLIT_DISCOUNT: f64 = 0.97;
+/// ...and further below when nothing confirms the word it splits off.
+const UNCONFIRMED_SPLIT: f64 = 0.9;
+const COMMAND_FAILED: f64 = 0.5;
+/// Weaker suspicions can't be repaired without the user confirming.
+const STRONG_SUSPICION: f64 = 0.75;
+
+fn combine(evidence: &[f64]) -> f64 {
+    1.0 - evidence.iter().map(|p| 1.0 - p).product::<f64>()
+}
+
+/// A token the engine believes is wrong, and why.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Suspicion {
+    pub command: usize,
+    pub word: usize,
+    pub role: TokenRole,
+    pub token: String,
+    /// Combined strength of the evidence, in `[0, 1]`.
+    pub score: f64,
+    pub evidence: Vec<Evidence>,
+}
+
+struct Run<'a> {
+    failure: &'a FailureContext,
+    ctx: &'a Context,
+    budget: Budget,
+    diagnosis: OutputDiagnosis,
+    notes: Vec<String>,
+    native: Option<providers::NativeCompletion<'a>>,
+    executables: Option<providers::Executables<'a>>,
+    hints: Option<providers::ErrorHints>,
+    history: Option<providers::History>,
+    man: Option<providers::ManPages>,
+    help: Option<providers::HelpText<'a>>,
+    filesystem: bool,
+    suspicions: Vec<Suspicion>,
+    /// Some words could not be checked (a failed probe, an exhausted budget).
+    unchecked: bool,
+    /// Words some source confirmed or rejected.
+    checked: usize,
+    /// The PowerShell to ask about PowerShell commands, found once.
+    powershell: Option<Option<PathBuf>>,
+    /// The commands that PowerShell lists, asked once.
+    powershell_names: Option<Vec<String>>,
+}
+
+/// One interpretation of a command being repaired.
+#[derive(Clone, Debug)]
+struct State {
+    program: String,
+    path: Option<PathBuf>,
+    /// The words after the program, as corrected so far.
+    context: Vec<String>,
+    /// Quoted dash-prefixed data in PowerShell's argument mode.
+    literal_arguments: Vec<usize>,
+    /// At least one earlier argument contains an unevaluated expansion.
+    opaque_context: bool,
+    /// The subcommands among them.
+    command_path: Vec<String>,
+    /// A corrected program's completer accepted the word after it.
+    confirmed: bool,
+    edits: Vec<TokenEdit>,
+    score: f64,
+    evidence: Vec<Evidence>,
+    weak: bool,
+    /// A PowerShell command: `-Name:value` attaches values, parameters
+    /// don't cluster, and only `-` before a letter starts one.
+    powershell: bool,
+}
+
+impl State {
+    fn new(program: &str, path: Option<PathBuf>) -> State {
+        State {
+            program: program.to_owned(),
+            path,
+            context: Vec::new(),
+            literal_arguments: Vec::new(),
+            opaque_context: false,
+            command_path: Vec::new(),
+            confirmed: false,
+            edits: Vec::new(),
+            score: 1.0,
+            evidence: Vec::new(),
+            weak: false,
+            powershell: false,
+        }
+    }
+}
+
+enum Resolution {
+    Executable(PathBuf),
+    /// An alias for one simple command running an installed program.
+    Alias(aliases::Target),
+    /// A PowerShell cmdlet or function, by the name PowerShell describes.
+    PowerShell(String),
+    /// An alias, builtin, or function: the shell knows it.
+    ShellDefined,
+    ExplicitPath,
+    Missing,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Level {
+    /// The app may still expect a subcommand or group here.
+    Commands,
+    /// Only arguments follow; words are no longer checked.
+    Arguments,
+}
+
+/// How a word missing from a vocabulary was handled.
+enum Branching {
+    /// A partial list doesn't hold anything close: no reason to doubt it.
+    NotSuspicious,
+    /// The word is wrong, but nothing listed is close.
+    Unresolved,
+    /// Interpretations with a close replacement, and whether it takes a value.
+    Branches(Vec<(State, Option<bool>)>),
+}
+
+/// What the app said about one word of the walk.
+enum Check {
+    Valid {
+        takes_value: Option<bool>,
+        /// The app itself (not documentation or history) listed the word.
+        confirmed: bool,
+    },
+    Invalid(providers::Vocabulary),
+    /// Nothing here is a subcommand: arguments follow.
+    Arguments,
+    Unknown,
+}
+
+/// Whether an option takes the next word as its value: one known to take
+/// a value always does; one of unknown arity doesn't take a word that is
+/// itself option-shaped (`yq -P --prettyPrint`), which values rarely are.
+fn takes_next(takes_value: Option<bool>, next: Option<&str>) -> bool {
+    match takes_value {
+        Some(known) => known,
+        None => !next.is_some_and(|next| {
+            next.len() > 1
+                && next.starts_with('-')
+                && !next[1..].starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        }),
+    }
+}
+
+/// Whether `typed` extends a listed word that ends where a hierarchical
+/// completion continues: a remote or scheme (`web:`), a directory (`src/`),
+/// or a key (`name=`). Apps complete such words one level at a time.
+fn continues_listed_word(vocabulary: &providers::Vocabulary, typed: &str) -> bool {
+    vocabulary.words.iter().any(|word| {
+        // A bare operator is a fragment too: zsh's _file_modes offers `+`,
+        // `-`, and `=` for chmod's `+x`.
+        (word.value.ends_with([':', '/', '=']) || matches!(word.value.as_str(), "+" | "-"))
+            && typed.len() > word.value.len()
+            && typed.starts_with(&word.value)
+    })
+}
+
+/// A listed word that ends where its completion continues (`web:`) repairs
+/// the typed word's head and keeps the rest: `wbe:b` becomes `web:b`, not
+/// `web:`.
+/// The name of a listed `Name=` alone, or ssh's `Name value` form.
+fn names_listed_key(vocabulary: &providers::Vocabulary, typed: &str) -> bool {
+    vocabulary.words.iter().any(|word| {
+        word.value.strip_suffix('=').is_some_and(|name| {
+            !name.is_empty()
+                && (typed == name
+                    || typed
+                        .strip_prefix(name)
+                        .is_some_and(|rest| rest.starts_with(' ')))
+        })
+    })
+}
+
+fn keep_hierarchical_tails(
+    mut vocabulary: providers::Vocabulary,
+    typed: &str,
+) -> providers::Vocabulary {
+    for word in &mut vocabulary.words {
+        let Some(separator) = word
+            .value
+            .chars()
+            .last()
+            .filter(|c| matches!(c, ':' | '/' | '='))
+        else {
+            continue;
+        };
+        // ssh's `-o 'Name value'` keeps its space.
+        let spaced = (separator == '=' && !typed.contains('='))
+            .then(|| typed.find(' '))
+            .flatten();
+        if let Some(at) = spaced {
+            let extended = format!("{}{}", &word.value[..word.value.len() - 1], &typed[at..]);
+            if vocabulary.resources.contains(&word.value) {
+                vocabulary.resources.push(extended.clone());
+            }
+            word.value = extended;
+        } else if let Some(at) = typed.find(separator)
+            && at + separator.len_utf8() < typed.len()
+        {
+            let extended = format!("{}{}", word.value, &typed[at + separator.len_utf8()..]);
+            if vocabulary.resources.contains(&word.value) {
+                vocabulary.resources.push(extended.clone());
+            }
+            word.value = extended;
+        }
+    }
+    vocabulary
+}
+
+impl<'a> Run<'a> {
+    fn new(failure: &'a FailureContext, ctx: &'a Context) -> Self {
+        let settings = &ctx.settings;
+        let enabled = |source: Source| settings.is_source_enabled(source.setting_name());
+        let mut notes = Vec::new();
+        for source in [
+            Source::NativeCompletion,
+            Source::Executables,
+            Source::Stderr,
+            Source::History,
+            Source::Filesystem,
+            Source::ManPage,
+        ] {
+            if !enabled(source) {
+                notes.push(format!(
+                    "the {} source is disabled by settings",
+                    source.setting_name()
+                ));
+            }
+        }
+        let diagnosis = match failure.output.diagnostic_text() {
+            Some(text) if enabled(Source::Stderr) => diagnosis::diagnose_output(text),
+            _ => OutputDiagnosis::default(),
+        };
+        let workspace = providers::Workspace {
+            cwd: failure.cwd.clone(),
+            trusted: &settings.trusted_workspaces,
+        };
+        Run {
+            failure,
+            ctx,
+            budget: Budget::for_timeout(settings.probe_timeout),
+            notes,
+            native: enabled(Source::NativeCompletion).then(|| {
+                providers::NativeCompletion::new(
+                    &settings.trusted_completers,
+                    settings.network_completion,
+                )
+                .with_shell(ctx.shell)
+                .with_trusted_help(&settings.trusted_help)
+                .with_workspace(workspace.clone())
+            }),
+            executables: enabled(Source::Executables).then(|| providers::Executables::new(ctx)),
+            hints: enabled(Source::Stderr).then(|| providers::ErrorHints {
+                suggestions: diagnosis.suggestions.clone(),
+            }),
+            history: enabled(Source::History).then(|| {
+                let own = [ctx.alias.as_str(), "fuck", "typo", "notypo", "thefuck"];
+                providers::History::with_dialect(
+                    ctx.recent_history(),
+                    parser::Dialect::for_shell(ctx.shell).unwrap_or_default(),
+                    |line| {
+                        line == failure.source
+                            || line
+                                .split_whitespace()
+                                .next()
+                                .is_some_and(|first| own.contains(&first))
+                    },
+                )
+            }),
+            man: enabled(Source::ManPage).then(|| providers::ManPages::new(ctx.which("man"))),
+            help: (enabled(Source::Help) && !settings.trusted_help.is_empty()).then(|| {
+                providers::HelpText::new(&settings.trusted_help)
+                    .with_workspace(workspace.clone())
+                    .with_man(enabled(Source::ManPage).then(|| ctx.which("man")).flatten())
+            }),
+            filesystem: enabled(Source::Filesystem),
+            diagnosis,
+            suspicions: Vec::new(),
+            unchecked: false,
+            checked: 0,
+            powershell: None,
+            powershell_names: None,
+        }
+    }
+
+    fn note(&mut self, note: String) {
+        if !self.notes.contains(&note) {
+            self.notes.push(note);
+        }
+    }
+
+    fn collect_notes(&mut self) {
+        let mut notes = self.native.as_mut().map(|n| n.notes()).unwrap_or_default();
+        if let Some(executables) = self.executables.as_mut() {
+            notes.extend(executables.notes());
+        }
+        if let Some(help) = self.help.as_mut() {
+            notes.extend(help.notes());
+        }
+        for note in notes {
+            self.note(note);
+        }
+    }
+
+    fn suspect(
+        &mut self,
+        index: usize,
+        word: usize,
+        role: TokenRole,
+        token: &str,
+        evidence: Vec<(f64, Evidence)>,
+    ) -> f64 {
+        let score = combine(&evidence.iter().map(|(p, _)| *p).collect::<Vec<_>>());
+        let evidence = evidence.into_iter().map(|(_, e)| e).collect();
+        match self
+            .suspicions
+            .iter_mut()
+            .find(|s| s.command == index && s.word == word && s.token == token)
+        {
+            Some(existing) => existing.score = existing.score.max(score),
+            None => self.suspicions.push(Suspicion {
+                command: index,
+                word,
+                role,
+                token: token.to_owned(),
+                score,
+                evidence,
+            }),
+        }
+        score
+    }
+
+    fn execute(&mut self) -> Outcome {
+        let shell = self.ctx.shell;
+        let Some(dialect) = parser::Dialect::for_shell(shell) else {
+            return Outcome::UnsupportedSyntax(format!(
+                "{} command lines are not parsed yet",
+                shell.friendly_name()
+            ));
+        };
+        let script = parser::parse_with_dialect(&self.failure.source, dialect);
+        if let Some(diagnostic) = script.diagnostics.first() {
+            return Outcome::UnsupportedSyntax(format!(
+                "{:?} at `{}`",
+                diagnostic.kind,
+                diagnostic.span.of(&script.source)
+            ));
+        }
+
+        let mut states = Vec::new();
+        for index in self.failed_commands(&script) {
+            states.extend(self.repair(&script, index));
+        }
+        self.collect_notes();
+        let mut candidates: Vec<Candidate> = Vec::new();
+        for state in states {
+            let Some(candidate) = self.build(&script, state) else {
+                continue;
+            };
+            match candidates.iter_mut().find(|c| c.script == candidate.script) {
+                Some(existing) => {
+                    for evidence in candidate.evidence {
+                        if !existing.evidence.contains(&evidence) {
+                            existing.evidence.push(evidence);
+                        }
+                    }
+                    if candidate.score > existing.score {
+                        existing.score = candidate.score;
+                        existing.edits = candidate.edits;
+                        existing.weak = candidate.weak;
+                        existing.confirmed = candidate.confirmed;
+                    }
+                }
+                None => candidates.push(candidate),
+            }
+        }
+        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+        if candidates.is_empty() {
+            return if !self.suspicions.is_empty() {
+                Outcome::InsufficientEvidence(
+                    "a token looks wrong, but no valid word is close to it".into(),
+                )
+            } else if self.unchecked {
+                Outcome::InsufficientEvidence(
+                    "some words could not be checked against the app".into(),
+                )
+            } else if let Some(failure) = self.diagnosis.operational {
+                Outcome::NoCorrection(format!(
+                    "the output points to {}, which a spelling change can't fix",
+                    failure.describe()
+                ))
+            } else if self.checked == 0 {
+                Outcome::NoCorrection("no source could check these words".into())
+            } else {
+                Outcome::NoCorrection("every checked token is valid".into())
+            };
+        }
+        let (refused, mut allowed): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .map(|mut c| {
+                c.safety = safety::assess_with_context(&script, &c.script, &[], self.ctx);
+                for edit in c.edits.iter().filter(|e| e.resource) {
+                    c.safety.flag(
+                        Decision::Confirm,
+                        format!(
+                            "acts on the resource `{}` instead of `{}`",
+                            edit.to, edit.from
+                        ),
+                    );
+                }
+                c
+            })
+            .partition(|c| c.safety.decision == Decision::Refuse);
+        for candidate in &refused {
+            self.note(format!(
+                "refused {}: {}",
+                candidate.script,
+                candidate.safety.reasons.join("; ")
+            ));
+        }
+        if allowed.is_empty() {
+            return Outcome::Unsafe(refused);
+        }
+        allowed.truncate(BEAM * 2);
+        let scores: Vec<f64> = allowed.iter().map(|c| c.score).collect();
+        let tied = allowed
+            .get(1)
+            .is_some_and(|second| equally_supported(&allowed[0], second));
+        if ranking::is_decisive(&scores) && !allowed[0].weak && !tied {
+            Outcome::Suggestion(allowed)
+        } else {
+            Outcome::Ambiguous(allowed)
+        }
+    }
+
+    /// The commands worth repairing. A single pipeline whose stage statuses
+    /// single out one failure narrows it; otherwise every command is checked.
+    fn failed_commands(&self, script: &Script) -> Vec<usize> {
+        let all: Vec<usize> = (0..script.commands.len()).collect();
+        // Stage statuses only map onto simple commands outside compounds.
+        let one_pipeline = script.compounds.is_empty()
+            && script
+                .commands
+                .iter()
+                .skip(1)
+                .all(|c| c.connector.is_some_and(parser::Connector::is_pipe));
+        match &self.failure.pipe_status {
+            Some(status) if one_pipeline && status.len() == all.len() => {
+                let failed: Vec<usize> = all.iter().copied().filter(|&i| status[i] != 0).collect();
+                if failed.len() == 1 { failed } else { all }
+            }
+            _ => all,
+        }
+    }
+
+    /// The shell's exit status says the program wasn't found: 127 from
+    /// POSIX shells and fish. tcsh exits 1 instead; it has no functions, and
+    /// its aliases and builtins are known, so a failed name that resolves to
+    /// none of them was missing too.
+    fn reported_missing(&self) -> bool {
+        match self.ctx.shell {
+            Shell::Tcsh => self.failure.exit_status.is_some_and(|s| s != 0),
+            _ => self.failure.exit_status == Some(127),
+        }
+    }
+
+    fn resolve(&self, name: &str) -> Resolution {
+        if name.contains('/') {
+            // An existing explicit executable has its own vocabulary too
+            // (`./artisan`, `bin/console`). Workspace/probe trust is checked
+            // by the providers before it is started. Missing paths still
+            // go through filesystem correction.
+            let cwd = self
+                .failure
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok());
+            if let Some(path) = cwd.and_then(|cwd| std::fs::canonicalize(cwd.join(name)).ok())
+                && crate::utils::is_executable_file(&path)
+            {
+                return Resolution::Executable(path);
+            }
+            return Resolution::ExplicitPath;
+        }
+        if self.ctx.shell == Shell::Powershell
+            && let Some(resolution) = self.resolve_powershell(name)
+        {
+            return resolution;
+        }
+        // `ls` aliased to `eza --icons` takes eza's vocabulary, never ls's.
+        if self.ctx.aliases().contains_key(name)
+            && let Some(dialect) = parser::Dialect::for_shell(self.ctx.shell)
+            && let Some(target) = aliases::target(
+                name,
+                dialect,
+                self.ctx.aliases(),
+                |program| self.ctx.which(program),
+                |program| {
+                    self.ctx.shell.get_functions().contains(program)
+                        || self.ctx.shell.get_builtin_commands().contains(&program)
+                },
+            )
+        {
+            return Resolution::Alias(target);
+        }
+        if self.ctx.aliases().contains_key(name)
+            || self.ctx.shell.get_functions().contains(name)
+            || self.ctx.shell.get_builtin_commands().contains(&name)
+        {
+            return Resolution::ShellDefined;
+        }
+        match self.ctx.which(name) {
+            Some(path) => Resolution::Executable(path),
+            // The shell ran something under this name (a function, say).
+            None if self.failure.exit_status.is_some() && !self.reported_missing() => {
+                Resolution::ShellDefined
+            }
+            None => Resolution::Missing,
+        }
+    }
+
+    /// PowerShell's own resolution of `name`: the session's report when its
+    /// function sent one, else module-qualified and cmdlet-shaped names
+    /// (not on `$PATH`) for PowerShell to describe, and the session's other
+    /// aliases and functions as its own. `None` defers to `$PATH`.
+    fn resolve_powershell(&self, name: &str) -> Option<Resolution> {
+        if name.contains('\\') && !is_cmdlet_name(name) {
+            return Some(Resolution::ExplicitPath);
+        }
+        if let Some(reported) = self.ctx.powershell_commands().get(&name.to_lowercase()) {
+            let application = |target: &str| {
+                let path = PathBuf::from(target);
+                (path.is_absolute() && crate::utils::is_executable_file(&path)).then_some(path)
+            };
+            if matches!(reported.target_kind.as_str(), "Function" | "Filter")
+                && let Some(resolution) = self.resolve_wrapper(&reported.target)
+            {
+                return Some(resolution);
+            }
+            return Some(
+                match (reported.kind.as_str(), reported.target_kind.as_str()) {
+                    ("", _) => Resolution::Missing,
+                    (_, "Cmdlet" | "Function" | "Filter") if !reported.target.is_empty() => {
+                        Resolution::PowerShell(reported.target.clone())
+                    }
+                    ("Application", _) => match self.ctx.which(name) {
+                        Some(path) => Resolution::Executable(path),
+                        None => application(&reported.target)
+                            .map_or(Resolution::ShellDefined, Resolution::Executable),
+                    },
+                    ("Alias", "Application") => match application(&reported.target) {
+                        Some(path) => Resolution::Alias(aliases::Target {
+                            program: program_name(&path),
+                            path,
+                            args: Vec::new(),
+                        }),
+                        None => Resolution::ShellDefined,
+                    },
+                    _ => Resolution::ShellDefined,
+                },
+            );
+        }
+        if is_cmdlet_name(name) && self.ctx.which(name).is_none() {
+            let unqualified = name.rsplit('\\').next().unwrap_or(name);
+            return Some(Resolution::PowerShell(unqualified.to_owned()));
+        }
+        self.ctx
+            .shell
+            .get_functions()
+            .iter()
+            .any(|function| function.eq_ignore_ascii_case(name))
+            .then_some(Resolution::ShellDefined)
+    }
+
+    /// A PowerShell function that only runs one command with its arguments
+    /// (`function gst { git status @args }`) resolves as an alias for that
+    /// command would: an application's vocabulary with the wrapper's words
+    /// as context, or a PowerShell command's parameters.
+    fn resolve_wrapper(&self, function: &str) -> Option<Resolution> {
+        let aliases = self.ctx.aliases();
+        if function.is_empty() || !aliases.contains_key(&function.to_lowercase()) {
+            return None;
+        }
+        let dialect = parser::Dialect::PowerShell;
+        let functions = self.ctx.shell.get_functions();
+        let shell_defined = |program: &str| {
+            (is_cmdlet_name(program) && self.ctx.which(program).is_none())
+                || functions.iter().any(|f| f.eq_ignore_ascii_case(program))
+        };
+        if let Some(target) = aliases::target(
+            function,
+            dialect,
+            aliases,
+            |program| self.ctx.which(program),
+            shell_defined,
+        ) {
+            return Some(Resolution::Alias(target));
+        }
+        let aliases::Expansion::Expanded(text) = aliases::expand(function, dialect, aliases) else {
+            return None;
+        };
+        let script = parser::parse_with_dialect(&text, dialect);
+        let program = script.commands.first()?.words.first()?.literal()?;
+        (is_cmdlet_name(program) && self.ctx.which(program).is_none()).then(|| {
+            Resolution::PowerShell(program.rsplit('\\').next().unwrap_or(program).to_owned())
+        })
+    }
+
+    /// The PowerShell that answers for PowerShell commands.
+    fn powershell_executable(&mut self) -> Option<PathBuf> {
+        if self.powershell.is_none() {
+            let found = native::powershell::executable(|name| self.ctx.which(name));
+            if found.is_none() {
+                self.note("no PowerShell executable to describe PowerShell commands".into());
+            }
+            self.powershell = Some(found);
+        }
+        self.powershell.clone().flatten()
+    }
+
+    /// Makes PowerShell answer for the command `name`, unless a backend
+    /// already does. Describing it waits until a word needs checking.
+    fn powershell_command(&mut self, name: &str) -> bool {
+        if self.native.as_ref().is_none_or(|n| n.has_backend(name)) {
+            return self.native.is_some();
+        }
+        let Some(shell) = self.powershell_executable() else {
+            return false;
+        };
+        let trusted = &self.ctx.settings.trusted_completers;
+        if let Some(native) = self.native.as_mut() {
+            native.register(
+                name,
+                std::rc::Rc::new(native::powershell::Command::new(name, shell, trusted)),
+            );
+        }
+        true
+    }
+
+    /// The names of commands PowerShell can run, for repairing a name that
+    /// isn't one. Asked once per run.
+    fn powershell_names(&mut self) -> Vec<String> {
+        if let Some(names) = &self.powershell_names {
+            return names.clone();
+        }
+        let names = match self.powershell_executable() {
+            Some(shell) => match native::powershell::commands(&shell, &mut self.budget) {
+                Ok(names) => names,
+                Err(error) => {
+                    self.note(format!("PowerShell command names: {error}"));
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        self.powershell_names = Some(names.clone());
+        names
+    }
+
+    fn repair(&mut self, script: &Script, index: usize) -> Vec<State> {
+        let words = &script.commands[index].words;
+        let Some((p, runner)) = diagnosis::effective_program_via(words) else {
+            return Vec::new();
+        };
+        let Some(name) = words[p].literal() else {
+            return Vec::new();
+        };
+        // PHP's argument immediately after the interpreter can be a console
+        // application. Its script token remains untouched; edits start after
+        // it, and completion uses this interpreter rather than a shebang.
+        if runner.is_none()
+            && native::is_php_interpreter_name(name)
+            && let Resolution::Executable(interpreter) = self.resolve(name)
+            && let Some(program) = words
+                .get(p + 1)
+                .and_then(|word| word.literal())
+                .filter(|word| !word.starts_with('-'))
+            && let Some(cwd) = self
+                .failure
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+            && let Ok(path) = std::fs::canonicalize(cwd.join(program))
+            && native::is_php_file(&path)
+        {
+            let registered = self.native.as_mut().and_then(|native| {
+                native.register_php_script(program, &path, &interpreter, &mut self.budget)
+            });
+            if let Some(program) = registered {
+                return self
+                    .walk(script, index, p + 1, State::new(&program, Some(path)))
+                    .into_iter()
+                    .filter(|state| !state.edits.is_empty())
+                    .collect();
+            }
+            return Vec::new();
+        }
+        if let Some(ecosystem) = runner {
+            return match self.resolve_package(name, ecosystem) {
+                Some(start) => self.walk(script, index, p, start),
+                None => Vec::new(),
+            }
+            .into_iter()
+            .filter(|s| !s.edits.is_empty())
+            .collect();
+        }
+        let starts = match self.resolve(name) {
+            Resolution::Executable(path) => vec![State::new(name, Some(path))],
+            Resolution::Alias(target) => {
+                self.note(format!(
+                    "`{name}` is an alias for `{}`; its words come from {}",
+                    std::iter::once(target.program.as_str())
+                        .chain(target.args.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    target.program
+                ));
+                let mut state = State::new(&target.program, Some(target.path));
+                // Leading words before any option name the alias's subcommands.
+                state.command_path = target
+                    .args
+                    .iter()
+                    .take_while(|arg| !arg.starts_with('-'))
+                    .cloned()
+                    .collect();
+                state.context = target.args;
+                vec![state]
+            }
+            Resolution::PowerShell(command) => {
+                if !self.powershell_command(&command) {
+                    return Vec::new();
+                }
+                if !command.eq_ignore_ascii_case(name) {
+                    self.note(format!("`{name}` runs the PowerShell command {command}"));
+                }
+                let mut state = State::new(&command, None);
+                state.powershell = true;
+                vec![state]
+            }
+            Resolution::ShellDefined => {
+                return if matches!(name, "cd" | "pushd") {
+                    self.path_candidates(script, index, p, Some(p + 1))
+                } else {
+                    Vec::new()
+                };
+            }
+            Resolution::ExplicitPath => return self.path_candidates(script, index, p, Some(p)),
+            Resolution::Missing => {
+                let starts = self.executable_candidates(script, index, p, name);
+                let mut finished = Vec::new();
+                for start in starts {
+                    finished.extend(self.walk(script, index, p, start));
+                }
+                finished.retain(|s| !s.edits.is_empty());
+                return finished;
+            }
+        };
+        // Compressor operands remain host paths when their syntax is
+        // declined (`gzip -r`), so only a parsed layout replaces the
+        // generic path provider for them.
+        let archive_command = starts.iter().any(|start| {
+            archives::tool(&start.program).is_some_and(|tool| {
+                !archives::host_paths_only(tool) || {
+                    let words = &script.commands[index].words;
+                    let args: Vec<Option<&str>> = start
+                        .context
+                        .iter()
+                        .map(|s| Some(s.as_str()))
+                        .chain(words[p + 1..].iter().map(|word| word.literal()))
+                        .collect();
+                    archives::layout(tool, &args).is_some()
+                }
+            })
+        });
+        let mut finished = Vec::new();
+        for start in starts {
+            let native = self.has_native(&start);
+            let original = start.edits.is_empty();
+            finished.extend(self.archive_candidates(script, index, p, &start));
+            finished.extend(self.walk(script, index, p, start.clone()));
+            if !native && original {
+                finished.extend(self.hint_candidates(script, index, p, start));
+            }
+        }
+        // Archive members and newly created archive names are not host paths.
+        if !archive_command {
+            finished.extend(self.path_candidates(script, index, p, None));
+        }
+        finished.retain(|s| !s.edits.is_empty());
+        finished
+    }
+
+    fn archive_candidates(
+        &mut self,
+        script: &Script,
+        index: usize,
+        p: usize,
+        start: &State,
+    ) -> Vec<State> {
+        let Some(tool) = archives::tool(&start.program) else {
+            return Vec::new();
+        };
+        let words = &script.commands[index].words;
+        let alias_words = start.context.len();
+        let args: Vec<Option<&str>> = start
+            .context
+            .iter()
+            .map(|s| Some(s.as_str()))
+            .chain(words[p + 1..].iter().map(|word| word.literal()))
+            .collect();
+        let Some(layout) = archives::layout(tool, &args) else {
+            return Vec::new();
+        };
+        let Some(cwd) = self
+            .failure
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+        else {
+            return Vec::new();
+        };
+        let failed = self.failure.exit_status.is_some_and(|status| status != 0)
+            || self.failure.output.diagnostic_text().is_some();
+        let mut states = vec![start.clone()];
+        if self.filesystem {
+            for argument in &layout.paths {
+                if argument.index < alias_words {
+                    continue;
+                }
+                let i = p + 1 + argument.index - alias_words;
+                let raw = args[argument.index].unwrap_or_default();
+                let typed = raw.strip_prefix(&argument.prefix).unwrap_or_default();
+                if argument.directory
+                    && tool != archives::Tool::Tar
+                    && !self.diagnosis.mentions(ProblemKind::MissingPath, typed)
+                {
+                    // unzip/7-Zip create their output directory if it is absent.
+                    continue;
+                }
+                if typed.is_empty()
+                    || typed.starts_with('-')
+                    || typed.contains("://")
+                    || std::fs::symlink_metadata(cwd.join(typed)).is_ok()
+                    || !(failed || self.diagnosis.mentions(ProblemKind::MissingPath, typed))
+                {
+                    continue;
+                }
+                let extension = std::path::Path::new(typed).extension();
+                if !argument.directory
+                    && extension.is_none()
+                    && !self.diagnosis.mentions(ProblemKind::MissingPath, typed)
+                {
+                    continue;
+                }
+                let repairs =
+                    providers::repair_path_filtered(typed, &cwd, argument.directory, extension);
+                // An attached value written after an unquoted prefix
+                // (`-Path:x`, `-xfx.tar`, `--file=x`) is replaced by itself,
+                // so the dialect quotes only the value: a quoted
+                // `'-Path:x'` is a PowerShell string, not a parameter.
+                let value_only = !argument.prefix.is_empty()
+                    && words[i]
+                        .span
+                        .of(&script.source)
+                        .starts_with(&argument.prefix);
+                for (to, score) in repairs {
+                    let mut state = start.clone();
+                    state.score *= score.total;
+                    state.evidence.push(Evidence {
+                        source: Source::Filesystem,
+                        detail: format!("archive argument `{typed}` does not exist"),
+                    });
+                    state.edits.push(TokenEdit {
+                        command: index,
+                        word: i,
+                        span: if value_only {
+                            parser::Span::new(
+                                words[i].span.start + argument.prefix.len(),
+                                words[i].span.end,
+                            )
+                        } else {
+                            words[i].span
+                        },
+                        role: if argument.prefix.is_empty() {
+                            TokenRole::Path
+                        } else {
+                            TokenRole::OptionValue
+                        },
+                        from: if value_only { typed.into() } else { raw.into() },
+                        to: if value_only {
+                            to
+                        } else {
+                            format!("{}{to}", argument.prefix)
+                        },
+                        via: "filesystem".into(),
+                        description: None,
+                        resource: true,
+                        score,
+                    });
+                    states.push(state);
+                }
+            }
+        }
+        let name = std::path::Path::new(&start.program)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&start.program);
+        let trusted = self
+            .ctx
+            .settings
+            .trusted_completers
+            .iter()
+            .any(|entry| entry == "*" || entry == name || entry == &start.program);
+        if self.native.is_none() || !trusted || !layout.reads_members || layout.members.is_empty() {
+            return states;
+        }
+        let Some(program) = start.path.as_ref() else {
+            return states;
+        };
+        let mut finished = Vec::new();
+        for state in states {
+            let at = layout.archive.index;
+            let raw = if at >= alias_words {
+                let i = p + 1 + at - alias_words;
+                state
+                    .edits
+                    .iter()
+                    .find(|edit| edit.word == i)
+                    .map(|edit| {
+                        // A value-only edit starts after the attached prefix.
+                        if edit.span.start > words[i].span.start {
+                            format!("{}{}", layout.archive.prefix, edit.to)
+                        } else {
+                            edit.to.clone()
+                        }
+                    })
+                    .or(args[at].map(str::to_owned))
+                    .unwrap_or_default()
+            } else {
+                args[at].unwrap_or_default().to_owned()
+            };
+            let archive = raw.strip_prefix(&layout.archive.prefix).unwrap_or_default();
+            if !cwd.join(archive).is_file() {
+                finished.push(state);
+                continue;
+            }
+            let listing = match archives::Listing::open(
+                tool,
+                program,
+                &cwd.join(archive),
+                &mut self.budget,
+            ) {
+                Ok(listing) => listing,
+                Err(error) => {
+                    self.note(format!("{name} archive members: {error}"));
+                    finished.push(state);
+                    continue;
+                }
+            };
+            // A repaired archive must hold what the command names.
+            let archive_repaired = at >= alias_words
+                && state
+                    .edits
+                    .iter()
+                    .any(|edit| edit.command == index && edit.word == p + 1 + at - alias_words);
+            let mut frontier = vec![state];
+            for &at in &layout.members {
+                if at < alias_words {
+                    continue;
+                }
+                let i = p + 1 + at - alias_words;
+                let typed = args[at].unwrap_or_default();
+                if !archives::literal_member(typed) || archives::contains(&listing.members, typed) {
+                    continue;
+                }
+                let ranked = ranking::rank_tokens(
+                    typed,
+                    listing.members.iter().map(String::as_str),
+                    &[],
+                    &|_| 0,
+                    BEAM,
+                );
+                let names: Vec<String> = ranked
+                    .into_iter()
+                    .filter_map(|(name, _)| {
+                        listing
+                            .verifies(name, &mut self.budget)
+                            .then(|| name.to_owned())
+                    })
+                    .collect();
+                if names.is_empty() {
+                    if archive_repaired {
+                        frontier.clear();
+                        break;
+                    }
+                    continue;
+                }
+                let vocabulary = providers::Vocabulary {
+                    words: names
+                        .iter()
+                        .map(|name| native::CompletionItem {
+                            value: name.clone(),
+                            takes_value: None,
+                            description: None,
+                        })
+                        .collect(),
+                    authoritative: false,
+                    via: format!("{name} archive listing"),
+                    source: Source::NativeCompletion,
+                    cached: false,
+                    resources: names,
+                };
+                let mut next = Vec::new();
+                for state in frontier {
+                    match self.branch(
+                        &state,
+                        (index, i),
+                        TokenRole::ArgumentValue,
+                        (typed, ""),
+                        words[i].span,
+                        &vocabulary,
+                    ) {
+                        Branching::Branches(branches) => {
+                            next.extend(branches.into_iter().map(|(state, _)| state))
+                        }
+                        _ => next.push(state),
+                    }
+                }
+                next.sort_by(|a, b| b.score.total_cmp(&a.score));
+                next.truncate(BEAM);
+                frontier = next;
+            }
+            finished.extend(frontier);
+        }
+        finished
+    }
+
+    /// The installed program a package runner would run, without fetching
+    /// anything: on `$PATH`, or (for Node) in a `node_modules/.bin` above
+    /// the working directory, which is used but never probed.
+    fn resolve_package(&mut self, spec: &str, ecosystem: diagnosis::Ecosystem) -> Option<State> {
+        if spec.starts_with('@') || spec.contains('/') {
+            self.note(format!(
+                "{spec}: scoped or path packages are not resolved to a program"
+            ));
+            return None;
+        }
+        let name = spec.split('@').next().unwrap_or(spec);
+        if let Some(path) = self.ctx.which(name) {
+            return Some(State::new(name, Some(path)));
+        }
+        if ecosystem == diagnosis::Ecosystem::Node
+            && let Some(cwd) = self
+                .failure
+                .cwd
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+            && cwd
+                .ancestors()
+                .take(16)
+                .any(|dir| dir.join("node_modules/.bin").join(name).is_file())
+        {
+            self.note(format!(
+                "{name}: a local package binary; its completion is not probed automatically"
+            ));
+            return Some(State::new(name, None));
+        }
+        self.note(format!(
+            "{name} is not installed; the package runner would fetch it, so its name is not checked"
+        ));
+        None
+    }
+
+    /// The app's first argument starts another program's words.
+    fn arguments_end_options(&mut self, state: &State) -> bool {
+        self.native.as_mut().is_some_and(|n| {
+            n.backend(&state.program, state.path.as_ref(), &mut self.budget)
+                .is_some_and(|b| b.arguments_end_options())
+        })
+    }
+
+    /// The `git-<name>` program `git <name>` runs, when it has a native
+    /// completer of its own (git-lfs's cobra); git's bridge probes only
+    /// builtins.
+    fn git_helper(&mut self, state: &State, word: &str) -> Option<(String, PathBuf)> {
+        if state.program != "git"
+            || !word
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
+        {
+            return None;
+        }
+        let program = format!("git-{word}");
+        let path = self.ctx.which(&program)?;
+        self.native
+            .as_mut()?
+            .backend(&program, Some(&path), &mut self.budget)
+            .map(|_| (program, path))
+    }
+
+    fn has_native(&mut self, state: &State) -> bool {
+        self.native.as_mut().is_some_and(|n| {
+            n.backend(&state.program, state.path.as_ref(), &mut self.budget)
+                .is_some()
+        })
+    }
+
+    /// Repairs words naming paths that don't exist: the target of `cd`
+    /// (`only`), an explicit program path (`only`), or, with `only` unset,
+    /// paths the output reports missing and, after a known failure, other
+    /// words containing `/`.
+    fn path_candidates(
+        &mut self,
+        script: &Script,
+        index: usize,
+        p: usize,
+        only: Option<usize>,
+    ) -> Vec<State> {
+        if !self.filesystem {
+            return Vec::new();
+        }
+        let Some(cwd) = self
+            .failure
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+        else {
+            return Vec::new();
+        };
+        let words = &script.commands[index].words;
+        let program = words[p].literal().unwrap_or_default();
+        let cd = matches!(program, "cd" | "pushd") && only == Some(p + 1);
+        if cd && std::env::var_os("CDPATH").is_some_and(|v| !v.is_empty()) {
+            self.note("cd targets are not repaired while CDPATH is set".into());
+            return Vec::new();
+        }
+        let failed = self.failure.exit_status.is_some_and(|s| s != 0)
+            || self.failure.output.diagnostic_text().is_some();
+        let targets: Vec<usize> = match only {
+            Some(i) if cd => words
+                .iter()
+                .enumerate()
+                .skip(i)
+                .find(|(_, w)| w.literal().is_some_and(|t| !t.starts_with('-')))
+                .map(|(i, _)| i)
+                .into_iter()
+                .collect(),
+            Some(i) => vec![i],
+            None => (p + 1..words.len())
+                .filter(|&i| {
+                    words[i].literal().is_some_and(|t| {
+                        !t.starts_with('-')
+                            && !t.contains("://")
+                            && (self.diagnosis.mentions(ProblemKind::MissingPath, t)
+                                || failed && t.contains('/') && !t.contains('='))
+                    })
+                })
+                .collect(),
+        };
+        let mut states = Vec::new();
+        for i in targets {
+            let Some(typed) = words[i].literal() else {
+                continue;
+            };
+            let here = cwd.join(typed);
+            let exists = if cd {
+                here.is_dir()
+            } else {
+                std::fs::symlink_metadata(&here).is_ok()
+            };
+            if exists {
+                continue;
+            }
+            let mut evidence = vec![(
+                PATH_MISSING,
+                Evidence {
+                    source: Source::Filesystem,
+                    detail: format!("`{typed}` does not exist"),
+                },
+            )];
+            if self.diagnosis.mentions(ProblemKind::MissingPath, typed) {
+                evidence.push((
+                    OUTPUT_NAMES_IT,
+                    Evidence {
+                        source: Source::Stderr,
+                        detail: format!("the output says `{typed}` is missing"),
+                    },
+                ));
+            } else if self.failure.exit_status.is_some_and(|s| s != 0) {
+                evidence.push((
+                    COMMAND_FAILED,
+                    Evidence {
+                        source: Source::Filesystem,
+                        detail: "the command failed".into(),
+                    },
+                ));
+            }
+            let suspicion = self.suspect(index, i, TokenRole::Path, typed, evidence.clone());
+            for (to, score) in providers::repair_path(typed, &cwd, cd) {
+                let mut state = State::new(program, None);
+                state.weak = suspicion < STRONG_SUSPICION;
+                state.score = score.total;
+                state
+                    .evidence
+                    .extend(evidence.iter().map(|(_, e)| e.clone()));
+                state.edits.push(TokenEdit {
+                    command: index,
+                    word: i,
+                    span: words[i].span,
+                    role: TokenRole::Path,
+                    from: typed.to_owned(),
+                    to,
+                    via: "filesystem".into(),
+                    description: None,
+                    resource: false,
+                    score,
+                });
+                states.push(state);
+            }
+        }
+        states
+    }
+
+    fn executable_candidates(
+        &mut self,
+        script: &Script,
+        index: usize,
+        p: usize,
+        name: &str,
+    ) -> Vec<State> {
+        let mut evidence = vec![(
+            NOT_ON_PATH,
+            Evidence {
+                source: Source::Executables,
+                detail: format!("`{name}` is not an installed executable, alias, or builtin"),
+            },
+        )];
+        if self.reported_missing() {
+            let status = self.failure.exit_status.unwrap_or_default();
+            evidence.push((
+                EXIT_127,
+                Evidence {
+                    source: Source::Executables,
+                    detail: format!("the shell exited with {status} (command not found)"),
+                },
+            ));
+        }
+        if self.diagnosis.mentions(ProblemKind::CommandNotFound, name) {
+            evidence.push((
+                OUTPUT_NAMES_IT,
+                Evidence {
+                    source: Source::Stderr,
+                    detail: format!("the output says `{name}` was not found"),
+                },
+            ));
+        }
+        let suspicion = self.suspect(index, p, TokenRole::Executable, name, evidence.clone());
+        let powershell = if self.ctx.shell == Shell::Powershell && self.executables.is_some() {
+            self.powershell_names()
+        } else {
+            Vec::new()
+        };
+        let Some(provider) = self.executables.as_mut() else {
+            return Vec::new();
+        };
+        provider.extra = powershell.clone();
+        let slot = providers::Slot {
+            role: TokenRole::Executable,
+            program: "",
+            path: None,
+            context: &[],
+            command_path: &[],
+            typed: name,
+            fresh: false,
+        };
+        let providers::Answer::Words(vocabulary) = provider.vocabulary(&slot, &mut self.budget)
+        else {
+            return Vec::new();
+        };
+        let history = self.history.as_ref();
+        let uses = |word: &str| history.map_or(0, |h| h.program_uses(word));
+        let ranked = within_window(ranking::rank_tokens(
+            name,
+            vocabulary.words.iter().map(|w| w.value.as_str()),
+            &self.diagnosis.suggestions,
+            &uses,
+            BEAM,
+        ));
+        if ranked.is_empty() {
+            self.note(format!("no installed executable is close to `{name}`"));
+        }
+        let word = &script.commands[index].words[p];
+        let splits =
+            self.split_candidates(index, p, word.span, name, &vocabulary, &evidence, suspicion);
+        let ranked: Vec<(String, ScoreBreakdown)> = ranked
+            .into_iter()
+            .map(|(to, score)| (to.to_owned(), score))
+            .collect();
+        ranked
+            .into_iter()
+            .map(|(to, score)| {
+                let to = to.as_str();
+                let path = self.ctx.which(to);
+                let mut state = State::new(to, path.clone());
+                // A PowerShell command takes PowerShell's parameter rules.
+                if path.is_none()
+                    && powershell.iter().any(|n| n == to)
+                    && self.powershell_command(to)
+                {
+                    state.powershell = true;
+                }
+                state.weak = suspicion < STRONG_SUSPICION;
+                state.score = score.total;
+                state
+                    .evidence
+                    .extend(evidence.iter().map(|(_, e)| e.clone()));
+                state.edits.push(TokenEdit {
+                    command: index,
+                    word: p,
+                    span: word.span,
+                    role: TokenRole::Executable,
+                    from: name.to_owned(),
+                    to: to.to_owned(),
+                    via: vocabulary.via.clone(),
+                    description: None,
+                    resource: false,
+                    score,
+                });
+                state
+            })
+            .chain(splits)
+            .collect()
+    }
+
+    /// `name` as a known program followed by the rest of the word: `cd..`
+    /// is `cd ..`, `gitstatus` is `git status`. The longest programs that
+    /// fit are tried, and the program's completer judges the rest.
+    #[allow(clippy::too_many_arguments)]
+    fn split_candidates(
+        &mut self,
+        index: usize,
+        p: usize,
+        span: Span,
+        name: &str,
+        vocabulary: &providers::Vocabulary,
+        evidence: &[(f64, Evidence)],
+        suspicion: f64,
+    ) -> Vec<State> {
+        let mut heads: Vec<usize> = name
+            .char_indices()
+            .map(|(i, _)| i)
+            .filter(|&i| i >= 2 && vocabulary.contains(&name[..i]))
+            .collect();
+        heads.reverse();
+        let mut states = Vec::new();
+        for i in heads.into_iter().take(2) {
+            let (head, tail) = name.split_at(i);
+            // `cd..`, `cd/tmp`, `cd~`, `ls-la`: punctuation after a program.
+            let wordy = !tail.starts_with(['.', '/', '~', '-']);
+            // `lsx` is likelier `ls` with a stray key than `ls x`.
+            if wordy && tail.chars().count() < 2 {
+                continue;
+            }
+            let joined = format!("{head} {tail}");
+            let uses = self.history.as_ref().map_or(0, |h| h.program_uses(head));
+            let score = ranking::score_token(name, &joined, false, uses);
+            let mut state = State::new(head, self.ctx.which(head));
+            state.weak = suspicion < STRONG_SUSPICION;
+            // An equally close spelling fix is the likelier mistake.
+            state.score = score.total * SPLIT_DISCOUNT;
+            state
+                .evidence
+                .extend(evidence.iter().map(|(_, e)| e.clone()));
+            state.evidence.push(Evidence {
+                source: Source::Executables,
+                detail: format!("`{head}` is installed and `{name}` starts with it"),
+            });
+            if !tail.starts_with('-') {
+                match self.check(&state, TokenRole::Subcommand, tail) {
+                    Check::Valid {
+                        confirmed: true, ..
+                    } => {
+                        state.score = (state.score + CONTEXT_FITS).min(1.0);
+                        state.confirmed = true;
+                        state.command_path.push(tail.to_owned());
+                        state.evidence.push(Evidence {
+                            source: Source::NativeCompletion,
+                            detail: format!("{head} completion lists `{tail}`"),
+                        });
+                    }
+                    Check::Invalid(v) if v.authoritative => state.score *= UNRESOLVED_PENALTY,
+                    // Nothing vouches for a word after the program.
+                    _ if wordy => state.score *= UNCONFIRMED_SPLIT,
+                    _ => {}
+                }
+            }
+            state.context.push(tail.to_owned());
+            state.edits.push(TokenEdit {
+                command: index,
+                word: p,
+                span,
+                role: TokenRole::Split,
+                from: name.to_owned(),
+                to: joined,
+                via: vocabulary.via.clone(),
+                description: None,
+                resource: false,
+                score,
+            });
+            states.push(state);
+        }
+        states
+    }
+
+    /// Asks the app's completer about one word of the walk, or, for apps
+    /// without one, what documentation and history know.
+    fn check(&mut self, state: &State, role: TokenRole, typed: &str) -> Check {
+        let mut check = if self.has_native(state) {
+            self.native_check(state, role, typed)
+        } else {
+            self.fallback_check(state, role, typed)
+        };
+        // PowerShell parameters never cluster.
+        if role == TokenRole::OptionName
+            && !state.powershell
+            && let Check::Invalid(vocabulary) = &check
+            && let Some(resolved) = short_cluster(typed, vocabulary)
+        {
+            // A partial list may omit the single-dash long option the word
+            // is close to (ffmpeg's basic `-h`, which zsh's _ffmpeg reads,
+            // omits `-hide_banner`). The app's documentation decides before
+            // the word becomes a short option with an attached value.
+            check = match resolved {
+                Check::Valid { .. } if !vocabulary.authoritative && self.has_native(state) => {
+                    match self.fallback_check(state, role, typed) {
+                        Check::Invalid(documented) if near_long_option(typed, &documented) => {
+                            Check::Invalid(documented)
+                        }
+                        _ => resolved,
+                    }
+                }
+                resolved => resolved,
+            };
+        }
+        if matches!(check, Check::Valid { .. } | Check::Invalid(_)) {
+            self.checked += 1;
+        }
+        check
+    }
+
+    fn native_check(&mut self, state: &State, role: TokenRole, typed: &str) -> Check {
+        let Some(native) = self.native.as_mut() else {
+            return Check::Unknown;
+        };
+        let mut slot = providers::Slot {
+            role,
+            program: &state.program,
+            path: state.path.as_ref(),
+            context: &state.context,
+            command_path: &state.command_path,
+            typed,
+            fresh: false,
+        };
+        let mut answer = native.vocabulary(&slot, &mut self.budget);
+        // A cached list may predate an upgrade: confirm with the app before
+        // calling a word invalid or a level free of subcommands.
+        if let providers::Answer::Words(vocabulary) = &answer
+            && vocabulary.cached
+            && (vocabulary.words.is_empty() || !vocabulary.contains(typed))
+        {
+            slot.fresh = true;
+            answer = native.vocabulary(&slot, &mut self.budget);
+        }
+        match answer {
+            providers::Answer::Words(vocabulary) => {
+                if let Some(word) = vocabulary.words.iter().find(|w| w.value == typed) {
+                    Check::Valid {
+                        takes_value: word.takes_value,
+                        confirmed: vocabulary.authoritative,
+                    }
+                } else if role != TokenRole::OptionName && continues_listed_word(&vocabulary, typed)
+                {
+                    // `web:a` goes on from rclone's listed remote `web:`, as a
+                    // path goes on from a listed directory: not a misspelling.
+                    Check::Valid {
+                        takes_value: None,
+                        confirmed: false,
+                    }
+                } else if let Some(word) = (role == TokenRole::OptionName)
+                    .then(|| native.resolve_option(&slot, &mut self.budget))
+                    .flatten()
+                {
+                    // Another spelling of a listed option (`-rec` for
+                    // PowerShell's `-Recurse`).
+                    Check::Valid {
+                        takes_value: word.takes_value,
+                        confirmed: vocabulary.authoritative,
+                    }
+                } else if vocabulary.words.is_empty() {
+                    if !vocabulary.authoritative {
+                        // A partial handler that lists nothing here (zsh's
+                        // _swift completes files after `swift`) says nothing:
+                        // ask documentation, as for apps without a completer.
+                        let fallback = self.fallback_check(state, role, typed);
+                        if matches!(fallback, Check::Valid { .. } | Check::Invalid(_)) {
+                            return fallback;
+                        }
+                    }
+                    if role == TokenRole::OptionName {
+                        Check::Unknown
+                    } else {
+                        Check::Arguments
+                    }
+                } else if role == TokenRole::Subcommand
+                    && (!vocabulary.authoritative
+                        || native.lists_omit_aliases(&slot, &mut self.budget))
+                    && native.confirms(&slot, &mut self.budget)
+                {
+                    // A partial list omits it, but the app accepts it.
+                    Check::Valid {
+                        takes_value: None,
+                        confirmed: true,
+                    }
+                } else {
+                    let listed: Vec<&str> = vocabulary
+                        .words
+                        .iter()
+                        .map(|word| word.value.as_str())
+                        .collect();
+                    match (role == TokenRole::Subcommand)
+                        .then(|| native.lists_arguments(&slot, &listed, &mut self.budget))
+                        .flatten()
+                    {
+                        // The app predicted arguments here; it never judges them.
+                        Some(native::ArgumentList::Unjudged) => Check::Arguments,
+                        // Values (make targets, mtr's placeholders): another
+                        // one is a resource the user approves.
+                        Some(native::ArgumentList::Resources) => {
+                            let mut vocabulary = vocabulary;
+                            vocabulary.resources = vocabulary
+                                .words
+                                .iter()
+                                .map(|word| word.value.clone())
+                                .collect();
+                            Check::Invalid(keep_hierarchical_tails(vocabulary, typed))
+                        }
+                        None => Check::Invalid(keep_hierarchical_tails(vocabulary, typed)),
+                    }
+                }
+            }
+            // A broken completer is reported; documentation still applies.
+            providers::Answer::NotApplicable | providers::Answer::Failed(_) => {
+                match self.fallback_check(state, role, typed) {
+                    check @ (Check::Valid { .. } | Check::Invalid(_)) => check,
+                    _ => Check::Unknown,
+                }
+            }
+        }
+    }
+
+    /// `--help` output, man pages, and history for an app without a native
+    /// completer: documented command levels and options, never authoritative.
+    fn fallback_check(&mut self, state: &State, role: TokenRole, typed: &str) -> Check {
+        let slot = providers::Slot {
+            role,
+            program: &state.program,
+            path: state.path.as_ref(),
+            context: &state.context,
+            command_path: &state.command_path,
+            typed,
+            fresh: false,
+        };
+        let answers = [
+            self.help
+                .as_mut()
+                .map(|p| p.vocabulary(&slot, &mut self.budget)),
+            self.man
+                .as_mut()
+                .map(|p| p.vocabulary(&slot, &mut self.budget)),
+            self.history
+                .as_mut()
+                .map(|p| p.vocabulary(&slot, &mut self.budget)),
+        ];
+        let mut merged = providers::Vocabulary {
+            words: Vec::new(),
+            authoritative: false,
+            via: String::new(),
+            source: Source::ManPage,
+            cached: false,
+            resources: Vec::new(),
+        };
+        let mut vias = Vec::new();
+        for answer in answers.into_iter().flatten() {
+            let providers::Answer::Words(vocabulary) = answer else {
+                continue;
+            };
+            if vias.is_empty() {
+                merged.source = vocabulary.source;
+            }
+            vias.push(vocabulary.via);
+            for word in vocabulary.words {
+                match merged.words.iter_mut().find(|w| w.value == word.value) {
+                    Some(known) if known.takes_value.is_none() => {
+                        known.takes_value = word.takes_value
+                    }
+                    Some(_) => {}
+                    None => merged.words.push(word),
+                }
+            }
+        }
+        merged.via = vias.join(" and ");
+        if merged.words.is_empty() {
+            return if role == TokenRole::Subcommand {
+                Check::Arguments
+            } else {
+                Check::Unknown
+            };
+        }
+        match merged.words.iter().find(|w| w.value == typed) {
+            Some(word) => Check::Valid {
+                takes_value: word.takes_value,
+                confirmed: false,
+            },
+            None => Check::Invalid(merged),
+        }
+    }
+
+    /// Checks the words after the program against the app's completer (or,
+    /// without one, documentation and history), from the first level down,
+    /// branching on close alternatives.
+    fn walk(&mut self, script: &Script, index: usize, p: usize, start: State) -> Vec<State> {
+        let src = &script.source;
+        let words = &script.commands[index].words;
+        let direct_arguments = start.context.is_empty();
+        let archive_arguments: Vec<_> = start
+            .context
+            .iter()
+            .map(|s| Some(s.as_str()))
+            .chain(words[p + 1..].iter().map(|word| word.literal()))
+            .collect();
+        let archive_words = archives::tool(&start.program)
+            .and_then(|tool| {
+                archives::layout(tool, &archive_arguments).map(|layout| {
+                    let mut protected = layout.members;
+                    protected.push(layout.archive.index);
+                    protected.extend(layout.paths.iter().map(|argument| argument.index));
+                    // A tar, jar, or ar mode without a dash is an old-style
+                    // option cluster (`tf`, `rcs`), not a subcommand.
+                    if matches!(
+                        tool,
+                        archives::Tool::Tar | archives::Tool::Jar | archives::Tool::Ar
+                    ) && archive_arguments
+                        .first()
+                        .copied()
+                        .flatten()
+                        .is_some_and(|word| !word.starts_with('-'))
+                    {
+                        protected.push(0);
+                    }
+                    protected
+                        .into_iter()
+                        .filter(|&at| at >= start.context.len())
+                        .map(|at| p + 1 + at - start.context.len())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        let mut done = Vec::new();
+        // (interpretation, next word, level, the previous option takes a value)
+        let mut frontier = vec![(start, p + 1, Level::Commands, false)];
+        while let Some((mut state, mut i, mut level, mut pending_value)) = frontier.pop() {
+            while i < words.len() {
+                if self.budget.exhausted() {
+                    self.note("probe budget exhausted; later words were not checked".into());
+                    self.unchecked = true;
+                    break;
+                }
+                let word = &words[i];
+                let Some(text) = word.literal() else {
+                    // An expansion: its meaning is unknown, so words after it
+                    // can no longer be checked as subcommands.
+                    if !pending_value {
+                        level = Level::Arguments;
+                    }
+                    pending_value = false;
+                    state.opaque_context = true;
+                    state.context.push("x".into());
+                    i += 1;
+                    continue;
+                };
+                if archive_words.contains(&i)
+                    || i == p + 1
+                        && direct_arguments
+                        && archives::tool(&state.program) == Some(archives::Tool::Tar)
+                        && archives::old_style_flags(text)
+                {
+                    state.context.push(text.to_owned());
+                    pending_value = false;
+                    level = Level::Arguments;
+                    i += 1;
+                    continue;
+                }
+                if state.powershell
+                    && text.starts_with('-')
+                    && word.option_name_span_with(src, ':').is_none()
+                {
+                    state.literal_arguments.push(state.context.len());
+                }
+                if pending_value {
+                    pending_value = false;
+                    if let Some(vocabulary) =
+                        self.check_value(&state, &[], text, &words[i + 1..], false, src)
+                        && let Branching::Branches(mut branches) = self.branch(
+                            &state,
+                            (index, i),
+                            TokenRole::OptionValue,
+                            (text, ""),
+                            word.span,
+                            &vocabulary,
+                        )
+                    {
+                        let (first, _) = branches.remove(0);
+                        for (other, _) in branches.into_iter().rev() {
+                            frontier.push((other, i + 1, level, false));
+                        }
+                        state = first;
+                        i += 1;
+                        continue;
+                    }
+                    state.context.push(text.to_owned());
+                    i += 1;
+                    continue;
+                }
+                if text == "--" {
+                    break;
+                }
+                if text == "then"
+                    && !state.opaque_context
+                    && !self.has_native(&state)
+                    && self.help.as_mut().is_some_and(|help| {
+                        help.chain_ready(
+                            &state.program,
+                            state.path.as_ref(),
+                            &state.command_path,
+                            &state.context,
+                            &mut self.budget,
+                        )
+                    })
+                {
+                    // Miller starts another verb here. Only fixed help for
+                    // that verb is queried; the preceding data stays in the
+                    // original source and is never forwarded to discovery.
+                    state.command_path.clear();
+                    state.context.clear();
+                    level = Level::Commands;
+                    i += 1;
+                    continue;
+                }
+                // PowerShell parameters start with a letter (`-5` is a
+                // number) and take attached values after `:`.
+                let backend = self.native.as_mut().and_then(|native| {
+                    native.backend(&state.program, state.path.as_ref(), &mut self.budget)
+                });
+                let protocol_separator = backend
+                    .as_ref()
+                    .and_then(|backend| backend.option_separator(text));
+                let is_option = protocol_separator.is_some()
+                    || (text.len() > 1
+                        && text.starts_with('-')
+                        && (!state.powershell
+                            || text[1..]
+                                .starts_with(|c: char| c.is_alphabetic() || "_?".contains(c))))
+                        && (!state.powershell || word.option_name_span_with(src, ':').is_some());
+                let separator =
+                    protocol_separator.unwrap_or(if state.powershell { ':' } else { '=' });
+                let name_len = backend
+                    .as_ref()
+                    .and_then(|backend| backend.option_name_len(text))
+                    .unwrap_or_else(|| text.find(separator).unwrap_or(text.len()));
+                let attached = is_option && name_len < text.len();
+                if !is_option
+                    && backend
+                        .as_ref()
+                        .is_some_and(|b| b.supports_positional_values())
+                {
+                    level = Level::Arguments;
+                    if let Some(vocabulary) =
+                        self.check_value(&state, &[], text, &words[i + 1..], true, src)
+                        && let Branching::Branches(mut branches) = self.branch(
+                            &state,
+                            (index, i),
+                            TokenRole::ArgumentValue,
+                            (text, ""),
+                            word.span,
+                            &vocabulary,
+                        )
+                    {
+                        let (first, _) = branches.remove(0);
+                        for (other, _) in branches.into_iter().rev() {
+                            frontier.push((other, i + 1, level, false));
+                        }
+                        state = first;
+                    } else {
+                        state.context.push(text.to_owned());
+                    }
+                    i += 1;
+                    continue;
+                }
+                if !is_option && level == Level::Arguments {
+                    state.context.push(text.to_owned());
+                    i += 1;
+                    continue;
+                }
+                let (role, typed) = if is_option {
+                    (TokenRole::OptionName, &text[..name_len])
+                } else {
+                    (TokenRole::Subcommand, text)
+                };
+                let vocabulary = match self.check(&state, role, typed) {
+                    Check::Valid {
+                        takes_value,
+                        confirmed,
+                    } => {
+                        // A misspelled program whose own completer accepts
+                        // the next word fits the whole command.
+                        if confirmed
+                            && !is_option
+                            && state.command_path.is_empty()
+                            && state.edits.iter().any(|e| e.role == TokenRole::Executable)
+                        {
+                            state.score = (state.score + CONTEXT_FITS).min(1.0);
+                            state.confirmed = true;
+                            state.evidence.push(Evidence {
+                                source: Source::NativeCompletion,
+                                detail: format!("{} completion lists `{text}`", state.program),
+                            });
+                        }
+                        let context: Vec<_> = state.context.iter().map(String::as_str).collect();
+                        let takes_value = backend
+                            .as_ref()
+                            .and_then(|backend| {
+                                backend.option_requires_value(
+                                    &context,
+                                    typed,
+                                    words.get(i + 1).and_then(|word| word.literal()),
+                                    &mut self.budget,
+                                )
+                            })
+                            .or(takes_value);
+                        pending_value = is_option
+                            && !attached
+                            && takes_next(takes_value, words.get(i + 1).and_then(|w| w.literal()));
+                        if !is_option {
+                            state.command_path.push(text.to_owned());
+                        }
+                        state.context.push(text.to_owned());
+                        // `git lfs track` runs git-lfs: its own completer
+                        // checks the words that follow.
+                        if !is_option
+                            && state.command_path.len() == 1
+                            && let Some((program, path)) = self.git_helper(&state, text)
+                        {
+                            state.program = program;
+                            state.path = Some(path);
+                            state.context.clear();
+                            state.command_path.clear();
+                            level = Level::Commands;
+                        }
+                        if attached && takes_value != Some(false) {
+                            let mut branches = self.repair_attached_value(
+                                state,
+                                (index, i),
+                                word,
+                                (src, separator, &words[i + 1..]),
+                                typed,
+                            );
+                            state = branches.remove(0);
+                            for other in branches.into_iter().rev() {
+                                frontier.push((other, i + 1, level, false));
+                            }
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    Check::Arguments => {
+                        // node's script: the rest is the script's.
+                        if self.arguments_end_options(&state) {
+                            break;
+                        }
+                        level = Level::Arguments;
+                        state.context.push(text.to_owned());
+                        i += 1;
+                        continue;
+                    }
+                    Check::Unknown if is_option => {
+                        pending_value = !attached;
+                        state.context.push(text.to_owned());
+                        i += 1;
+                        continue;
+                    }
+                    Check::Unknown => {
+                        self.unchecked = true;
+                        break;
+                    }
+                    Check::Invalid(_)
+                        if is_option && word.option_name_span_to(src, typed.len()).is_none() =>
+                    {
+                        // A quoted option name can't be edited in place.
+                        pending_value = !attached;
+                        state.context.push(text.to_owned());
+                        i += 1;
+                        continue;
+                    }
+                    Check::Invalid(vocabulary) => vocabulary,
+                };
+                let span = match role {
+                    TokenRole::OptionName => word
+                        .option_name_span_to(src, typed.len())
+                        .unwrap_or(word.span),
+                    _ => word.span,
+                };
+                // A partial native list omits words the app accepts (zsh's
+                // _ffmpeg reads only ffmpeg's basic `-h`: no `-pix_fmt` or
+                // `-loglevel`; _swift lists files where swift's help lists
+                // `build`). The app's documentation keeps a word it lists,
+                // and judges a word far from everything the list has.
+                let documented = (!vocabulary.authoritative && self.has_native(&state))
+                    .then(|| self.fallback_check(&state, role, typed));
+                if let Some(Check::Valid { takes_value, .. }) = documented {
+                    pending_value = is_option
+                        && !attached
+                        && takes_next(takes_value, words.get(i + 1).and_then(|w| w.literal()));
+                    if !is_option {
+                        state.command_path.push(text.to_owned());
+                    }
+                    state.context.push(text.to_owned());
+                    i += 1;
+                    continue;
+                }
+                let mut branching = self.branch(
+                    &state,
+                    (index, i),
+                    role,
+                    (typed, &text[typed.len()..]),
+                    span,
+                    &vocabulary,
+                );
+                if matches!(branching, Branching::NotSuspicious)
+                    && let Some(Check::Invalid(documented)) = documented
+                {
+                    branching = self.branch(
+                        &state,
+                        (index, i),
+                        role,
+                        (typed, &text[typed.len()..]),
+                        span,
+                        &documented,
+                    );
+                }
+                match branching {
+                    Branching::NotSuspicious => {
+                        // A partial list says nothing about a word far from it.
+                        pending_value = is_option && !attached;
+                        state.context.push(text.to_owned());
+                        i += 1;
+                    }
+                    Branching::Unresolved => {
+                        state.score *= UNRESOLVED_PENALTY;
+                        break;
+                    }
+                    Branching::Branches(mut branches) => {
+                        let mut checked = Vec::new();
+                        for (branch, takes_value) in branches.drain(..) {
+                            let name = branch.context.last().map(|word| {
+                                let length = backend
+                                    .as_ref()
+                                    .and_then(|backend| backend.option_name_len(word))
+                                    .unwrap_or_else(|| word.find(separator).unwrap_or(word.len()));
+                                &word[..length]
+                            });
+                            let context: Vec<_> = branch.context
+                                [..branch.context.len().saturating_sub(1)]
+                                .iter()
+                                .map(String::as_str)
+                                .collect();
+                            let takes_value = backend
+                                .as_ref()
+                                .and_then(|backend| {
+                                    backend.option_requires_value(
+                                        &context,
+                                        name?,
+                                        words.get(i + 1).and_then(|word| word.literal()),
+                                        &mut self.budget,
+                                    )
+                                })
+                                .or(takes_value);
+                            let pending = is_option
+                                && !attached
+                                && takes_next(
+                                    takes_value,
+                                    words.get(i + 1).and_then(|word| word.literal()),
+                                );
+                            let values = if attached && takes_value != Some(false) {
+                                self.repair_attached_value(
+                                    branch,
+                                    (index, i),
+                                    word,
+                                    (src, separator, &words[i + 1..]),
+                                    typed,
+                                )
+                            } else {
+                                vec![branch]
+                            };
+                            checked.extend(values.into_iter().map(|state| (state, pending)));
+                        }
+                        let (first, pending) = checked.remove(0);
+                        for (other, pending) in checked.into_iter().rev() {
+                            frontier.push((other, i + 1, level, pending));
+                        }
+                        state = first;
+                        pending_value = pending;
+                        i += 1;
+                    }
+                }
+            }
+            done.push(state);
+        }
+        done
+    }
+
+    /// Check an attached value after resolving its option name, including
+    /// when both parts of the same word were misspelled.
+    fn repair_attached_value(
+        &mut self,
+        mut state: State,
+        position: (usize, usize),
+        word: &parser::Word,
+        (source, separator, following): (&str, char, &[parser::Word]),
+        original_name: &str,
+    ) -> Vec<State> {
+        let Some(span) = attached_value_span(word, source, original_name, separator) else {
+            return vec![state];
+        };
+        let attached = state.context.pop().expect("the option was appended");
+        let suffix_len = word.literal().expect("a literal option").len() - original_name.len();
+        let (name, suffix) = attached.split_at(attached.len() - suffix_len);
+        let value = suffix
+            .strip_prefix(separator)
+            .expect("an attached option value");
+        if let Some(vocabulary) = self.check_value(&state, &[name], value, following, false, source)
+            && let Branching::Branches(branches) = self.branch(
+                &state,
+                position,
+                TokenRole::OptionValue,
+                (value, ""),
+                span,
+                &vocabulary,
+            )
+        {
+            return branches
+                .into_iter()
+                .map(|(mut branch, _)| {
+                    let corrected = branch.context.pop().expect("the value was appended");
+                    branch.context.push(format!("{name}{separator}{corrected}"));
+                    branch
+                })
+                .collect();
+        }
+        state.context.push(attached);
+        vec![state]
+    }
+
+    /// The values the app lists for the option ending the context (plus
+    /// `extra` words), when `typed` is not among them. A native protocol must
+    /// declare its value grammar before interpreting slashes as vocabulary.
+    fn check_value(
+        &mut self,
+        state: &State,
+        extra: &[&str],
+        typed: &str,
+        following: &[parser::Word],
+        positional: bool,
+        source: &str,
+    ) -> Option<providers::Vocabulary> {
+        if typed.is_empty() {
+            return None;
+        }
+        let mut context = state.context.clone();
+        context.extend(extra.iter().map(|w| w.to_string()));
+        let vocabulary = if self.has_native(state) {
+            if state.opaque_context || following.iter().any(|w| w.literal().is_none()) {
+                let backend = self.native.as_mut()?.backend(
+                    &state.program,
+                    state.path.as_ref(),
+                    &mut self.budget,
+                )?;
+                let words: Vec<&str> = context.iter().map(String::as_str).collect();
+                if positional || backend.values_require_literal_context(&words) {
+                    self.note("parameter completion requires literal context arguments".into());
+                    return None;
+                }
+            }
+            let mut following_values = Vec::new();
+            let mut following_literals = Vec::new();
+            for word in following {
+                if let Some(value) = word.literal() {
+                    if state.powershell
+                        && value.starts_with('-')
+                        && word.option_name_span_with(source, ':').is_none()
+                    {
+                        following_literals.push(following_values.len());
+                    }
+                    following_values.push(value);
+                }
+            }
+            let words: Vec<&str> = context.iter().map(String::as_str).collect();
+            self.native.as_mut()?.values_in_context(
+                &state.program,
+                state.path.as_ref(),
+                native::ValueContext {
+                    words: &words,
+                    following: &following_values,
+                    literal_arguments: (&state.literal_arguments, &following_literals),
+                    positional,
+                },
+                typed,
+                &mut self.budget,
+            )?
+        } else {
+            if typed.contains('/') {
+                return None;
+            }
+            let slot = providers::Slot {
+                role: TokenRole::OptionValue,
+                program: &state.program,
+                path: state.path.as_ref(),
+                context: &context,
+                command_path: &state.command_path,
+                typed,
+                fresh: false,
+            };
+            match self.help.as_mut()?.vocabulary(&slot, &mut self.budget) {
+                providers::Answer::Words(vocabulary) => vocabulary,
+                _ => return None,
+            }
+        };
+        // `Name=value` goes on from a listed `Name=` (ssh's -o): only the
+        // name is judged, and a repaired name keeps the typed value.
+        (!vocabulary.contains(typed)
+            && !continues_listed_word(&vocabulary, typed)
+            && !names_listed_key(&vocabulary, typed))
+        .then(|| keep_hierarchical_tails(vocabulary, typed))
+    }
+
+    /// `typed` (followed by `suffix`, such as `=value`) is not listed in
+    /// `vocabulary`: records the suspicion and returns the closest listed
+    /// words as new interpretations, with whether each takes a value.
+    fn branch(
+        &mut self,
+        state: &State,
+        (index, i): (usize, usize),
+        role: TokenRole,
+        (typed, suffix): (&str, &str),
+        span: Span,
+        vocabulary: &providers::Vocabulary,
+    ) -> Branching {
+        let history = self.history.as_ref();
+        let uses =
+            |word: &str| history.map_or(0, |h| h.uses(&state.program, &state.command_path, word));
+        let mut ranked = within_window(ranking::rank_tokens_as(
+            comparison(role),
+            typed,
+            vocabulary.words.iter().map(|v| v.value.as_str()),
+            &self.diagnosis.suggestions,
+            &uses,
+            BEAM,
+        ));
+        if !vocabulary.authoritative {
+            // A word a partial list omits may be valid. One only as close as
+            // the floor (`x` and `MX`: half the letters differ), or more than
+            // a typo away (zsh's _whois lists `whois.gb.com` for `-h`, seven
+            // edits from `whois.example.com`), is no evidence against it,
+            // unless the app's own output names it.
+            // An abbreviation with one slip at its end (`--no-inferr` for
+            // `--no-inference`) is a typo too.
+            let typo = 2 + typed.chars().count() / 10;
+            let abbreviates = |candidate: &str| {
+                let typed: Vec<char> = typed.chars().collect();
+                typed.len() >= 4
+                    && candidate.chars().count() > typed.len()
+                    && candidate
+                        .chars()
+                        .zip(&typed)
+                        .take_while(|(a, b)| a == *b)
+                        .count()
+                        + 1
+                        >= typed.len()
+            };
+            ranked.retain(|(candidate, score)| {
+                score.total > ranking::FLOOR
+                    && (score.distance <= typo || score.hint > 0.0 || abbreviates(candidate))
+            });
+        }
+        if ranked.is_empty() && !vocabulary.authoritative {
+            return Branching::NotSuspicious;
+        }
+        let kind = if role == TokenRole::OptionName {
+            ProblemKind::UnknownOption
+        } else {
+            ProblemKind::UnknownCommand
+        };
+        let mut evidence = vec![(
+            if vocabulary.authoritative {
+                APP_REJECTS
+            } else {
+                APP_OMITS
+            },
+            Evidence {
+                source: vocabulary.source,
+                detail: format!(
+                    "`{typed}` is not listed after `{}` by {}{}",
+                    [state.program.as_str()]
+                        .into_iter()
+                        .chain(state.context.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    vocabulary.via,
+                    if vocabulary.authoritative {
+                        ""
+                    } else {
+                        " (a partial list)"
+                    }
+                ),
+            },
+        )];
+        if self.diagnosis.mentions(kind, typed) {
+            evidence.push((
+                OUTPUT_NAMES_IT,
+                Evidence {
+                    source: Source::Stderr,
+                    detail: format!("the error output names `{typed}`"),
+                },
+            ));
+        }
+        let suspicion = self.suspect(index, i, role, typed, evidence.clone());
+        if ranked.is_empty() {
+            self.note(format!(
+                "{}: `{typed}` is not valid after `{}`, and nothing valid is close",
+                state.program,
+                state.context.join(" ")
+            ));
+            return Branching::Unresolved;
+        }
+        let branches = ranked
+            .into_iter()
+            .map(|(to, score)| {
+                let mut next = state.clone();
+                let listed = vocabulary.words.iter().find(|v| v.value == to);
+                let takes_value = listed.and_then(|v| v.takes_value);
+                next.context.push(format!("{to}{suffix}"));
+                if role == TokenRole::Subcommand {
+                    next.command_path.push(to.to_owned());
+                }
+                if score.history > 0.0 {
+                    next.evidence.push(Evidence {
+                        source: Source::History,
+                        detail: format!("you have used `{to}` here before"),
+                    });
+                }
+                next.score *= score.total;
+                next.weak |= suspicion < STRONG_SUSPICION;
+                next.evidence
+                    .extend(evidence.iter().map(|(_, e)| e.clone()));
+                next.edits.push(TokenEdit {
+                    command: index,
+                    word: i,
+                    span,
+                    role,
+                    from: typed.to_owned(),
+                    to: to.to_owned(),
+                    via: vocabulary.via.clone(),
+                    description: listed.and_then(|v| v.description.clone()),
+                    resource: vocabulary.resources.iter().any(|r| r == to),
+                    score,
+                });
+                (next, takes_value)
+            })
+            .collect();
+        Branching::Branches(branches)
+    }
+
+    /// Replacements offered by the error output, for apps without a native
+    /// completer. Each occurrence of the named token is its own candidate.
+    fn hint_candidates(
+        &mut self,
+        script: &Script,
+        index: usize,
+        p: usize,
+        start: State,
+    ) -> Vec<State> {
+        if self.hints.is_none() {
+            return Vec::new();
+        }
+        let src = &script.source;
+        let words = &script.commands[index].words;
+        let problems: Vec<_> = self
+            .diagnosis
+            .problems
+            .iter()
+            .filter(|problem| {
+                matches!(
+                    problem.kind,
+                    ProblemKind::UnknownCommand | ProblemKind::UnknownOption
+                )
+            })
+            .cloned()
+            .collect();
+        let mut states = Vec::new();
+        for problem in problems {
+            let option = problem.kind == ProblemKind::UnknownOption;
+            let role = if option {
+                TokenRole::OptionName
+            } else {
+                TokenRole::Subcommand
+            };
+            let positions: Vec<usize> = (p + 1..words.len())
+                .filter(|&i| {
+                    let Some(text) = words[i].literal() else {
+                        return false;
+                    };
+                    if option {
+                        text.split('=').next().map(|n| n.trim_start_matches('-'))
+                            == Some(problem.token.trim_start_matches('-'))
+                            && words[i].option_name_span(src).is_some()
+                    } else {
+                        text == problem.token
+                    }
+                })
+                .collect();
+            for &i in &positions {
+                let evidence = vec![(
+                    OUTPUT_NAMES_IT,
+                    Evidence {
+                        source: Source::Stderr,
+                        detail: format!("the error output rejects `{}`", problem.token),
+                    },
+                )];
+                self.suspect(index, i, role, &problem.token, evidence);
+            }
+            let slot = providers::Slot {
+                role,
+                program: &start.program,
+                path: start.path.as_ref(),
+                context: &[],
+                command_path: &[],
+                typed: &problem.token,
+                fresh: false,
+            };
+            let Some(providers::Answer::Words(vocabulary)) = self
+                .hints
+                .as_mut()
+                .map(|hints| hints.vocabulary(&slot, &mut self.budget))
+            else {
+                continue;
+            };
+            let ranked = ranking::rank_tokens_as(
+                comparison(role),
+                &problem.token,
+                vocabulary.words.iter().map(|w| w.value.as_str()),
+                &self.diagnosis.suggestions,
+                &|_: &str| 0,
+                BEAM,
+            );
+            for (n, &i) in positions.iter().enumerate() {
+                let word = &words[i];
+                for (to, score) in &ranked {
+                    let mut state = start.clone();
+                    state.score = score.total * (1.0 - LATER_OCCURRENCE_PENALTY * n as f64);
+                    state.evidence.push(Evidence {
+                        source: Source::Stderr,
+                        detail: format!(
+                            "the error output rejects `{}` and suggests `{to}`",
+                            problem.token
+                        ),
+                    });
+                    state.edits.push(TokenEdit {
+                        command: index,
+                        word: i,
+                        span: if option {
+                            word.option_name_span(src).unwrap_or(word.span)
+                        } else {
+                            word.span
+                        },
+                        role,
+                        from: problem.token.clone(),
+                        to: (*to).to_owned(),
+                        via: vocabulary.via.clone(),
+                        description: None,
+                        resource: false,
+                        score: score.clone(),
+                    });
+                    states.push(state);
+                }
+            }
+        }
+        states
+    }
+
+    /// Applies a state's edits and checks that only the intended words
+    /// changed: same commands, operators, redirections, and other words.
+    fn build(&mut self, script: &Script, state: State) -> Option<Candidate> {
+        if state.edits.is_empty() {
+            return None;
+        }
+        let edits: Vec<parser::Edit> = state
+            .edits
+            .iter()
+            .map(|e| parser::Edit {
+                span: e.span,
+                replacement: if e.role == TokenRole::Split {
+                    e.to.split(' ')
+                        .map(|word| parser::quote_word_with_dialect(word, script.dialect))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else if script.dialect == parser::Dialect::PowerShell
+                    && matches!(e.role, TokenRole::OptionValue | TokenRole::ArgumentValue)
+                    && e.to.starts_with('-')
+                {
+                    // An unquoted dash value becomes a parameter token to
+                    // PowerShell, even though its literal bytes are right.
+                    format!("'{}'", e.to.replace('\'', "''"))
+                } else {
+                    parser::quote_word_with_dialect(&e.to, script.dialect)
+                },
+            })
+            .collect();
+        let source = parser::apply_edits(&script.source, &edits)?;
+        if let Err(why) = check_structure(script, &source, &state.edits) {
+            self.note(format!("rejected {source}: {why}"));
+            return None;
+        }
+        Some(Candidate {
+            script: source,
+            edits: state.edits,
+            evidence: state.evidence,
+            score: state.score,
+            safety: SafetyAssessment {
+                decision: Decision::Allow,
+                reasons: Vec::new(),
+            },
+            weak: state.weak,
+            confirmed: state.confirmed,
+        })
+    }
+}
+
+/// One dash before several characters (`-la`, `-cf`, `-j4`, `-I/usr/lib`)
+/// is a cluster of short options, or one with its value attached, when its
+/// first letter is a listed short option. Otherwise only a multi-letter
+/// option (`find -type`, `--verbose`) can have been meant: replacing a
+/// cluster with a single short option would silently drop the rest of it.
+/// A cmdlet-shaped name, `Verb-Noun`, optionally module-qualified.
+fn is_cmdlet_name(name: &str) -> bool {
+    regex!(r"^([A-Za-z0-9_.]+\\)?[A-Za-z]+-[A-Za-z][A-Za-z0-9]*$").is_match(name)
+}
+
+/// The name an application runs under: its file name, without Windows'
+/// executable extensions.
+fn program_name(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if cfg!(windows)
+        && let Some((stem, extension)) = name.rsplit_once('.')
+        && ["exe", "cmd", "bat", "com"]
+            .iter()
+            .any(|e| extension.eq_ignore_ascii_case(e))
+    {
+        return stem.to_owned();
+    }
+    name
+}
+
+/// ffmpeg's `-hide_baner` is not `-h` with a value: a listed single-dash
+/// long option sharing its head is the likelier word. gcc's `-Iinclude`
+/// shares no head with `-include`.
+fn near_long_option(typed: &str, vocabulary: &providers::Vocabulary) -> bool {
+    vocabulary.words.iter().any(|w| {
+        w.value.len() > 4
+            && !w.value.starts_with("--")
+            && w.value.get(..4) == typed.get(..4)
+            && ranking::osa_distance(&w.value, typed) <= 2
+    })
+}
+
+fn short_cluster(typed: &str, vocabulary: &providers::Vocabulary) -> Option<Check> {
+    let letters = typed
+        .strip_prefix('-')
+        .filter(|rest| !rest.starts_with('-'))?;
+    // `-x` alone is an ordinary short option.
+    letters.chars().nth(1)?;
+    let short = |c: char| {
+        vocabulary
+            .words
+            .iter()
+            .find(|w| w.value.strip_prefix('-') == Some(c.encode_utf8(&mut [0; 4])))
+    };
+    if letters.chars().next().and_then(short).is_some() && !near_long_option(typed, vocabulary) {
+        let takes_value = match letters.chars().map(short).collect::<Option<Vec<_>>>() {
+            // The last option of a cluster may take the next word.
+            Some(options) => options.last().and_then(|o| o.takes_value),
+            // `-j4`, `-oout`: the value is attached.
+            None => Some(false),
+        };
+        return Some(Check::Valid {
+            takes_value,
+            confirmed: false,
+        });
+    }
+    let mut longer = vocabulary.clone();
+    longer
+        .words
+        .retain(|w| w.value.trim_start_matches('-').chars().nth(1).is_some());
+    Some(if longer.words.is_empty() {
+        Check::Unknown
+    } else {
+        Check::Invalid(longer)
+    })
+}
+
+/// The entire value suffix of `--name=value`, including its quotes/escapes.
+/// The parsed word must be literal, and the option name must be plain.
+/// Replacing the whole suffix lets the selected dialect quote it safely.
+fn attached_value_span(
+    word: &parser::Word,
+    src: &str,
+    name: &str,
+    separator: char,
+) -> Option<Span> {
+    let name_span = word.option_name_span_to(src, name.len())?;
+    let raw = &src[name_span.end..word.span.end];
+    let value = raw.strip_prefix(separator)?;
+    (name_span.of(src) == name
+        && !value.is_empty()
+        && word
+            .literal()
+            .is_some_and(|text| text.starts_with(&format!("{name}{separator}"))))
+    .then(|| Span::new(name_span.end + 1, word.span.end))
+}
+
+/// Two repairs of the same words that are equally many edits away and
+/// equally backed by hints and history: only word length would separate
+/// them (`mal` → `mail` or `man`), which is no reason to choose alone.
+fn equally_supported(a: &Candidate, b: &Candidate) -> bool {
+    a.confirmed == b.confirmed
+        && a.edits.len() == b.edits.len()
+        && a.edits.iter().zip(&b.edits).all(|(x, y)| {
+            (x.command, x.word, x.role) == (y.command, y.word, y.role)
+                && x.score.distance == y.score.distance
+                && x.score.first_letter == y.score.first_letter
+                && x.score.hint == y.score.hint
+                && x.score.history == y.score.history
+        })
+}
+
+/// How spellings in a role compare: option names without their dashes.
+fn comparison(role: TokenRole) -> ranking::Comparison {
+    if role == TokenRole::OptionName {
+        ranking::Comparison::OptionName
+    } else {
+        ranking::Comparison::Word
+    }
+}
+
+/// Drops alternatives too far behind the best one to be worth probing.
+fn within_window<T>(mut ranked: Vec<(T, ScoreBreakdown)>) -> Vec<(T, ScoreBreakdown)> {
+    if let Some(best) = ranked.first().map(|(_, s)| s.total) {
+        ranked.retain(|(_, s)| s.total >= best - BRANCH_WINDOW);
+    }
+    ranked
+}
+
+/// Reparses an edited command line and verifies that the edits changed
+/// exactly the intended words and nothing else.
+fn check_structure(old: &Script, source: &str, edits: &[TokenEdit]) -> Result<(), String> {
+    let new = parser::parse_with_dialect(source, old.dialect);
+    if !new.is_fully_supported() {
+        return Err("the edit produced syntax that can't be analyzed".into());
+    }
+    if new.commands.len() != old.commands.len() {
+        return Err("the number of commands changed".into());
+    }
+    if new.compound_shapes() != old.compound_shapes() {
+        return Err("the compound command structure changed".into());
+    }
+    let literal = |script: &Script, w: &parser::Word| {
+        w.literal()
+            .map_or_else(|| format!("\0{}", w.span.of(&script.source)), str::to_owned)
+    };
+    for (n, (a, b)) in old.commands.iter().zip(&new.commands).enumerate() {
+        if a.connector != b.connector
+            || a.assignments.len() != b.assignments.len()
+            || a.redirections.len() != b.redirections.len()
+        {
+            return Err("the command structure changed".into());
+        }
+        for (x, y) in a.assignments.iter().zip(&b.assignments) {
+            if literal(old, x) != literal(&new, y) {
+                return Err("an assignment changed".into());
+            }
+        }
+        for (x, y) in a.redirections.iter().zip(&b.redirections) {
+            let target =
+                |s: &Script, r: &parser::Redirection| r.target.as_ref().map(|t| literal(s, t));
+            if x.operator.of(&old.source) != y.operator.of(&new.source)
+                || target(old, x) != target(&new, y)
+            {
+                return Err("a redirection changed".into());
+            }
+        }
+        let mut expected: Vec<String> = Vec::new();
+        for (i, x) in a.words.iter().enumerate() {
+            let word_edits = || edits.iter().filter(|e| e.command == n && e.word == i);
+            if let Some(split) = word_edits().find(|e| e.role == TokenRole::Split) {
+                expected.extend(split.to.split(' ').map(str::to_owned));
+                continue;
+            }
+            let mut word = literal(old, x);
+            for edit in word_edits() {
+                word = if edit.role == TokenRole::OptionName {
+                    format!("{}{}", edit.to, &word[edit.from.len().min(word.len())..])
+                } else if edit.role == TokenRole::OptionValue && word != edit.from {
+                    // `--output=jsn` → `--output=json`: replace the suffix.
+                    format!(
+                        "{}{}",
+                        &word[..word.len().saturating_sub(edit.from.len())],
+                        edit.to
+                    )
+                } else {
+                    edit.to.clone()
+                };
+            }
+            expected.push(word);
+        }
+        let actual: Vec<String> = b.words.iter().map(|w| literal(&new, w)).collect();
+        if actual != expected {
+            return Err(format!("the words would read `{}`", actual.join(" ")));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::native::tests::{Dir, FAKE_GIT};
+    use super::*;
+    use crate::settings::Settings;
+    use std::fs;
+
+    /// An aws_completer double that answers from a `tree` file of
+    /// `<context glob>|<word>` lines, so tests can change the app's
+    /// command surface between requests.
+    const TREE_COMPLETER: &str = r#"#!/bin/sh
+# awscli test double
+line=${COMP_LINE#aws }
+prefix=${line##* }
+context=${line% *}
+[ "$context" = "$line" ] && context=
+# Like the real completer, global options don't change the level.
+case $context in
+  "--region "*) rest=${context#--region }
+    case $rest in *" "*) context=${rest#* };; *) context=;; esac;;
+esac
+lists="$(dirname "$0")/tree"
+[ -r "$lists" ] || exit 2
+# Resource names need credentials: offline queries get none.
+[ "$AWS_CONFIG_FILE" != /dev/null ] && [ -f "$(dirname "$0")/resources" ] &&
+  lists="$lists $(dirname "$0")/resources"
+cat $lists | while IFS='|' read -r pattern word; do
+  case $context in
+    $pattern) case $word in "$prefix"*) printf '%s\n' "$word";; esac;;
+  esac
+done
+"#;
+
+    const TREE: &str = "|ec2\n|s3\n|sts\n|--region\n|--profile\n\
+ec2|describe-instances\nec2|describe-instance-status\nec2|run-instances\nec2|terminate-instances\n\
+ec2 *-instances*|--instance-ids\nec2 *-instances*|--region\nec2 *-instances*|--dry-run\n\
+ec2 *-instances*|--output\n\
+ec2 *-instances* --region|eu-west-1\nec2 *-instances* --region|eu-west-2\nec2 *-instances* --region|us-east-1\n\
+ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances* --output|text\n";
+
+    struct Fake {
+        dir: Dir,
+        aws: PathBuf,
+    }
+
+    fn fake_aws() -> Fake {
+        let dir = Dir::new("engine");
+        let aws = dir.script("bin/aws", "#!/bin/sh\ntouch \"$(dirname \"$0\")/ran\"\n");
+        dir.script("bin/aws_completer", TREE_COMPLETER);
+        dir.script("bin/git", FAKE_GIT);
+        fs::write(dir.0.join("bin/tree"), TREE).unwrap();
+        Fake { dir, aws }
+    }
+
+    fn context(fake: &Fake) -> Context {
+        context_with(fake, Settings::default())
+    }
+
+    fn context_with(fake: &Fake, settings: Settings) -> Context {
+        Context::new(settings, Shell::Bash, "fuck".into())
+            .with_executables(&["aws", "git", "grep", "gzip", "ls"])
+            .with_which("aws", Some(fake.aws.to_str().unwrap()))
+            .with_which("git", Some(fake.dir.0.join("bin/git").to_str().unwrap()))
+            .with_which("ls", Some("/bin/ls"))
+            .with_which("gti", None)
+            .with_which("jq", Some("/usr/bin/jq"))
+            .with_which("man", None)
+            .with_history::<&str>(&[])
+    }
+
+    fn failure(source: &str) -> FailureContext {
+        FailureContext {
+            source: source.into(),
+            ..FailureContext::default()
+        }
+    }
+
+    fn scripts(outcome: &Outcome) -> Vec<&str> {
+        outcome
+            .candidates()
+            .iter()
+            .map(|c| c.script.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn native_completion_repairs_operations_and_options() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let report = correct(
+            &failure("aws ec2 describ-instances --regoin eu-west-1"),
+            &ctx,
+        );
+        let Outcome::Suggestion(candidates) = &report.outcome else {
+            panic!("{:?} {:?}", report.outcome, report.notes);
+        };
+        assert_eq!(
+            candidates[0].script,
+            "aws ec2 describe-instances --region eu-west-1"
+        );
+        assert_eq!(candidates[0].edits.len(), 2);
+        assert!(
+            candidates[0]
+                .evidence
+                .iter()
+                .all(|e| e.source == Source::NativeCompletion)
+        );
+        assert_eq!(candidates[0].safety.decision, Decision::Allow);
+        assert!(
+            !fake.dir.0.join("bin/ran").exists(),
+            "discovery must not run the app's failed operation"
+        );
+        assert!(report.probes <= 4, "{} probes", report.probes);
+    }
+
+    #[test]
+    fn only_the_diagnosed_token_changes() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let source = "AWS_PAGER='' aws ec2 describ-instances --region=eu-west-1 | jq '.x y' > \"out file\" # note";
+        let report = correct(&failure(source), &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "AWS_PAGER='' aws ec2 describe-instances --region=eu-west-1 | jq '.x y' > \"out file\" # note"
+        );
+    }
+
+    #[test]
+    fn commands_inside_compound_commands_are_repaired_in_place() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        for (source, expected) in [
+            (
+                "for r in a 'b c'; do aws ec2 describ-instances; done > log",
+                "for r in a 'b c'; do aws ec2 describe-instances; done > log",
+            ),
+            (
+                "{ aws ec2 describ-instances; } | jq .",
+                "{ aws ec2 describe-instances; } | jq .",
+            ),
+            (
+                "f() { aws ec2 describ-instances; } # keep",
+                "f() { aws ec2 describe-instances; } # keep",
+            ),
+            (
+                "! aws ec2 describ-instances",
+                "! aws ec2 describe-instances",
+            ),
+        ] {
+            let report = correct(&failure(source), &ctx);
+            let Outcome::Suggestion(candidates) = &report.outcome else {
+                panic!("{source}: {:?} {:?}", report.outcome, report.notes);
+            };
+            assert_eq!(candidates[0].script, expected);
+            assert_eq!(candidates[0].safety.decision, Decision::Allow, "{source}");
+        }
+        assert!(!fake.dir.0.join("bin/ran").exists());
+        let mut f = failure("if true; then gti status; fi");
+        f.exit_status = Some(127);
+        assert_eq!(
+            scripts(&correct(&f, &ctx).outcome).first().copied(),
+            Some("if true; then git status; fi")
+        );
+
+        let old = parser::parse("for x in a; do git sttus; done");
+        let edit = |to: &str, word| TokenEdit {
+            command: 0,
+            word,
+            role: TokenRole::Subcommand,
+            span: old.commands[0].words[word].span,
+            from: "sttus".into(),
+            to: to.into(),
+            via: "test".into(),
+            description: None,
+            resource: false,
+            score: ranking::score_token("sttus", to, false, 0),
+        };
+        assert!(
+            check_structure(
+                &old,
+                "for x in a; do git status; done",
+                &[edit("status", 1)]
+            )
+            .is_ok()
+        );
+        assert!(
+            check_structure(
+                &old,
+                "for x in b; do git status; done",
+                &[edit("status", 1)]
+            )
+            .is_err(),
+            "a loop's items are not part of the edit"
+        );
+        assert!(
+            check_structure(&old, "while x; do git status; done", &[edit("status", 1)]).is_err()
+        );
+    }
+
+    #[test]
+    fn tcsh_lines_are_repaired_with_tcsh_syntax() {
+        let fake = fake_aws();
+        let ctx = Context::new(Settings::default(), Shell::Tcsh, "fuck".into())
+            .with_executables(&["aws", "git", "grep", "gzip", "ls"])
+            .with_which("aws", Some(fake.aws.to_str().unwrap()))
+            .with_which("git", Some(fake.dir.0.join("bin/git").to_str().unwrap()))
+            .with_which("gti", None)
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let case = |source: &str, status: i32| {
+            let mut f = failure(source);
+            f.exit_status = Some(status);
+            correct(&f, &ctx).outcome
+        };
+        // tcsh exits 1, not 127, for a command it can't find.
+        let outcome = case("gti status 'a b' >& log", 1);
+        let Outcome::Suggestion(candidates) = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(candidates[0].script, "git status 'a b' >& log");
+        assert!(
+            candidates[0]
+                .evidence
+                .iter()
+                .any(|e| e.detail.contains("exited with 1"))
+        );
+        assert_eq!(
+            scripts(&case("aws ec2 describ-instances |& grep x", 255))[0],
+            "aws ec2 describe-instances |& grep x"
+        );
+        assert!(matches!(
+            case("gti status x!y", 1),
+            Outcome::UnsupportedSyntax(_)
+        ));
+        assert!(matches!(case("gti status", 0), Outcome::NoCorrection(_)));
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn new_operations_are_used_without_code_changes() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let source = "aws ec2 describe-capacity-blocks";
+        assert!(matches!(
+            correct(&failure(source), &ctx).outcome,
+            Outcome::Suggestion(_) | Outcome::Ambiguous(_) | Outcome::InsufficientEvidence(_)
+        ));
+        // The installed CLI gains an operation: the same request now validates.
+        let tree = fs::read_to_string(fake.dir.0.join("bin/tree")).unwrap();
+        fs::write(
+            fake.dir.0.join("bin/tree"),
+            format!("{tree}ec2|describe-capacity-blocks\n"),
+        )
+        .unwrap();
+        let report = correct(&failure(source), &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::NoCorrection(_)),
+            "{:?}",
+            report.outcome
+        );
+        let report = correct(&failure("aws ec2 describe-capacity-block"), &ctx);
+        assert_eq!(scripts(&report.outcome)[0], source);
+    }
+
+    #[test]
+    fn git_commands_options_and_subcommands_come_from_git() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        for (typo, fixed, decisive) in [
+            ("git sttus", "git status", true),
+            ("git stash pp", "git stash pop", true),
+            // git's option lists are partial: without output, ask.
+            (
+                "git -C repo stash pop --idex",
+                "git -C repo stash pop --index",
+                false,
+            ),
+            (
+                "git commit --amnd -m 'msg here'",
+                "git commit --amend -m 'msg here'",
+                false,
+            ),
+        ] {
+            let report = correct(&failure(typo), &ctx);
+            assert_eq!(
+                matches!(report.outcome, Outcome::Suggestion(_)),
+                decisive,
+                "{typo}: {:?} {:?}",
+                report.outcome,
+                report.notes
+            );
+            assert_eq!(scripts(&report.outcome)[0], fixed);
+        }
+        for valid in [
+            "git commit -m x -a",
+            "git co main",
+            "git --no-pager status --short",
+        ] {
+            let report = correct(&failure(valid), &ctx);
+            assert!(
+                matches!(report.outcome, Outcome::NoCorrection(_)),
+                "{valid}: {:?}",
+                report.outcome
+            );
+        }
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn man_pages_supply_options_for_apps_without_completion() {
+        let fake = fake_aws();
+        let man = fake.dir.script(
+            "bin/man",
+            "#!/bin/sh\n[ \"$1\" = ls ] || exit 1\nprintf 'LS(1)\\n     -\\b-a\\ba      all\\n     -\\b--\\b-c\\bco\\bol\\blo\\bor\\br[=when]   colorize\\n'\n",
+        );
+        let ctx = context(&fake).with_which("man", Some(man.to_str().unwrap()));
+        let mut f = failure("ls --colro=auto -a");
+        f.exit_status = Some(2);
+        let report = correct(&f, &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::Ambiguous(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(scripts(&report.outcome)[0], "ls --color=auto -a");
+        assert!(
+            report.outcome.candidates()[0]
+                .evidence
+                .iter()
+                .any(|e| e.source == Source::ManPage)
+        );
+        f.output = CapturedOutput::Combined {
+            text: "ls: unrecognized option '--colro=auto'".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        assert!(matches!(correct(&f, &ctx).outcome, Outcome::Suggestion(_)));
+        assert!(
+            matches!(
+                correct(&failure("ls --all-of-it"), &ctx).outcome,
+                Outcome::NoCorrection(_)
+            ),
+            "an unlisted option far from every documented one is left alone"
+        );
+    }
+
+    #[test]
+    fn history_ranks_and_supplies_first_level_words() {
+        let fake = fake_aws();
+        let cargo = fake.dir.script("bin/cargo", "#!/bin/sh\n");
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("cargo", Some(cargo.to_str().unwrap()))
+            .with_which("go", Some(cargo.to_str().unwrap()))
+            .with_which("gt", None)
+            .with_which("man", None)
+            .with_executables(&["git", "gzip", "go", "cargo"])
+            .with_history(&[
+                "cargo test",
+                "cargo build --release",
+                "go build",
+                "go test",
+                "go vet",
+                "fuck",
+            ]);
+        let mut f = failure("cargo tset");
+        f.exit_status = Some(101);
+        let report = correct(&f, &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "cargo test",
+            "{:?}",
+            report.notes
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Ambiguous(_)),
+            "history alone is weak"
+        );
+        let report = correct(&failure("cargo build --relase"), &ctx);
+        assert_eq!(scripts(&report.outcome)[0], "cargo build --release");
+        assert!(matches!(
+            correct(&failure("cargo add serde"), &ctx).outcome,
+            Outcome::NoCorrection(_)
+        ));
+        // `gt` is as close to git as to go; history prefers what was used.
+        let mut f = failure("gt vet");
+        f.exit_status = Some(127);
+        let report = correct(&f, &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "go vet",
+            "{:?}",
+            report.outcome
+        );
+    }
+
+    #[test]
+    fn explicit_executables_use_native_completion_only_in_trusted_workspaces() {
+        let fake = fake_aws();
+        let mut failure = failure("bin/aws ec2 describ-instances");
+        failure.cwd = Some(fake.dir.0.clone());
+        let refused = correct(&failure, &context(&fake));
+        assert!(
+            refused.outcome.candidates().is_empty(),
+            "{:?}",
+            refused.outcome
+        );
+        assert_eq!(refused.probes, 0);
+        assert!(
+            refused
+                .notes
+                .iter()
+                .any(|note| note.contains("trusted_workspaces"))
+        );
+        let ctx = context_with(
+            &fake,
+            Settings {
+                trusted_workspaces: vec![fake.dir.0.to_string_lossy().into_owned()],
+                ..Settings::default()
+            },
+        );
+        let report = correct(&failure, &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "bin/aws ec2 describe-instances",
+            "{:?}",
+            report.notes
+        );
+        failure.source = format!("{} ec2 describ-instances", fake.aws.display());
+        let report = correct(&failure, &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            format!("{} ec2 describe-instances", fake.aws.display())
+        );
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn php_scripts_use_the_resolved_interpreter_and_require_all_three_trust_settings() {
+        let dir = Dir::new("php-script");
+        fs::write(
+            dir.0.join("console"),
+            "<?php\nfile_put_contents('operation-marker', 'executed');\n",
+        )
+        .unwrap();
+        let php = dir.script("bin/php", r#"#!/bin/sh
+root=$(cd "$(dirname "$(dirname "$0")")" && pwd -P)
+printf '%s\n' "$0" >> "$root/interpreters"
+printf '<%s>' "$@" >> "$root/queries"
+printf '\n' >> "$root/queries"
+[ "$1" = "$root/console" ] || exit 8
+shift
+case "$1" in
+  --help)
+    printf 'Options:\n  -h, --help  Display help for the given command. When no command is given display help for the list command\n  -n, --no-interaction  Do not ask any interactive question\n';;
+  help)
+    [ "$2" = _complete ] || exit 8
+    printf '%s\n' '{"name":"_complete","hidden":true,"definition":{"options":{"shell":{"name":"--shell","accept_value":true,"is_multiple":false},"input":{"name":"--input","accept_value":true,"is_multiple":true},"current":{"name":"--current","accept_value":true,"is_multiple":false}}}}';;
+  _complete) printf 'help\nlist\nstatus\n';;
+  *) touch "$root/operation-marker"; exit 9;;
+esac
+"#);
+        let context = |completer, help, workspace| {
+            Context::new(
+                Settings {
+                    trusted_completers: if completer {
+                        vec!["console".into()]
+                    } else {
+                        vec![]
+                    },
+                    trusted_help: if help { vec!["console".into()] } else { vec![] },
+                    trusted_workspaces: if workspace {
+                        vec![dir.0.to_string_lossy().into_owned()]
+                    } else {
+                        vec![]
+                    },
+                    disabled_sources: vec!["help".into(), "man".into(), "history".into()],
+                    ..Settings::default()
+                },
+                Shell::Bash,
+                "fuck".into(),
+            )
+            .with_which("php", Some(php.to_str().unwrap()))
+        };
+        let mut failed = failure("php console stauts");
+        failed.cwd = Some(dir.0.clone());
+        for (completer, help, workspace) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let report = correct(&failed, &context(completer, help, workspace));
+            assert!(report.outcome.candidates().is_empty(), "{:?}", report.notes);
+            assert_eq!(report.probes, 0);
+        }
+        let report = correct(&failed, &context(true, true, true));
+        assert!(
+            !report.outcome.candidates().is_empty(),
+            "{:?} {:?}",
+            report.outcome,
+            report.notes
+        );
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "php console status",
+            "{:?}",
+            report.notes
+        );
+        assert!(
+            report.outcome.candidates()[0]
+                .edits
+                .iter()
+                .all(|edit| edit.word == 2 && edit.via == "symfony completion")
+        );
+        let queries = fs::read_to_string(dir.0.join("queries")).unwrap();
+        assert!(queries.lines().all(|line| line.starts_with(&format!(
+            "<{}>",
+            fs::canonicalize(dir.0.join("console")).unwrap().display()
+        ))));
+        assert!(!dir.0.join("operation-marker").exists());
+        let second = dir.script("bin/php8.5", &fs::read_to_string(&php).unwrap());
+        let trusted = vec!["console".into()];
+        let workspaces = vec![dir.0.to_string_lossy().into_owned()];
+        let mut provider = providers::NativeCompletion::new(&trusted, false)
+            .with_trusted_help(&trusted)
+            .with_workspace(providers::Workspace {
+                cwd: Some(dir.0.clone()),
+                trusted: &workspaces,
+            });
+        let script = fs::canonicalize(dir.0.join("console")).unwrap();
+        let first_key = provider
+            .register_php_script("console", &script, &php, &mut Budget::for_timeout(3.0))
+            .unwrap();
+        let second_key = provider
+            .register_php_script("console", &script, &second, &mut Budget::for_timeout(3.0))
+            .unwrap();
+        assert_ne!(first_key, second_key);
+        assert!(!provider.has_backend("console"));
+        assert!(
+            fs::read_to_string(dir.0.join("interpreters"))
+                .unwrap()
+                .lines()
+                .any(|line| line == second.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn archive_input_paths_need_a_failure_and_matching_extension() {
+        let fake = fake_aws();
+        let root = fake.dir.0.join("work");
+        fs::create_dir_all(root.join("output")).unwrap();
+        for name in [
+            "backup.tar.gz",
+            "photos.zip",
+            "data.7z",
+            "backpu.tar.txt",
+            "backpu.tar.xz",
+            "backpu.tar.bz2",
+            "dir/report.txt",
+        ] {
+            if let Some(parent) = root.join(name).parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(root.join(name), "").unwrap();
+        }
+        let ctx = context_with(
+            &fake,
+            Settings {
+                disabled_sources: vec![
+                    "native".into(),
+                    "help".into(),
+                    "man".into(),
+                    "history".into(),
+                    "stderr".into(),
+                ],
+                ..Settings::default()
+            },
+        )
+        .with_which("tar", Some("/usr/bin/tar"))
+        .with_which("unzip", Some("/usr/bin/unzip"))
+        .with_which("7z", Some("/opt/homebrew/bin/7z"));
+        for (source, expected) in [
+            ("tar xvzf backpu.tar.gz", "tar xvzf backup.tar.gz"),
+            ("tar -xfbackpu.tar.gz", "tar -xfbackup.tar.gz"),
+            (
+                "tar --extract --file=backpu.tar.gz",
+                "tar --extract --file=backup.tar.gz",
+            ),
+            ("unzip photso.zip", "unzip photos.zip"),
+            ("7z x dat.7z -t7z -mx=9", "7z x data.7z -t7z -mx=9"),
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            assert!(
+                correct(&f, &ctx).outcome.candidates().is_empty(),
+                "{source}"
+            );
+            f.exit_status = Some(1);
+            let report = correct(&f, &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first(),
+                Some(&expected),
+                "{report:?}"
+            );
+            assert_eq!(report.probes, 0);
+            assert_eq!(
+                report.outcome.candidates()[0].safety.decision,
+                Decision::Confirm
+            );
+        }
+        for source in [
+            "tar cf backpu.tar.gz notes",
+            "7z a dat.7z notes",
+            "unzip photos.zip dir/reprot.txt",
+            "tar xf backup.tar.gz dir/reprot.txt",
+            "7z x data.7z dir/reprot.txt",
+            "7z d data.7z dir/reprot.txt",
+            "7z x data.7z -ooutpt",
+            "unzip photos.zip -doutpt",
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = Some(1);
+            assert!(
+                correct(&f, &ctx).outcome.candidates().is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn compressor_and_archiver_inputs_follow_each_tools_syntax() {
+        let fake = fake_aws();
+        let root = fake.dir.0.join("work");
+        for name in [
+            "backup.txt.gz",
+            "backup.txt.zst",
+            "backup.txt.lz4",
+            "backup.txt.br",
+            "notes.txt",
+            "photos.zip",
+            "libfoo.a",
+            "archive.pax",
+            "archive.cpio",
+            "dir/a.txt",
+        ] {
+            if let Some(parent) = root.join(name).parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(root.join(name), "").unwrap();
+        }
+        let mut ctx = context_with(
+            &fake,
+            Settings {
+                disabled_sources: vec![
+                    "native".into(),
+                    "help".into(),
+                    "man".into(),
+                    "history".into(),
+                    "stderr".into(),
+                ],
+                ..Settings::default()
+            },
+        );
+        for program in [
+            "gzip", "gunzip", "zcat", "zstd", "lz4", "brotli", "zipinfo", "ar", "pax", "cpio",
+            "ditto",
+        ] {
+            ctx = ctx.with_which(program, Some(&format!("/usr/bin/{program}")));
+        }
+        for (source, expected) in [
+            ("gunzip backpu.txt.gz", "gunzip backup.txt.gz"),
+            ("zcat -S .gz backpu.txt.gz", "zcat -S .gz backup.txt.gz"),
+            ("gzip notse.txt", "gzip notes.txt"),
+            (
+                "zstd -d backpu.txt.zst -o out",
+                "zstd -d backup.txt.zst -o out",
+            ),
+            ("lz4 -d backpu.txt.lz4 otu", "lz4 -d backup.txt.lz4 otu"),
+            (
+                "brotli -q 5 -d backpu.txt.br",
+                "brotli -q 5 -d backup.txt.br",
+            ),
+            ("zipinfo -1 photso.zip", "zipinfo -1 photos.zip"),
+            ("ar -t -v libfo.a", "ar -t -v libfoo.a"),
+            ("pax -rvf archve.pax", "pax -rvf archive.pax"),
+            ("cpio -it -F archve.cpio", "cpio -it -F archive.cpio"),
+            ("ditto -xk photso.zip out", "ditto -xk photos.zip out"),
+            // Declined syntax leaves operands to the generic path provider.
+            ("gzip -r dri/a.txt", "gzip -r dir/a.txt"),
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            assert!(
+                correct(&f, &ctx).outcome.candidates().is_empty(),
+                "{source}"
+            );
+            f.exit_status = Some(1);
+            let report = correct(&f, &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first(),
+                Some(&expected),
+                "{report:?}"
+            );
+            assert_eq!(report.probes, 0);
+            assert_eq!(
+                report.outcome.candidates()[0].safety.decision,
+                Decision::Confirm
+            );
+        }
+        for source in [
+            // Outputs, option values, and patterns are not inputs.
+            "zstd -d backup.txt.zst -o outptu.txt",
+            "lz4 -d backup.txt.lz4 notse.txt",
+            "brotli -o notse.txt backup.txt.br",
+            "gzip -S .gzz backup.txt.gz",
+            "pax -w -f archve.pax notes.txt",
+            "cpio -o -F archve.cpio",
+            "ditto -c -k notes.txt photso.zip",
+            "zstd -r backpu.txt.zst",
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = Some(1);
+            assert!(
+                correct(&f, &ctx).outcome.candidates().is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn archive_members_use_trusted_listings_and_preserve_aliases() {
+        let fake = fake_aws();
+        let tar = fake.dir.script("bin/tar", "#!/bin/sh\ncase $1 in\n--version) printf 'bsdtar 3.5.3 - libarchive 3.7.4\\n';;\n-tf) [ $# = 2 ] || exit 9; printf 'docs/report.txt\\nnotes.txt\\n';;\n*) touch \"$(dirname \"$0\")/extracted\"; exit 9;;\nesac\n");
+        fs::write(fake.dir.0.join("backup.tar"), "").unwrap();
+        fs::create_dir_all(fake.dir.0.join("docs")).unwrap();
+        fs::write(fake.dir.0.join("docs/reports.txt"), "unrelated local file").unwrap();
+        let settings = Settings {
+            trusted_completers: vec!["tar".into()],
+            disabled_sources: vec!["help".into(), "man".into(), "history".into()],
+            ..Settings::default()
+        };
+        let ctx = context_with(&fake, settings)
+            .with_which("tar", Some(tar.to_str().unwrap()))
+            .with_aliases(&[("untar", "tar xf")]);
+        for (source, expected) in [
+            (
+                "tar xf backup.tar docs/reprot.txt",
+                "tar xf backup.tar docs/report.txt",
+            ),
+            (
+                "untar backup.tar docs/reprot.txt",
+                "untar backup.tar docs/report.txt",
+            ),
+            (
+                "tar xf backpu.tar docs/reprot.txt",
+                "tar xf backup.tar docs/report.txt",
+            ),
+            (
+                "tar xf backup.tar docs/reprot.txt notse.txt",
+                "tar xf backup.tar docs/report.txt notes.txt",
+            ),
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(fake.dir.0.clone());
+            f.exit_status = Some(1);
+            let report = correct(&f, &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first(),
+                Some(&expected),
+                "{report:?}"
+            );
+            let edits = &report.outcome.candidates()[0].edits;
+            assert!(
+                edits
+                    .iter()
+                    .any(|edit| edit.role == TokenRole::ArgumentValue && edit.resource)
+            );
+            assert_eq!(
+                report.outcome.candidates()[0].safety.decision,
+                Decision::Confirm
+            );
+        }
+        for source in [
+            "tar xf backup.tar docs/report.txt",
+            "tar xf backup.tar docs",
+            "tar xf backup.tar 'docs/*'",
+            "tar xf backup.tar $MEMBER",
+            "tar cf new.tar docs/reprot.txt",
+        ] {
+            let mut f = failure(source);
+            f.cwd = Some(fake.dir.0.clone());
+            let report = correct(&f, &ctx);
+            assert!(
+                report.outcome.candidates().is_empty(),
+                "{source}: {report:?}"
+            );
+        }
+        let ctx = context(&fake).with_which("tar", Some(tar.to_str().unwrap()));
+        let mut f = failure("tar xf backup.tar docs/reprot.txt");
+        f.cwd = Some(fake.dir.0.clone());
+        let report = correct(&f, &ctx);
+        assert!(report.outcome.candidates().is_empty(), "{report:?}");
+        assert_eq!(report.probes, 0);
+        assert!(!fake.dir.0.join("bin/extracted").exists());
+    }
+
+    #[test]
+    fn missing_paths_are_repaired_from_the_filesystem() {
+        let fake = fake_aws();
+        let root = fake.dir.0.join("work");
+        fs::create_dir_all(root.join("src/engine")).unwrap();
+        fs::write(root.join("src/engine/parser.rs"), "").unwrap();
+        fs::write(root.join("notes.txt"), "").unwrap();
+        fake.dir.script("work/script.sh", "#!/bin/sh\n");
+        let ctx = context(&fake).with_which("cat", Some("/bin/cat"));
+        let case = |source: &str, status: Option<i32>, output: Option<&str>| {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = status;
+            if let Some(text) = output {
+                f.output = CapturedOutput::Combined {
+                    text: text.into(),
+                    origin: OutputOrigin::ShellLogger,
+                };
+            }
+            correct(&f, &ctx).outcome
+        };
+        let outcome = case("cd sr/engin", Some(1), None);
+        assert!(matches!(outcome, Outcome::Suggestion(_)), "{outcome:?}");
+        assert_eq!(scripts(&outcome)[0], "cd src/engine");
+        let outcome = case(
+            "cat notse.txt",
+            Some(1),
+            Some("cat: notse.txt: No such file or directory"),
+        );
+        assert_eq!(scripts(&outcome)[0], "cat notes.txt");
+        // Archivers name the archive they couldn't open in their own words.
+        fs::write(root.join("backup.tar.gz"), "").unwrap();
+        fs::write(root.join("photos.zip"), "").unwrap();
+        let ctx = ctx
+            .with_which("tar", Some("/usr/bin/tar"))
+            .with_which("unzip", Some("/usr/bin/unzip"));
+        let case = |source: &str, output: &str| {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = Some(1);
+            f.output = CapturedOutput::Combined {
+                text: output.into(),
+                origin: OutputOrigin::ShellLogger,
+            };
+            correct(&f, &ctx).outcome
+        };
+        for (source, output, expected) in [
+            (
+                "tar -xzf backpu.tar.gz",
+                "tar: Error opening archive: Failed to open 'backpu.tar.gz'",
+                "tar -xzf backup.tar.gz",
+            ),
+            (
+                "tar -xzf backpu.tar.gz",
+                "tar: backpu.tar.gz: Cannot open: No such file or directory",
+                "tar -xzf backup.tar.gz",
+            ),
+            (
+                "unzip photso.zip",
+                "unzip:  cannot find or open photso.zip, photso.zip.zip or photso.zip.ZIP.",
+                "unzip photos.zip",
+            ),
+        ] {
+            let outcome = case(source, output);
+            assert_eq!(scripts(&outcome).first(), Some(&expected), "{outcome:?}");
+        }
+        let ctx = context(&fake).with_which("cat", Some("/bin/cat"));
+        let case = |source: &str, status: Option<i32>, output: Option<&str>| {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = status;
+            if let Some(text) = output {
+                f.output = CapturedOutput::Combined {
+                    text: text.into(),
+                    origin: OutputOrigin::ShellLogger,
+                };
+            }
+            correct(&f, &ctx).outcome
+        };
+        let outcome = case("cat src/engine/parsr.rs", Some(1), None);
+        assert_eq!(scripts(&outcome)[0], "cat src/engine/parser.rs");
+        let outcome = case("./scirpt.sh --x", Some(127), None);
+        assert_eq!(scripts(&outcome)[0], "./script.sh --x");
+        assert!(
+            matches!(
+                case("cat src/engine/parsr.rs", None, None),
+                Outcome::NoCorrection(_)
+            ),
+            "an argument path is only questioned after a known failure"
+        );
+        assert!(matches!(
+            case("cd src", Some(1), None),
+            Outcome::NoCorrection(_)
+        ));
+    }
+
+    #[test]
+    fn chosen_corrections_are_rechecked_before_they_run() {
+        let fake = fake_aws();
+        let root = fake.dir.0.join("work");
+        fs::create_dir_all(root.join("src/engine")).unwrap();
+        fs::write(root.join("src/notes.txt"), "").unwrap();
+        let script = fake.dir.script("work/script.sh", "#!/bin/sh\n");
+        let ctx = context(&fake).with_which("cat", Some("/bin/cat"));
+        let chosen: Vec<(FailureContext, Candidate)> = [
+            ("cd sr/engin", 1, "cd src/engine"),
+            ("cat src/notse.txt", 1, "cat src/notes.txt"),
+            ("./scirpt.sh --x", 127, "./script.sh --x"),
+            ("gti status", 127, "git status"),
+            ("gitstatus", 127, "git status"),
+        ]
+        .into_iter()
+        .map(|(source, status, expected)| {
+            let mut f = failure(source);
+            f.cwd = Some(root.clone());
+            f.exit_status = Some(status);
+            let report = correct(&f, &ctx);
+            let candidate = report
+                .outcome
+                .candidates()
+                .iter()
+                .find(|c| c.script == expected)
+                .unwrap_or_else(|| panic!("{source}: {:?}", report.outcome))
+                .clone();
+            (f, candidate)
+        })
+        .collect();
+        for (f, candidate) in &chosen {
+            assert_eq!(revalidate(candidate, f, &ctx), Ok(()), "{}", f.source);
+        }
+
+        // The world changes between discovery and execution.
+        fs::remove_dir(root.join("src/engine")).unwrap();
+        fs::write(root.join("src/engine"), "").unwrap();
+        fs::remove_file(root.join("src/notes.txt")).unwrap();
+        fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+        fs::remove_file(fake.dir.0.join("bin/git")).unwrap();
+        let errors: Vec<String> = chosen
+            .iter()
+            .map(|(f, candidate)| revalidate(candidate, f, &ctx).unwrap_err())
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                "src/engine no longer exists",
+                "src/notes.txt no longer exists",
+                "./script.sh is no longer executable",
+                "git is no longer installed",
+                "git is no longer installed",
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_help_output_supplies_subcommands() {
+        let fake = fake_aws();
+        let tool = fake.dir.script(
+            "bin/tool",
+            "#!/bin/sh\ncase \"$*\" in '--help'|'build --help') ;; *) touch \"$(dirname \"$0\")/ran\"; exit 1;; esac\nprintf 'Usage: tool <command>\\n\\nCommands:\\n  build    Build it\\n  deploy   Ship it\\n\\nOptions:\\n  -v, --verbose  Talk\\n' >&2\n",
+        );
+        let settings = Settings {
+            trusted_help: vec!["tool".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("tool", Some(tool.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let report = correct(&failure("tool biuld --verbos"), &ctx);
+        assert_eq!(scripts(&report.outcome)[0], "tool build --verbose");
+        assert!(!fake.dir.0.join("bin/ran").exists(), "only --help ran");
+        let untrusted = context(&fake).with_which("tool", Some(tool.to_str().unwrap()));
+        assert!(
+            correct(&failure("tool biuld"), &untrusted)
+                .outcome
+                .candidates()
+                .is_empty()
+        );
+    }
+
+    /// A completer that answers every slot the same way.
+    #[derive(Debug)]
+    struct Fixed {
+        answer: Result<Vec<native::CompletionItem>, native::CompletionError>,
+        complete: bool,
+    }
+
+    impl native::NativeCompletionBackend for Fixed {
+        fn id(&self) -> &str {
+            "fixed"
+        }
+
+        fn capabilities(&self) -> native::Capabilities {
+            native::Capabilities {
+                subcommands: true,
+                options: true,
+                option_arity: false,
+                values: false,
+                resources: false,
+                option_prefix: "-",
+                short_options: false,
+                complete_options: self.complete,
+                complete_subcommands: self.complete,
+                descriptions: false,
+                query_dialect: None,
+                trust: native::Trust::UserTrusted,
+            }
+        }
+
+        fn complete(
+            &self,
+            _words: &[&str],
+            _prefix: &str,
+            _budget: &mut Budget,
+        ) -> Result<Vec<native::CompletionItem>, native::CompletionError> {
+            self.answer.clone()
+        }
+    }
+
+    /// A partial handler list (zsh's _ffmpeg reads only ffmpeg's basic `-h`;
+    /// _swift lists files where swift's help lists `build`) says nothing
+    /// about a word far from it: the app's documentation confirms or
+    /// repairs it, and decides before `-hide_baner` becomes `-h` with an
+    /// attached value.
+    #[test]
+    fn documentation_judges_words_far_from_a_partial_list() {
+        let fake = fake_aws();
+        let tool = fake.dir.script(
+            "bin/tool",
+            "#!/bin/sh\ncase \"$*\" in\n  --help) printf 'Commands:\\n  build    Build it\\n\\nOptions:\\n  -h TOPIC      Help\\n  -hide_banner  Quiet\\n  -loglevel L   Level\\n';;\n  'build --help') printf 'Options:\\n  --configuration CONF  Config\\n';;\n  *) touch \"$(dirname \"$0\")/ran\"; exit 1;;\nesac\n",
+        );
+        let settings = Settings {
+            trusted_help: vec!["tool".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("tool", Some(tool.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let item = |value: &str, takes_value| native::CompletionItem {
+            value: value.into(),
+            takes_value,
+            description: None,
+        };
+        let partial = vec![
+            item("home", None),
+            item("notes", None),
+            item("-h", Some(true)),
+            item("-v", Some(false)),
+        ];
+        for (source, expected) in [
+            (
+                "tool build --configuraton release",
+                Some("tool build --configuration release"),
+            ),
+            ("tool -hide_baner x", Some("tool -hide_banner x")),
+            ("tool -loglevle quiet", Some("tool -loglevel quiet")),
+            // Still `-h` with a value, and a word nothing documents.
+            ("tool -hbuild", None),
+            ("tool build --zzzzzz", None),
+        ] {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Fixed {
+                    answer: Ok(partial.clone()),
+                    complete: false,
+                });
+            let report =
+                correct_with_backends(&failure(source), &ctx, vec![("tool".into(), backend)]);
+            assert_eq!(
+                report
+                    .outcome
+                    .candidates()
+                    .first()
+                    .map(|c| c.script.as_str()),
+                expected,
+                "{source}: {:?}",
+                report.outcome
+            );
+        }
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    /// `git lfs` runs git-lfs, whose own completer (cobra) checks the words
+    /// after it; git's bridge probes only builtins.
+    #[test]
+    fn git_helpers_with_their_own_completers_check_the_rest_of_the_line() {
+        let item = |value: &str| native::CompletionItem {
+            value: value.into(),
+            takes_value: None,
+            description: None,
+        };
+        let fixed = |words: &[&str]| -> std::rc::Rc<dyn native::NativeCompletionBackend> {
+            std::rc::Rc::new(Fixed {
+                answer: Ok(words.iter().map(|w| item(w)).collect()),
+                complete: true,
+            })
+        };
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("git", Some("/bin/echo"))
+            .with_which("git-lfs", Some("/bin/echo"))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        for (source, expected) in [
+            ("git lfs trak x", Some("git lfs track x")),
+            ("git lfs pull", None),
+            ("git lsf pull", Some("git lfs pull")),
+        ] {
+            let report = correct_with_backends(
+                &failure(source),
+                &ctx,
+                vec![
+                    ("git".into(), fixed(&["lfs", "status"])),
+                    ("git-lfs".into(), fixed(&["track", "pull"])),
+                ],
+            );
+            assert_eq!(
+                report
+                    .outcome
+                    .candidates()
+                    .first()
+                    .map(|c| c.script.as_str()),
+                expected,
+                "{source}: {:?}",
+                report.outcome
+            );
+        }
+    }
+
+    #[test]
+    fn documentation_answers_where_a_partial_or_broken_completer_says_nothing() {
+        let fake = fake_aws();
+        let tool = fake.dir.script(
+            "bin/tool",
+            "#!/bin/sh\n[ \"$*\" = --help ] || exit 1\nprintf 'Commands:\\n  build    Build it\\n  deploy   Ship it\\n'\n",
+        );
+        let settings = Settings {
+            trusted_help: vec!["tool".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("tool", Some(tool.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let run = |answer, complete| {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Fixed { answer, complete });
+            let report =
+                correct_with_backends(&failure("tool biuld"), &ctx, vec![("tool".into(), backend)]);
+            report
+                .outcome
+                .candidates()
+                .first()
+                .map(|c| c.script.clone())
+        };
+        // zsh's _swift lists nothing after `swift`; swift's help lists commands.
+        assert_eq!(run(Ok(Vec::new()), false).as_deref(), Some("tool build"));
+        let broken = Err(native::CompletionError::Failed("exited with 2".into()));
+        assert_eq!(run(broken, false).as_deref(), Some("tool build"));
+        // A complete list with nothing in it means no subcommands here.
+        assert_eq!(run(Ok(Vec::new()), true), None);
+    }
+
+    const NESTED_HELP: &str = r#"#!/bin/sh
+root=$(dirname "$0")
+printf '[%s]' "$@" >> "$root/queries"
+printf '\n' >> "$root/queries"
+case "$*" in
+  '--help')
+    printf 'Commands:\n  cluster    Manage clusters\n  status     Show status\n\nOptions:\n  --profile <PROFILE>  Select profile\n  --format {json,yaml}  Global format\n';;
+  'cluster --help')
+    printf 'Commands:\n  nodes      Manage nodes\n  backups    Manage backups\n\nOptions:\n  --region <REGION>  Select region\n';;
+  'cluster nodes --help')
+    printf 'Commands:\n  list    List nodes\n  show    Show a node\n';;
+  'cluster nodes list --help')
+    printf 'Options:\n  --verbose          Talk\n  -o, --format <FMT>  Format [possible values: text, binary]\n  -t, --target <ID>   Target\n';;
+  *) touch "$root/ran"; exit 1;;
+esac
+"#;
+
+    #[test]
+    fn help_follows_documented_nested_commands_without_forwarding_arguments() {
+        let fake = fake_aws();
+        let tool = fake.dir.script("bin/tool", NESTED_HELP);
+        let settings = Settings {
+            trusted_help: vec!["tool".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("tool", Some(tool.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let source = "tool --profile 'private account' cluster ndose list --verbos | cat > 'out file' # keep";
+        let report = correct(&failure(source), &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            source
+                .replace("ndose", "nodes")
+                .replace("--verbos", "--verbose")
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Ambiguous(_)),
+            "help is partial: {:?}",
+            report.outcome
+        );
+        assert!(
+            report.outcome.candidates()[0]
+                .edits
+                .iter()
+                .all(|e| e.via.contains("--help"))
+        );
+        assert_eq!(
+            fs::read_to_string(fake.dir.0.join("bin/queries")).unwrap(),
+            "[--help]\n[cluster][--help]\n[cluster][nodes][--help]\n[cluster][nodes][list][--help]\n"
+        );
+        assert!(!fake.dir.0.join("bin/ran").exists());
+        // An option value and positional words must not become command paths.
+        let report = correct(&failure("tool cluster nodes list -t verbos"), &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::NoCorrection(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn short_option_clusters_and_attached_values_are_never_cut_down() {
+        let fake = fake_aws();
+        let tool = fake.dir.script(
+            "bin/archiver",
+            "#!/bin/sh\n[ \"$1\" = --help ] || { touch \"$(dirname \"$0\")/ran\"; exit 1; }\nprintf 'Usage: archiver [options] files\\n\\nOptions:\\n  -c            Create\\n  -x            Extract\\n  -v            Verbose\\n  -z            Compress\\n  -f FILE       Archive file\\n  -j N          Jobs\\n  -C DIR        Change directory\\n  -name PATTERN Match names\\n  -h TOPIC      Help\\n  -hide_banner  Quiet\\n  -I DIR        Include\\n  -include FILE Prepend\\n  --verbose     Talk\\n  --zstd        Use zstd\\n'\n",
+        );
+        let settings = Settings {
+            trusted_help: vec!["archiver".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("archiver", Some(tool.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        for (source, expected) in [
+            // `f` ends the cluster and takes `out.tar`.
+            (
+                "archiver --ztsd -cf out.tar src",
+                "archiver --zstd -cf out.tar src",
+            ),
+            (
+                "archiver -xvzf out.tar --verbsoe",
+                "archiver -xvzf out.tar --verbose",
+            ),
+            ("archiver -j4 --verbsoe", "archiver -j4 --verbose"),
+            ("archiver -Csrc --verbsoe", "archiver -Csrc --verbose"),
+            // A single-dash long option is still repaired as a whole.
+            ("archiver -nmae '*.rs'", "archiver -name '*.rs'"),
+            // ffmpeg's `-hide_baner` is not `-h` with a value...
+            ("archiver -hide_baner src", "archiver -hide_banner src"),
+            // ...but gcc's `-Iinclude` is `-I` with one.
+            (
+                "archiver -Iinclude --verbsoe",
+                "archiver -Iinclude --verbose",
+            ),
+        ] {
+            let report = correct(&failure(source), &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first().copied(),
+                Some(expected),
+                "{source}: {:?}",
+                report.outcome
+            );
+            assert!(
+                report
+                    .outcome
+                    .candidates()
+                    .iter()
+                    .flat_map(|c| &c.edits)
+                    .all(|e| e.to.trim_start_matches('-').chars().nth(1).is_some()),
+                "{source}: no cluster becomes a single short option"
+            );
+        }
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn help_option_values_belong_to_the_leaf_declaration_and_short_alias() {
+        let fake = fake_aws();
+        let tool = fake.dir.script("bin/tool", NESTED_HELP);
+        let settings = Settings {
+            trusted_help: vec!["tool".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("tool", Some(tool.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        for (source, expected) in [
+            ("tool --format jsno", "tool --format json"),
+            (
+                "tool cluster nodes list --format txet",
+                "tool cluster nodes list --format text",
+            ),
+            (
+                "tool cluster nodes list --format=txet",
+                "tool cluster nodes list --format=text",
+            ),
+            (
+                "tool cluster nodes list -o txet",
+                "tool cluster nodes list -o text",
+            ),
+            (
+                "tool cluster nodes list --format 'txet' --target status",
+                "tool cluster nodes list --format text --target status",
+            ),
+        ] {
+            let report = correct(&failure(source), &ctx);
+            assert_eq!(
+                scripts(&report.outcome)[0],
+                expected,
+                "{source}: {:?}",
+                report.outcome
+            );
+            assert!(
+                matches!(report.outcome, Outcome::Ambiguous(_)),
+                "{source}: {:?}",
+                report.outcome
+            );
+            assert_eq!(
+                report.outcome.candidates()[0].edits[0].role,
+                TokenRole::OptionValue
+            );
+        }
+        for valid in [
+            "tool cluster nodes list --format binary",
+            "tool cluster nodes list --target txet",
+        ] {
+            assert!(
+                matches!(
+                    correct(&failure(valid), &ctx).outcome,
+                    Outcome::NoCorrection(_)
+                ),
+                "{valid}"
+            );
+        }
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn package_runners_resolve_installed_apps_only() {
+        let fake = fake_aws();
+        let ctx = context(&fake)
+            .with_which("cdkk", None)
+            .with_which("cdk", None);
+        let report = correct(&failure("npx aws ec2 describ-instances"), &ctx);
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "npx aws ec2 describe-instances"
+        );
+        let report = correct(&failure("npx cdkk deploy"), &ctx);
+        assert!(
+            report.outcome.candidates().is_empty(),
+            "{:?}",
+            report.outcome
+        );
+        assert!(report.notes.iter().any(|n| n.contains("not installed")));
+    }
+
+    #[test]
+    fn partial_option_lists_are_weak_evidence() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        // git's helper omits `log`'s revision options: unlisted is not wrong.
+        let report = correct(&failure("git commit --graph"), &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::NoCorrection(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert!(report.suspicions.is_empty());
+        let mut f = failure("git commit --amen");
+        let report = correct(&f, &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::Ambiguous(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(scripts(&report.outcome)[0], "git commit --amend");
+        f.output = CapturedOutput::Combined {
+            text: "error: unknown option `amen'".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&f, &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            report.outcome
+        );
+        // zsh's _whois lists a few servers: one seven edits away says
+        // nothing about the typed server.
+        let item = |value: &str| native::CompletionItem {
+            value: value.into(),
+            takes_value: None,
+            description: None,
+        };
+        let servers = vec![item("whois.gb.com"), item("whois.ripe.net")];
+        let backend: std::rc::Rc<dyn native::NativeCompletionBackend> = std::rc::Rc::new(Fixed {
+            answer: Ok(servers),
+            complete: false,
+        });
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("tool", Some("/bin/echo"))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        for (source, expected) in [
+            ("tool whois.example.com", None),
+            ("tool whois.ripe.ent", Some("tool whois.ripe.net")),
+            // An abbreviation, as csvlook's `--no-inferr`.
+            ("tool whois.rip", Some("tool whois.ripe.net")),
+        ] {
+            let report = correct_with_backends(
+                &failure(source),
+                &ctx,
+                vec![("tool".into(), backend.clone())],
+            );
+            assert_eq!(
+                report
+                    .outcome
+                    .candidates()
+                    .first()
+                    .map(|c| c.script.as_str()),
+                expected,
+                "{source}: {:?}",
+                report.outcome
+            );
+        }
+    }
+
+    #[test]
+    fn missing_executables_need_shell_evidence_to_be_decisive() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let mut f = failure("gti status");
+        let weak = correct(&f, &ctx);
+        assert!(
+            matches!(weak.outcome, Outcome::Ambiguous(_)),
+            "{:?}",
+            weak.outcome
+        );
+        assert_eq!(scripts(&weak.outcome)[0], "git status");
+        assert!(weak.suspicions[0].score < STRONG_SUSPICION);
+        f.exit_status = Some(127);
+        let strong = correct(&f, &ctx);
+        assert_eq!(strong.suspicions.len(), 1);
+        assert_eq!(strong.suspicions[0].role, TokenRole::Executable);
+        assert!(strong.suspicions[0].score > STRONG_SUSPICION);
+        assert!(
+            matches!(strong.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            strong.outcome
+        );
+        assert_eq!(scripts(&strong.outcome)[0], "git status");
+        f.exit_status = Some(1);
+        assert!(matches!(
+            correct(&f, &ctx).outcome,
+            Outcome::NoCorrection(_)
+        ));
+    }
+
+    #[test]
+    fn a_program_that_accepts_the_rest_of_the_line_ranks_first() {
+        let fake = fake_aws();
+        let gtr = fake.dir.script("bin/gtr", "#!/bin/sh\n");
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_executables(&["gtr", "git"])
+            .with_which("gtr", Some(gtr.to_str().unwrap()))
+            .with_which("git", Some(fake.dir.0.join("bin/git").to_str().unwrap()))
+            .with_which("gti", None)
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let mut f = failure("gti status");
+        f.exit_status = Some(127);
+        let report = correct(&f, &ctx);
+        assert_eq!(scripts(&report.outcome), ["git status", "gtr status"]);
+        assert!(
+            matches!(report.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            report.outcome
+        );
+        let mut f = failure("gti frobnicate");
+        f.exit_status = Some(127);
+        assert!(
+            matches!(correct(&f, &ctx).outcome, Outcome::Ambiguous(_)),
+            "without context agreement, equally close names are a tie"
+        );
+    }
+
+    #[test]
+    fn missing_spaces_after_programs_are_inserted() {
+        let fake = fake_aws();
+        let ctx = context(&fake)
+            .with_which("cd..", None)
+            .with_which("gitstatus", None)
+            .with_which("awsec2", None);
+        for (typo, fixed) in [
+            ("cd..", "cd .."),
+            ("gitstatus --short", "git status --short"),
+            ("awsec2 describ-instances", "aws ec2 describe-instances"),
+        ] {
+            let mut f = failure(typo);
+            f.exit_status = Some(127);
+            let report = correct(&f, &ctx);
+            assert!(
+                matches!(report.outcome, Outcome::Suggestion(_)),
+                "{typo}: {:?}",
+                report.outcome
+            );
+            assert_eq!(scripts(&report.outcome)[0], fixed);
+        }
+    }
+
+    #[test]
+    fn misspelled_app_names_continue_into_native_completion() {
+        let fake = fake_aws();
+        let ctx = context(&fake).with_which("asw", None);
+        let mut f = failure("asw ec2 describ-instances");
+        f.exit_status = Some(127);
+        let report = correct(&f, &ctx);
+        assert_eq!(scripts(&report.outcome)[0], "aws ec2 describe-instances");
+    }
+
+    #[test]
+    fn error_output_hints_help_apps_without_native_completion() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let mut f = failure("ls --colro=auto");
+        f.output = CapturedOutput::Combined {
+            text: "ls: unrecognized option '--colro=auto'\nTry 'ls --help' for more information."
+                .into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        assert!(matches!(
+            correct(&f, &ctx).outcome,
+            Outcome::InsufficientEvidence(_)
+        ));
+        f.output = CapturedOutput::Combined {
+            text: "ls: unrecognized option '--colro=auto'\nDid you mean --color?".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&f, &ctx);
+        assert_eq!(scripts(&report.outcome), ["ls --color=auto"]);
+        let mut f = failure("git sttus sttus");
+        f.output = CapturedOutput::Combined {
+            text: "git: 'sttus' is not a git command. See 'git --help'.\n\nThe most similar command is\n\tstatus\n".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&f, &ctx);
+        assert_eq!(scripts(&report.outcome)[0], "git status sttus");
+    }
+
+    #[test]
+    fn printed_hints_cannot_inject_commands() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let mut f = failure("git sttus");
+        f.output = CapturedOutput::Combined {
+            text: "git: 'sttus' is not a git command.\nDid you mean 'sttus;rm'?".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&f, &ctx);
+        for script in scripts(&report.outcome) {
+            assert_eq!(parser::parse(script).commands.len(), 1, "{script}");
+        }
+    }
+
+    #[test]
+    fn risky_and_unsupported_cases_have_explicit_outcomes() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let report = correct(&failure("aws ec2 terminat-instances"), &ctx);
+        let candidate = &report.outcome.candidates()[0];
+        assert_eq!(candidate.script, "aws ec2 terminate-instances");
+        assert_eq!(candidate.safety.decision, Decision::Confirm);
+        assert!(matches!(
+            correct(&failure("[[ -n x ]] && gti status"), &ctx).outcome,
+            Outcome::UnsupportedSyntax(_)
+        ));
+        // PowerShell statements and expressions stay unsupported.
+        let powershell = Context::new(Settings::default(), Shell::Powershell, "fuck".into());
+        assert!(matches!(
+            correct(
+                &failure("foreach ($f in $files) { gti status }"),
+                &powershell
+            )
+            .outcome,
+            Outcome::UnsupportedSyntax(_)
+        ));
+        let mut f = failure("aws sts get-caller-identity");
+        f.output = CapturedOutput::Combined {
+            text: "Unable to locate credentials.".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let tree = fs::read_to_string(fake.dir.0.join("bin/tree")).unwrap();
+        fs::write(
+            fake.dir.0.join("bin/tree"),
+            format!("{tree}sts|get-caller-identity\n"),
+        )
+        .unwrap();
+        let report = correct(&f, &ctx);
+        assert!(
+            matches!(&report.outcome, Outcome::NoCorrection(why) if why.contains("authentication")),
+            "{:?}",
+            report.outcome
+        );
+    }
+
+    /// An argcomplete app (gcloud or az flavored) answering on fd 8 from a
+    /// tree file, which tests rewrite to install new groups or extensions.
+    fn fake_argcomplete(app: &str) -> (Dir, PathBuf) {
+        let dir = Dir::new(app);
+        let marker = if app == "az" {
+            "# azure.cli test double"
+        } else {
+            ""
+        };
+        let path = dir.script(
+            &format!("sdk/bin/{app}"),
+            &format!(
+                "#!/bin/sh\n{marker}\n[ \"$_ARGCOMPLETE\" = 1 ] || {{ touch \"$(dirname \"$0\")/ran\"; exit 0; }}\n\
+line=${{COMP_LINE#{app} }}\nprefix=${{line##* }}\ncontext=${{line% *}}\n[ \"$context\" = \"$line\" ] && context=\n\
+while IFS='|' read -r pattern word; do\n  case $context in\n    $pattern) case $word in \"$prefix\"*) printf '%s\\v' \"$word\" >&8;; esac;;\n  esac\n\
+done < \"$(dirname \"$0\")/tree\"\n"
+            ),
+        );
+        fs::create_dir_all(dir.0.join("sdk/lib/googlecloudsdk")).unwrap();
+        fs::write(
+            dir.0.join("sdk/bin/tree"),
+            "|storage\n|vm\nstorage|account\nstorage|blob\nstorage account|list\nstorage account|create\n\
+storage account *|--resource-group=\nstorage account *|--verbose\n",
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn argcomplete_apps_reflect_newly_installed_groups() {
+        for app in ["gcloud", "az"] {
+            let (dir, path) = fake_argcomplete(app);
+            let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+                .with_which(app, Some(path.to_str().unwrap()))
+                .with_history::<&str>(&[]);
+            let report = correct(
+                &failure(&format!("{app} storage acount list --resorce-group=rg")),
+                &ctx,
+            );
+            assert_eq!(
+                scripts(&report.outcome)[0],
+                format!("{app} storage account list --resource-group=rg"),
+                "{app}: {:?}",
+                report.notes
+            );
+            // An extension adds a group: it is accepted and repaired at once.
+            let typo = format!("{app} containerap up");
+            assert!(!matches!(
+                correct(&failure(&typo), &ctx).outcome,
+                Outcome::Suggestion(_)
+            ));
+            let tree = fs::read_to_string(dir.0.join("sdk/bin/tree")).unwrap();
+            fs::write(
+                dir.0.join("sdk/bin/tree"),
+                format!("{tree}|containerapp\ncontainerapp|up\n"),
+            )
+            .unwrap();
+            let report = correct(&failure(&typo), &ctx);
+            assert_eq!(
+                scripts(&report.outcome)[0],
+                format!("{app} containerapp up"),
+                "{app}: {:?}",
+                report.notes
+            );
+            assert!(
+                !dir.0.join("sdk/bin/ran").exists(),
+                "{app} ran an operation"
+            );
+        }
+    }
+
+    #[test]
+    fn every_protocol_follows_commands_added_by_an_upgrade() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("upgrades");
+        // Each fake answers from `words` next to it, in its own protocol.
+        let cobra = dir.script(
+            "cobra/app",
+            "#!/bin/sh\n[ \"$1\" = __complete ] || exit 1\ncat \"$(dirname \"$0\")/words\"\necho :4\n",
+        );
+        // A listed subcommand answers its own (empty) predictions; after
+        // any other word posener lists the root's subcommands again.
+        let posener = dir.script(
+            "posener/app",
+            "#!/bin/sh\n[ -n \"$COMP_LINE\" ] || exit 1\nset -- $COMP_LINE\ngrep -qx -- \"$2\" \"$(dirname \"$0\")/words\" && exit 0\ncat \"$(dirname \"$0\")/words\"\n",
+        );
+        let git = dir.script(
+            "git/app",
+            "#!/bin/sh\ncase \"$*\" in\n  --list-cmds=main*) cat \"$(dirname \"$0\")/words\";;\n  --list-cmds=builtins) ;;\n  -h) printf 'usage: git [--version]\\n'; exit 129;;\n  *) exit 1;;\nesac\n",
+        );
+        for (flavor, path) in [
+            (Flavor::Cobra, cobra),
+            (Flavor::Posener, posener),
+            (Flavor::Git, git),
+        ] {
+            let words = path.parent().unwrap().join("words");
+            fs::write(&words, "build\ndeploy\n").unwrap();
+            let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+                .with_which("app", Some(path.to_str().unwrap()))
+                .with_which("man", None)
+                .with_history::<&str>(&[]);
+            let run = |source: &str| {
+                let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                    std::rc::Rc::new(Backend::new(flavor, "app", path.clone()));
+                correct_with_backends(&failure(source), &ctx, vec![("app".into(), backend)])
+            };
+            assert!(
+                !matches!(run("app releese").outcome, Outcome::Suggestion(_)),
+                "{flavor:?}: nothing close yet"
+            );
+            fs::write(&words, "build\ndeploy\nrelease\n").unwrap();
+            let report = run("app releese");
+            assert_eq!(
+                scripts(&report.outcome),
+                ["app release"],
+                "{flavor:?}: {:?}",
+                report.notes
+            );
+            assert!(matches!(
+                run("app release").outcome,
+                Outcome::NoCorrection(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn posener_argument_predictions_are_not_a_command_vocabulary() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("posener-arguments");
+        // vault's fixed engine set answers at every argument position;
+        // terraform predicts workspaces, then directories.
+        let app = dir.script(
+            "app",
+            r#"#!/bin/sh
+[ -n "$COMP_LINE" ] || exit 1
+case "$COMP_LINE" in
+  "app secrets ") printf 'enable\ndisable\n';;
+  "app secrets enable "*) printf 'aws\nconsul\ntransit\n';;
+  "app secrets disable "*) ;;
+  "app secrets "*) printf 'enable\ndisable\n';;
+  "app workspace ") printf 'select\nlist\n';;
+  "app workspace select ") printf 'default\n';;
+  "app workspace select "*) printf 'dir/\n';;
+  "app workspace list "*) ;;
+  "app workspace "*) printf 'select\nlist\n';;
+  *) printf 'secrets\nworkspace\n';;
+esac
+"#,
+        );
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("app", Some(app.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let run = |source: &str| {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Backend::new(Flavor::Posener, "app", app.clone()));
+            correct_with_backends(&failure(source), &ctx, vec![("app".into(), backend)])
+        };
+        for valid in [
+            "app secrets enable kv",
+            // Not `transit`: the app never judged the engine's name.
+            "app secrets enable transform",
+            "app workspace select prod",
+            "app workspace select prod dir/",
+        ] {
+            let report = run(valid);
+            assert!(
+                matches!(report.outcome, Outcome::NoCorrection(_)),
+                "{valid}: {:?} {:?}",
+                report.outcome,
+                report.notes
+            );
+        }
+        for (typo, expected) in [
+            ("app secrets enabel kv", "app secrets enable kv"),
+            ("app workspace selcet prod", "app workspace select prod"),
+            ("app secrts list", "app secrets list"),
+        ] {
+            let report = run(typo);
+            assert_eq!(scripts(&report.outcome), [expected], "{:?}", report.notes);
+        }
+    }
+
+    #[test]
+    fn listed_fragments_continue_into_longer_words() {
+        let listed = |words: &[&str]| providers::Vocabulary {
+            words: words
+                .iter()
+                .map(|w| native::CompletionItem {
+                    value: (*w).into(),
+                    takes_value: None,
+                    description: None,
+                })
+                .collect(),
+            authoritative: false,
+            via: "zsh completion".into(),
+            source: Source::NativeCompletion,
+            cached: false,
+            resources: Vec::new(),
+        };
+        // zsh's _file_modes: chmod's `+x` and `=r` go on from operators.
+        let modes = listed(&["u", "g", "o", "a", "+", "-", "="]);
+        for typed in ["+x", "-w", "=r"] {
+            assert!(continues_listed_word(&modes, typed), "{typed}");
+        }
+        assert!(!continues_listed_word(&modes, "+"));
+        assert!(!continues_listed_word(&listed(&["log"]), "logs"));
+        assert!(!continues_listed_word(&listed(&["a+"]), "a+x"));
+        assert!(continues_listed_word(&listed(&["web:"]), "web:a"));
+        // ssh's -o keys: `Name=value`, the name alone, and `Name value`.
+        let keys = listed(&["StrictHostKeyChecking=", "BatchMode="]);
+        assert!(continues_listed_word(&keys, "BatchMode=yes"));
+        assert!(names_listed_key(&keys, "BatchMode"));
+        assert!(names_listed_key(&keys, "BatchMode yes"));
+        assert!(!names_listed_key(&keys, "BatchModes"));
+        let repaired = |typed: &str| {
+            keep_hierarchical_tails(keys.clone(), typed)
+                .words
+                .into_iter()
+                .map(|w| w.value)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            repaired("StrictHostKeyCheking=no"),
+            ["StrictHostKeyChecking=no", "BatchMode=no"]
+        );
+        assert_eq!(
+            repaired("BatchMdoe yes"),
+            ["StrictHostKeyChecking yes", "BatchMode yes"]
+        );
+    }
+
+    #[test]
+    fn cobra_boolean_flags_aliases_file_arguments_and_hierarchical_words() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("cobra-arguments");
+        // rclone's shape: remotes complete one level at a time, and files
+        // are valid arguments too (directive 0, no ShellCompDirectiveNoFileComp).
+        let app = dir.script(
+            "app",
+            r#"#!/bin/sh
+[ "$1" = __complete ] || exit 1
+shift
+case "$*" in
+  "") printf 'copy\tCopy files\nlsd\tList directories\n:0\n';;
+  "-") printf -- '--config\tConfig file\n:4\n';;
+  "copy -") printf -- '--dry-run\tTrial run\n--transfers\tParallel transfers\n:4\n';;
+  "copy --transfers ") printf ':0\n';;
+  "lsd -"|"ls -") printf -- '--config\tConfig file\n--recursive\tRecurse\n:4\n';;
+  "copy "*|"lsd "*|"ls "*) printf 'web:\nloc:\n:0\n';;
+  *) printf ':0\n';;
+esac
+"#,
+        );
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("app", Some(app.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let run = |source: &str| {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Backend::new(Flavor::Cobra, "app", app.clone()));
+            correct_with_backends(&failure(source), &ctx, vec![("app".into(), backend)])
+        };
+        for valid in [
+            // `--dry-run` takes no value: `web:a` and `b` are arguments.
+            "app copy --dry-run web:a b",
+            "app copy --transfers 4 web:a b",
+        ] {
+            let report = run(valid);
+            assert!(
+                matches!(report.outcome, Outcome::NoCorrection(_)),
+                "{valid}: {:?} {:?}",
+                report.outcome,
+                report.notes
+            );
+        }
+        let report = run("app copy --dry-rnu web:a b");
+        assert_eq!(scripts(&report.outcome), ["app copy --dry-run web:a b"]);
+        // The root's commands are complete; a misspelled one is decided.
+        let report = run("app lsdd web:");
+        assert!(
+            matches!(report.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(scripts(&report.outcome), ["app lsd web:"]);
+        // cobra lists no aliases; `ls` resolves to `lsd`, whose flags differ
+        // from the root's, while `lsdd` finds no command at all.
+        let report = run("app ls web:");
+        assert!(
+            matches!(report.outcome, Outcome::NoCorrection(_)),
+            "{:?} {:?}",
+            report.outcome,
+            report.notes
+        );
+        // A misspelled remote keeps its path, and a partial level asks.
+        let report = run("app copy web:a wbe:b/c");
+        assert!(
+            !matches!(report.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(scripts(&report.outcome)[0], "app copy web:a web:b/c");
+    }
+
+    #[test]
+    fn handler_values_repeated_in_every_slot_are_resources() {
+        use super::native::{Backend, Flavor};
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let dir = Dir::new("handler-values");
+        // make's targets come back after every target; svn-like commands
+        // only where a command goes.
+        let script = dir.script(
+            "completion",
+            "_vals() { COMPREPLY=(alpha beta gamma); }\ncomplete -F _vals vals\n_cmds() { COMPREPLY=(); [ \"$COMP_CWORD\" -eq 1 ] && COMPREPLY=(build deploy); }\ncomplete -F _cmds cmds\n",
+        );
+        for (app, typo, expected, approval) in [
+            ("vals", "vals alpah", "vals alpha", Decision::Confirm),
+            ("cmds", "cmds biuld", "cmds build", Decision::Allow),
+        ] {
+            let path = dir.script(&format!("bin/{app}"), "#!/bin/sh\nexit 0\n");
+            let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+                .with_which(app, Some(path.to_str().unwrap()))
+                .with_which("man", None)
+                .with_history::<&str>(&[]);
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> = std::rc::Rc::new(
+                Backend::new(Flavor::BashFunction, app, bash.clone()).with_helper(script.clone()),
+            );
+            let report = correct_with_backends(&failure(typo), &ctx, vec![(app.into(), backend)]);
+            let candidates = report.outcome.candidates();
+            assert_eq!(candidates[0].script, expected, "{:?}", report.notes);
+            assert_eq!(candidates[0].safety.decision, approval, "{typo}");
+        }
+    }
+
+    #[test]
+    fn shell_handlers_follow_upgrades_and_fingerprint_the_app_and_registration() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("shell-upgrades");
+        for (shell, flavor) in [
+            (Shell::Bash, Flavor::BashFunction),
+            (Shell::Fish, Flavor::FishScript),
+        ] {
+            let name = if shell == Shell::Fish { "fish" } else { "bash" };
+            let Some(executable) = crate::utils::which(name) else {
+                continue;
+            };
+            let app = dir.script(
+                &format!("{name}/app"),
+                &format!(
+                    "#!/bin/sh\nprintf ran > {}\n",
+                    crate::shlex::quote(dir.0.join("operation-marker").to_str().unwrap())
+                ),
+            );
+            let words = app.parent().unwrap().join("words");
+            fs::write(&words, "build\ndeploy\n").unwrap();
+            let body = if shell == Shell::Fish {
+                // Commands only where a command goes, as real handlers do.
+                format!(
+                    "complete -c app -f -n 'test (count (commandline -opc)) -eq 1' -a '(cat {})'\n",
+                    parser::quote_word_with_dialect(words.to_str().unwrap(), parser::Dialect::Fish)
+                )
+            } else {
+                format!(
+                    "_app() {{ COMPREPLY=(); [ \"$COMP_CWORD\" -eq 1 ] || return 0; while IFS= read -r word; do COMPREPLY+=(\"$word\"); done < {}; }}\ncomplete -F _app app\n",
+                    crate::shlex::quote(words.to_str().unwrap())
+                )
+            };
+            let script = dir.script(&format!("{name}/completion"), &body);
+            let backend = || {
+                Backend::new(flavor, "app", executable.clone())
+                    .with_helper(script.clone())
+                    .with_application(app.clone())
+            };
+            let ctx = Context::new(Settings::default(), shell, "fuck".into())
+                .with_which("app", Some(app.to_str().unwrap()))
+                .with_which("man", None)
+                .with_history::<&str>(&[]);
+            let run = |source: &str| {
+                correct_with_backends(
+                    &failure(source),
+                    &ctx,
+                    vec![("app".into(), std::rc::Rc::new(backend()))],
+                )
+            };
+            assert!(scripts(&run("app releese").outcome).is_empty(), "{shell:?}");
+            fs::write(&words, "build\ndeploy\nrelease\n").unwrap();
+            let report = run("app releese");
+            assert_eq!(
+                scripts(&report.outcome),
+                ["app release"],
+                "{shell:?}: {:?}",
+                report.notes
+            );
+            assert!(
+                matches!(report.outcome, Outcome::Ambiguous(_)),
+                "handwritten scripts give partial evidence"
+            );
+            assert!(matches!(
+                run("app release").outcome,
+                Outcome::NoCorrection(_)
+            ));
+            let original = backend().cache_identity();
+            fs::write(
+                &app,
+                format!(
+                    "#!/bin/sh\n# upgraded installation\nprintf ran > {}\n",
+                    crate::shlex::quote(dir.0.join("operation-marker").to_str().unwrap())
+                ),
+            )
+            .unwrap();
+            let upgraded = backend().cache_identity();
+            assert_ne!(
+                original, upgraded,
+                "{shell:?}: app identity matters even when a shell probes it"
+            );
+            fs::write(&script, format!("{body}\n# changed registration\n")).unwrap();
+            assert_ne!(
+                upgraded,
+                backend().cache_identity(),
+                "{shell:?}: registration identity matters"
+            );
+            assert!(!dir.0.join("operation-marker").exists());
+        }
+    }
+
+    #[test]
+    fn native_text_cannot_inject_operators_or_substitutions() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("native-injection");
+        for shell in [Shell::Bash, Shell::Fish] {
+            let ctx = Context::new(Settings::default(), shell, "fuck".into())
+                .with_which("app", Some("/usr/bin/app"))
+                .with_which("man", None)
+                .with_history::<&str>(&[]);
+            for (typed, value) in [
+                ("buidl;touch_marker", "build;touch_marker"),
+                ("buidl$(touch_marker)", "build$(touch_marker)"),
+                ("buidl(touch_marker)", "build(touch_marker)"),
+                ("buidl'quoted'", "build'quoted'"),
+            ] {
+                let app = dir.script(
+                    "app",
+                    &format!(
+                        "#!/bin/sh\nprintf '%s\\n' {} ':4'\n",
+                        crate::shlex::quote(value)
+                    ),
+                );
+                let backend = Backend::new(Flavor::Cobra, "app", app);
+                let dialect = parser::Dialect::for_shell(shell).unwrap();
+                let source = format!("app {}", parser::quote_word_with_dialect(typed, dialect));
+                let report = correct_with_backends(
+                    &failure(&source),
+                    &ctx,
+                    vec![("app".into(), std::rc::Rc::new(backend))],
+                );
+                let candidates = scripts(&report.outcome);
+                assert_eq!(
+                    candidates.len(),
+                    1,
+                    "{shell:?}: {value}: {:?}",
+                    report.notes
+                );
+                let parsed = parser::parse_with_dialect(candidates[0], dialect);
+                assert!(parsed.is_fully_supported());
+                assert_eq!(parsed.commands.len(), 1);
+                assert_eq!(parsed.commands[0].words[1].literal(), Some(value));
+                assert!(parsed.commands[0].redirections.is_empty());
+                assert_eq!(
+                    safety::assess(
+                        &parser::parse_with_dialect(&source, dialect),
+                        candidates[0],
+                        &[]
+                    )
+                    .decision,
+                    Decision::Allow
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_answers_are_reused_but_never_hide_new_commands() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let first = correct(&failure("aws ec2 describe-instances --dry-run"), &ctx);
+        assert!(matches!(first.outcome, Outcome::NoCorrection(_)));
+        assert!(first.probes > 0);
+        let again = correct(&failure("aws ec2 describe-instances --dry-run"), &ctx);
+        assert_eq!(again.probes, 0, "valid words are confirmed from the cache");
+        let tree = fs::read_to_string(fake.dir.0.join("bin/tree")).unwrap();
+        fs::write(
+            fake.dir.0.join("bin/tree"),
+            format!("{tree}ec2|describe-hosts\n"),
+        )
+        .unwrap();
+        let report = correct(&failure("aws ec2 describe-hosts"), &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::NoCorrection(_)),
+            "a stale cached list must not reject a new command: {:?}",
+            report.outcome
+        );
+        assert_eq!(report.probes, 1);
+    }
+
+    #[test]
+    fn option_values_are_checked_against_the_apps_list() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let report = correct(
+            &failure("aws ec2 describe-instances --region eu-wst-1 --output=jsn"),
+            &ctx,
+        );
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "aws ec2 describe-instances --region eu-west-1 --output=json",
+            "{:?}",
+            report.notes
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Ambiguous(_)),
+            "value lists are partial: without output, ask"
+        );
+        let mut f = failure("aws ec2 describe-instances --output jsn");
+        f.output = CapturedOutput::Combined {
+            text: "aws: [ERROR]: argument --output: Found invalid choice 'jsn'".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&f, &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::Suggestion(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "aws ec2 describe-instances --output json"
+        );
+        for valid in [
+            "aws ec2 describe-instances --region us-east-1",
+            "aws ec2 describe-instances --region ap-south-9 --dry-run",
+            "aws ec2 describe-instances --instance-ids i-0abc",
+        ] {
+            assert!(
+                matches!(
+                    correct(&failure(valid), &ctx).outcome,
+                    Outcome::NoCorrection(_)
+                ),
+                "{valid}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_option_name_and_its_attached_value_are_repaired_together() {
+        let fake = fake_aws();
+        for shell in [Shell::Bash, Shell::Fish, Shell::Tcsh] {
+            let mut ctx = context(&fake);
+            ctx.shell = shell;
+            for value in ["jsn", "'jsn'", "\"jsn\""] {
+                let source =
+                    format!("aws ec2 describe-instances --outpt={value} --region 'eu-west-1'");
+                let report = correct(&failure(&source), &ctx);
+                let candidate = report.outcome.candidates().first().unwrap_or_else(|| {
+                    panic!(
+                        "{shell:?}: {source}: {:?} {:?}",
+                        report.outcome, report.notes
+                    )
+                });
+                assert_eq!(
+                    candidate.script,
+                    "aws ec2 describe-instances --output=json --region 'eu-west-1'",
+                    "{shell:?}: {source}"
+                );
+                assert_eq!(candidate.edits.len(), 2);
+                assert_eq!(candidate.edits[0].role, TokenRole::OptionName);
+                assert_eq!(candidate.edits[1].role, TokenRole::OptionValue);
+                assert_eq!(candidate.edits[0].word, candidate.edits[1].word);
+                let old =
+                    parser::parse_with_dialect(&source, parser::Dialect::for_shell(shell).unwrap());
+                assert!(
+                    check_structure(
+                        &old,
+                        &candidate.script.replace("eu-west-1", "us-east-1"),
+                        &candidate.edits,
+                    )
+                    .is_err(),
+                    "another value must not change"
+                );
+            }
+        }
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn resource_names_are_looked_up_only_with_network_completion_and_need_approval() {
+        let fake = fake_aws();
+        fs::write(
+            fake.dir.0.join("bin/resources"),
+            "ec2 *-instances* --instance-ids|i-0abc123def\nec2 *-instances* --instance-ids|i-0fff000aaa\n",
+        )
+        .unwrap();
+        let source = "aws ec2 describe-instances --instance-ids i-0abc123dfe";
+        let offline = correct(&failure(source), &context(&fake));
+        assert!(
+            scripts(&offline.outcome)
+                .iter()
+                .all(|s| !s.contains("i-0abc123def")),
+            "offline, resource names are never looked up: {:?}",
+            offline.outcome
+        );
+
+        let settings = Settings {
+            network_completion: true,
+            ..Settings::default()
+        };
+        let ctx = context_with(&fake, settings);
+        let report = correct(&failure(source), &ctx);
+        let candidate = report
+            .outcome
+            .candidates()
+            .iter()
+            .find(|c| c.script == "aws ec2 describe-instances --instance-ids i-0abc123def")
+            .unwrap_or_else(|| panic!("{:?} {:?}", report.outcome, report.notes));
+        assert!(candidate.edits[0].resource);
+        assert_eq!(candidate.safety.decision, Decision::Confirm);
+        assert!(
+            candidate
+                .safety
+                .reasons
+                .iter()
+                .any(|r| r.contains("resource `i-0abc123def`")),
+            "{:?}",
+            candidate.safety.reasons
+        );
+
+        // The app's fixed values stay ordinary words with lookups on.
+        let report = correct(
+            &failure("aws ec2 describe-instances --region eu-wst-1"),
+            &ctx,
+        );
+        let candidate = &report.outcome.candidates()[0];
+        assert_eq!(
+            candidate.script,
+            "aws ec2 describe-instances --region eu-west-1"
+        );
+        assert!(!candidate.edits[0].resource);
+        assert_eq!(candidate.safety.decision, Decision::Allow);
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
+    fn global_options_before_subcommands_keep_their_values() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let report = correct(
+            &failure("aws --region eu-west-1 ec2 describ-instances"),
+            &ctx,
+        );
+        assert_eq!(
+            scripts(&report.outcome)[0],
+            "aws --region eu-west-1 ec2 describe-instances"
+        );
+    }
+
+    #[test]
+    fn a_broken_completer_is_not_mistaken_for_valid_input() {
+        let fake = fake_aws();
+        fs::remove_file(fake.dir.0.join("bin/tree")).unwrap();
+        let ctx = context(&fake);
+        let report = correct(&failure("aws ec2 describ-instances"), &ctx);
+        assert!(
+            matches!(report.outcome, Outcome::InsufficientEvidence(_)),
+            "{:?}",
+            report.outcome
+        );
+        assert!(report.notes.iter().any(|n| n.contains("failed")));
+    }
+
+    #[test]
+    fn disabled_sources_are_reported() {
+        let fake = fake_aws();
+        let settings = Settings {
+            disabled_sources: vec!["native".into()],
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Bash, "fuck".into())
+            .with_which("aws", Some(fake.aws.to_str().unwrap()))
+            .with_history::<&str>(&[]);
+        let report = correct(&failure("aws ec2 describ-instances"), &ctx);
+        assert!(report.outcome.candidates().is_empty());
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("native source is disabled"))
+        );
+        assert_eq!(report.probes, 0);
+    }
+
+    #[test]
+    fn pipeline_status_narrows_the_failed_stage() {
+        let fake = fake_aws();
+        let ctx = context(&fake).with_which("gerp", None);
+        let mut f = failure("gti log | gerp x");
+        f.pipe_status = Some(vec![0, 127]);
+        f.exit_status = Some(127);
+        let report = correct(&f, &ctx);
+        for candidate in report.outcome.candidates() {
+            assert!(
+                candidate.script.starts_with("gti log | "),
+                "{}",
+                candidate.script
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_take_their_target_programs_vocabulary_and_arguments() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("alias-vocabulary");
+        // eza's completer, recording the words it is asked about.
+        let eza = dir.script(
+            "eza",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/queries\"\nshift\nprintf -- '--color\\t\\n--icons\\t\\n--long\\t\\n:4\\n'\n",
+        );
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_aliases(&[("ls", "eza --icons"), ("ll", "ls --long")])
+            .with_which("eza", Some(eza.to_str().unwrap()))
+            .with_which("ls", Some("/bin/ls"))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        for (source, expected) in [
+            ("ls --colro=auto", "ls --color=auto"),
+            ("ll --colro", "ll --color"),
+        ] {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Backend::new(Flavor::Cobra, "eza", eza.clone()));
+            let report =
+                correct_with_backends(&failure(source), &ctx, vec![("eza".into(), backend)]);
+            assert_eq!(scripts(&report.outcome), [expected], "{:?}", report.notes);
+            assert!(
+                report
+                    .notes
+                    .iter()
+                    .any(|n| n.contains("is an alias for `eza")),
+                "{:?}",
+                report.notes
+            );
+        }
+        let queries = fs::read_to_string(dir.0.join("queries")).unwrap();
+        assert!(queries.contains("__complete --icons -"), "{queries}");
+        assert!(queries.contains("__complete --icons --long -"), "{queries}");
+    }
+
+    #[test]
+    fn the_safety_gate_judges_what_an_alias_runs() {
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into()).with_aliases(&[
+            ("rmf", "rm -rf"),
+            ("gs", "git status"),
+            ("pp", "git pull && git push"),
+        ]);
+        let gate = |original: &str, candidate: &str| {
+            safety::assess_with_context(&parser::parse(original), candidate, &[], &ctx)
+        };
+        for (original, candidate, why) in [
+            ("rmf buidl", "rmf build", "rm"),
+            ("rmff build", "rmf build", "rm"),
+            ("pp --forse", "pp --force", "can't analyze"),
+        ] {
+            let assessment = gate(original, candidate);
+            assert_eq!(
+                assessment.decision,
+                Decision::Confirm,
+                "{candidate}: {assessment:?}"
+            );
+            assert!(
+                assessment.reasons.iter().any(|r| r.contains(why)),
+                "{candidate}: {assessment:?}"
+            );
+        }
+        assert_eq!(gate("gs -sb", "gs -s").decision, Decision::Allow);
+        // Replay of the failed command judges the expansion as well.
+        assert_eq!(
+            safety::assess_replay_with_context("rmf build", parser::Dialect::Posix, &ctx).decision,
+            Decision::Confirm
+        );
+    }
+
+    #[test]
+    fn powershell_lines_are_repaired_with_their_own_quoting() {
+        let fake = fake_aws();
+        let ctx = Context::new(Settings::default(), Shell::Powershell, "fuck".into())
+            .with_executables(&["aws", "git"])
+            .with_which("aws", Some(fake.aws.to_str().unwrap()))
+            .with_which("git", Some(fake.dir.0.join("bin/git").to_str().unwrap()))
+            .with_which("gti", None)
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        for (source, expected) in [
+            (
+                "aws ec2 describ-instances --regoin 'eu-west-1' | Select-Object -First 3",
+                "aws ec2 describe-instances --region 'eu-west-1' | Select-Object -First 3",
+            ),
+            ("gti status; Get-Date", "git status; Get-Date"),
+        ] {
+            let report = correct(&failure(source), &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first().copied(),
+                Some(expected),
+                "{:?}",
+                report.notes
+            );
+            let parsed = parser::parse_with_dialect(expected, parser::Dialect::PowerShell);
+            assert!(parsed.is_fully_supported());
+        }
+        // Cmdlet names are PowerShell's, never misspelled executables.
+        let ctx = ctx.with_which("pwsh", None);
+        assert!(scripts(&correct(&failure("Get-ChildItme -Path x"), &ctx).outcome).is_empty());
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    /// Get-ChildItem, Set-ExecutionPolicy, and a simple function as
+    /// PowerShell 7.6 describes them (abridged).
+    fn powershell_commands() -> Vec<(String, std::rc::Rc<dyn native::NativeCompletionBackend>)> {
+        use native::powershell::{Command, Description, Parameter};
+        let parameter = |name: &str, switch: bool, aliases: &[&str], values: &[&str]| Parameter {
+            name: name.into(),
+            switch,
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            values: values.iter().map(|v| v.to_string()).collect(),
+            ..Parameter::default()
+        };
+        let common = |p: Parameter| Parameter { common: true, ..p };
+        let describe = |name: &str, open: bool, parameters: Vec<Parameter>| Description {
+            name: name.into(),
+            kind: if open { "Function" } else { "Cmdlet" }.into(),
+            module: "Microsoft.PowerShell.Management".into(),
+            shipped: true,
+            open,
+            parameters,
+        };
+        let gci = describe(
+            "Get-ChildItem",
+            false,
+            vec![
+                parameter("Path", false, &[], &[]),
+                parameter("LiteralPath", false, &["PSPath", "LP"], &[]),
+                parameter("Recurse", true, &["s", "r"], &[]),
+                parameter("Depth", false, &[], &[]),
+                parameter("Name", true, &[], &[]),
+                common(parameter(
+                    "ErrorAction",
+                    false,
+                    &["ea"],
+                    &["SilentlyContinue", "Stop"],
+                )),
+                common(parameter("Verbose", true, &["vb"], &[])),
+            ],
+        );
+        let policy = describe(
+            "Set-ExecutionPolicy",
+            false,
+            vec![
+                parameter(
+                    "ExecutionPolicy",
+                    false,
+                    &[],
+                    &["Unrestricted", "RemoteSigned", "AllSigned", "Bypass"],
+                ),
+                parameter("Scope", false, &[], &["Process", "CurrentUser"]),
+                parameter("Force", true, &[], &[]),
+            ],
+        );
+        let tool = describe(
+            "Invoke-Tool",
+            true,
+            vec![parameter("Mode", false, &[], &[])],
+        );
+        [gci, policy, tool]
+            .into_iter()
+            .map(|d| {
+                let name = d.name.clone();
+                (
+                    name,
+                    std::rc::Rc::new(Command::described(d))
+                        as std::rc::Rc<dyn native::NativeCompletionBackend>,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn powershell_commands_take_parameters_from_powershell() {
+        let fake = fake_aws();
+        let git = fake.dir.0.join("bin/git");
+        let ctx = Context::new(Settings::default(), Shell::Powershell, "fuck".into())
+            .with_executables(&["git"])
+            .with_which("git", Some(git.to_str().unwrap()))
+            .with_which("pwsh", None)
+            .with_which("powershell", None)
+            .with_which("man", None)
+            .with_history::<&str>(&[])
+            .with_powershell_commands(&format!(
+                "gci\tAlias\tCmdlet\tGet-ChildItem\n\
+                 Get-ChildItem\tCmdlet\tCmdlet\tGet-ChildItem\n\
+                 Set-ExecutionPolicy\tCmdlet\tCmdlet\tSet-ExecutionPolicy\n\
+                 Invoke-Tool\tFunction\tFunction\tInvoke-Tool\n\
+                 g\tAlias\tApplication\t{}\n",
+                git.display()
+            ));
+        let run = |source: &str, error: &str| {
+            let mut failure = failure(source);
+            failure.exit_status = Some(1);
+            if !error.is_empty() {
+                failure.output = CapturedOutput::Combined {
+                    text: error.into(),
+                    origin: OutputOrigin::ShellErrors,
+                };
+            }
+            correct_with_backends(&failure, &ctx, powershell_commands())
+        };
+        let report = run(
+            "Get-ChildItem -Recrse",
+            "A parameter cannot be found that matches parameter name 'Recrse'.",
+        );
+        assert!(
+            matches!(&report.outcome, Outcome::Suggestion(c) if c[0].script == "Get-ChildItem -Recurse"),
+            "{:?} {:?}",
+            report.outcome,
+            report.notes
+        );
+        for (source, expected) in [
+            // An alias takes its command's parameters and stays as typed;
+            // abbreviations PowerShell accepts are left alone.
+            ("gci -rec -Dpth 2", "gci -rec -Depth 2"),
+            (
+                "Get-ChildItem -Path:docs -Recrse",
+                "Get-ChildItem -Path:docs -Recurse",
+            ),
+            ("Get-ChildItem -Pth:docs", "Get-ChildItem -Path:docs"),
+            ("Get-ChildItem -ea stpo", "Get-ChildItem -ea Stop"),
+            (
+                "Set-ExecutionPolicy -ExecutionPolicy RemoteSignd -Scope process",
+                "Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope process",
+            ),
+            // An alias for a program takes the program's vocabulary.
+            ("g sttus", "g status"),
+        ] {
+            let report = run(source, "");
+            assert_eq!(
+                scripts(&report.outcome).first().copied(),
+                Some(expected),
+                "{source}: {:?}",
+                report.notes
+            );
+        }
+        // Case, aliases, prefixes, numbers, and attached values are valid.
+        for source in [
+            "Get-ChildItem -RECURSE -lp x -s -ea silentlycontinue",
+            "Get-ChildItem docs -Depth -5 -Name",
+            "gci -Path:docs -Recurse:$false",
+            "Set-ExecutionPolicy Bypass -Force",
+            // A simple function takes parameters it doesn't declare.
+            "Invoke-Tool -Whatever x",
+        ] {
+            let report = run(source, "");
+            assert!(
+                scripts(&report.outcome).is_empty(),
+                "{source}: {:?}",
+                report.outcome
+            );
+        }
+    }
+
+    #[test]
+    fn real_powershell_repairs_cmdlet_names_and_parameters() {
+        let Some(pwsh) = native::powershell::tests::pwsh() else {
+            eprintln!("skipped: PowerShell is not installed");
+            return;
+        };
+        let ctx = Context::new(Settings::default(), Shell::Powershell, "fuck".into())
+            .with_executables::<&str>(&[])
+            .with_which("pwsh", Some(pwsh.to_str().unwrap()))
+            .with_which("Get-ChildItme", None)
+            .with_which("Get-ChildItem", None)
+            .with_which("man", None)
+            .with_history::<&str>(&[])
+            .with_powershell_commands("Get-ChildItme\t\t\t\n");
+        let mut failure = failure("Get-ChildItme -Recrse -Name");
+        failure.exit_status = Some(127);
+        failure.output = CapturedOutput::Combined {
+            text: "The term 'Get-ChildItme' is not recognized as a name of a cmdlet, function, \
+                   script file, or executable program."
+                .into(),
+            origin: OutputOrigin::ShellErrors,
+        };
+        let report = correct(&failure, &ctx);
+        assert_eq!(
+            scripts(&report.outcome).first().copied(),
+            Some("Get-ChildItem -Recurse -Name"),
+            "{:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn node_options_come_from_node_and_its_scripts_arguments_are_left_alone() {
+        let dir = Dir::new("node");
+        let node = dir.script(
+            "bin/node",
+            "#!/bin/sh\ncase \"$1\" in\n\
+             --completion-bash) cat <<'EOF'\n\
+             _node_complete() {\n  local cur_word options\n  cur_word=\"${COMP_WORDS[COMP_CWORD]}\"\n  \
+             if [[ \"${cur_word}\" == -* ]] ; then\n    \
+             COMPREPLY=( $(compgen -W '--inspect --inspect= --require -r --watch --prof --max-old-space-size' -- \"${cur_word}\") )\n    \
+             return 0\n  fi\n}\n\
+             complete -o filenames -o nospace -o bashdefault -F _node_complete node node_g\n\
+             EOF\n;;\n\
+             --help) printf '%s\\n' 'Options:' '  --inspect[=[host:]port]     inspector' \
+             '  -r, --require=...           preload' '  --watch                     watch' \
+             '  --prof                      profile';;\n\
+             *) touch \"$(dirname \"$0\")/ran\";;\nesac\n",
+        );
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_executables(&["node"])
+            .with_which("node", Some(node.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let mut failed = failure("node --inpsect app.js");
+        failed.exit_status = Some(9);
+        failed.output = CapturedOutput::Combined {
+            text: "node: bad option: --inpsect\n".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let report = correct(&failed, &ctx);
+        assert!(
+            matches!(&report.outcome, Outcome::Suggestion(c) if c[0].script == "node --inspect app.js"),
+            "{:?} {:?}",
+            report.outcome,
+            report.notes
+        );
+        for (source, expected) in [
+            (
+                "node --requir ./x.js app.js",
+                Some("node --require ./x.js app.js"),
+            ),
+            ("node --wacth app.js", Some("node --watch app.js")),
+            // The script's options are its own, even after `--inspect`.
+            ("node --inspect app.js --prot 80", None),
+            ("node app.js --wacth", None),
+        ] {
+            let report = correct(&failure(source), &ctx);
+            assert_eq!(
+                scripts(&report.outcome).first().copied(),
+                expected,
+                "{source}: {:?}",
+                report.notes
+            );
+        }
+        assert!(
+            !dir.0.join("bin/ran").exists(),
+            "only node's own listings ran"
+        );
+    }
+}

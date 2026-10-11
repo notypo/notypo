@@ -60,6 +60,7 @@ impl<'c, 'a> Corrector<'c, 'a> {
                         script,
                         side_effect: rule.side_effect,
                         priority: (n as i64 + 1) * priority,
+                        rule: rule.name,
                     })
                     .collect(),
             );
