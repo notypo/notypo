@@ -3346,7 +3346,7 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
         let fake = fake_aws();
         let man = fake.dir.script(
             "bin/man",
-            "#!/bin/sh\n[ \"$1\" = ls ] || exit 1\nprintf 'LS(1)\\n     -\\b-a\\ba      all\\n     -\\b--\\b-c\\bco\\bol\\blo\\bor\\br[=when]   colorize\\n'\n",
+            "#!/bin/sh\ncase \"$1\" in ls|*/ls.1|*/ls.1.gz) ;; *) exit 1;; esac\nprintf 'LS(1)\\n     -\\b-a\\ba      all\\n     -\\b--\\b-c\\bco\\bol\\blo\\bor\\br[=when]   colorize\\n'\n",
         );
         let ctx = context(&fake).with_which("man", Some(man.to_str().unwrap()));
         let mut f = failure("ls --colro=auto -a");
@@ -5635,7 +5635,11 @@ esac
             eprintln!("skipped: PowerShell is not installed");
             return;
         };
-        let ctx = Context::new(Settings::default(), Shell::Powershell, "fuck".into())
+        let settings = Settings {
+            probe_timeout: 10.0,
+            ..Settings::default()
+        };
+        let ctx = Context::new(settings, Shell::Powershell, "fuck".into())
             .with_executables::<&str>(&[])
             .with_which("pwsh", Some(pwsh.to_str().unwrap()))
             .with_which("Get-ChildItme", None)

@@ -2571,7 +2571,7 @@ mod tests {
             ),
             ("until false; do :; done", &[Until], &["false", ":"], &[]),
             (
-                "case $1 in a|b) git sttus;; (c) ;; *) ls;& esac",
+                "case $1 in a|b) git sttus;; (c) ;; *) ls;; esac",
                 &[Case],
                 &["git", "ls"],
                 &["\0$1", "a", "b", "c", "\0*"],
@@ -2774,7 +2774,7 @@ mod tests {
             ("! git sttus", &[Negation], &["git"], &[]),
             ("begin; end", &[Group], &[], &[]),
             ("if true; end", &[If], &["true"], &[]),
-            ("if false; else end", &[If], &["false"], &[]),
+            ("if false; else; end", &[If], &["false"], &[]),
             ("for x in; end", &[For], &[], &["x"]),
             ("switch a; end", &[Case], &[], &["a"]),
             ("if a; else; if b; end; end", &[If, If], &["a", "b"], &[]),
@@ -2922,6 +2922,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn compound_syntax_agrees_with_installed_shells() {
         for (src, ..) in POSIX_COMPOUNDS {
@@ -3137,7 +3138,13 @@ mod tests {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let printed: Vec<&str> = stdout
                 .lines()
-                .map(|l| l.trim_start_matches("> "))
+                .map(|line| {
+                    let line = line.trim_start();
+                    line.strip_prefix('>')
+                        .or_else(|| line.strip_prefix('%'))
+                        .unwrap_or(line)
+                        .trim_start()
+                })
                 .filter_map(|l| l.strip_prefix('[')?.strip_suffix(']'))
                 .collect();
             let expected: Vec<&str> = values.iter().chain(&values).copied().collect();

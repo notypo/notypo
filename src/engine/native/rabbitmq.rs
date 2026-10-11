@@ -699,7 +699,7 @@ esac
         dir.script(
             "sbin/rabbitmqctl",
             &format!(
-                "#!/bin/bash\nPATH=\"/nonexistent/erlang/bin:${{PATH}}\" exec \"{}\"  \"$@\"\n",
+                "#!/bin/sh\nPATH=\"/nonexistent/erlang/bin:${{PATH}}\" exec \"{}\"  \"$@\"\n",
                 dir.0.join("libexec/rabbitmqctl").display()
             ),
         )
@@ -740,13 +740,13 @@ esac
         // A renamed wrapper, extra commands, or a missing escript are not it.
         let renamed = dir.script(
             "sbin/rmq",
-            &format!("#!/bin/bash\nexec \"{}\" \"$@\"\n", direct.display()),
+            &format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", direct.display()),
         );
         assert_eq!(tool(&renamed), None);
         let chained = dir.script(
             "other/rabbitmqctl",
             &format!(
-                "#!/bin/bash\ntouch marker\nexec \"{}\" \"$@\"\n",
+                "#!/bin/sh\ntouch marker\nexec \"{}\" \"$@\"\n",
                 direct.display()
             ),
         );

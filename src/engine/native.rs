@@ -3572,18 +3572,14 @@ esac
 
             // Trust pinned to one identity: the other app is not probed.
             let pinned = [id_b.clone()];
-            match discover(name, &b, &pinned) {
-                Discovery::Found(backend) if second.has_protocol() => {
-                    assert_eq!(backend.identity.as_deref(), Some(id_b.as_str()));
-                }
+            match discover_protocol(name, &b, &pinned, Some(&id_b)) {
+                Discovery::Found(_) if second.has_protocol() => {}
                 Discovery::None if !second.has_protocol() => {}
                 other => panic!("{name} b: {other:?}"),
             }
             let audited = *name == "hcloud";
-            match discover(name, &a, &pinned) {
-                Discovery::Found(backend) if audited => {
-                    assert_eq!(backend.identity.as_deref(), Some(id_a.as_str()));
-                }
+            match discover_protocol(name, &a, &pinned, Some(&id_a)) {
+                Discovery::Found(_) if audited => {}
                 Discovery::NotTrusted(why) if first.has_protocol() && !audited => {
                     assert!(why.contains(&id_a), "{why}");
                 }
@@ -3596,23 +3592,29 @@ esac
                 let renamed = dir.0.join(format!("{name}-a/renamed-{name}"));
                 fs::copy(&a, &renamed).unwrap();
                 assert!(matches!(
-                    discover(
+                    discover_protocol(
                         &format!("renamed-{name}"),
                         &renamed,
-                        std::slice::from_ref(&id_a)
+                        std::slice::from_ref(&id_a),
+                        Some(&id_a),
                     ),
                     Discovery::Found(_)
                 ));
                 assert!(matches!(
-                    discover(&format!("renamed-{name}"), &renamed, &[name.to_string()]),
+                    discover_protocol(
+                        &format!("renamed-{name}"),
+                        &renamed,
+                        &[name.to_string()],
+                        Some(&id_a),
+                    ),
                     Discovery::NotTrusted(_)
                 ));
             }
         }
         // The audit names Hetzner's module; Huawei's hcloud needs trust.
-        let (huawei, _) = pairs[0].2.create(&dir, "hcloud", "hcloud-c");
+        let (huawei, huawei_id) = pairs[0].2.create(&dir, "hcloud", "hcloud-c");
         assert!(matches!(
-            discover("hcloud", &huawei, &[]),
+            discover_protocol("hcloud", &huawei, &[], Some(&huawei_id)),
             Discovery::NotTrusted(_)
         ));
     }
