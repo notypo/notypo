@@ -2076,6 +2076,73 @@ fn shell_aliases_pass_the_exit_status_to_the_native_engine() {
     }
 }
 
+#[test]
+fn shell_aliases_print_reports_without_evaluating_them_or_changing_history() {
+    for (name, shell, flags) in [
+        (
+            "bash",
+            Shell::Bash,
+            vec!["--norc", "--noprofile", "-i", "-c"],
+        ),
+        ("zsh", Shell::Zsh, vec!["-f", "-i", "-c"]),
+        ("fish", Shell::Fish, vec!["--no-config", "--private", "-c"]),
+        ("ksh", Shell::Generic, vec!["-c"]),
+        ("tcsh", Shell::Tcsh, vec!["-f", "-i"]),
+    ] {
+        let Some(path) = notypo::utils::which(name) else {
+            continue;
+        };
+        let workspace = Workspace::new();
+        let payload =
+            serde_json::json!({"command":"$(touch report-marker)","candidates":[]}).to_string();
+        let selector = workspace.0.join("selector");
+        fs::write(&selector, format!("#!/bin/sh\nshift\ncase \"$1\" in\n --json) printf '%s\\n' {};;\n --) printf '%s\\n' 'touch selected-marker';;\nesac\n", Shell::Bash.quote(&payload))).unwrap();
+        fs::set_permissions(&selector, fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = shell.app_alias("corefix", selector.to_str().unwrap(), true);
+        let script = format!("{alias}\ncorefix --json\ncorefix -- --json\n");
+        let mut command = workspace.program(&path, "");
+        command.args(&flags);
+        let child = if shell == Shell::Tcsh {
+            let mut child = command.stdin(Stdio::piped()).spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(format!("set prompt=''\nset history=100\n{script}\nexit\n").as_bytes())
+                .unwrap();
+            child
+        } else {
+            command.arg(&script).spawn().unwrap()
+        };
+        let output = finish(child);
+        let detail = format!(
+            "{name}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == payload || shell == Shell::Tcsh && line.ends_with(&payload)),
+            "{detail}"
+        );
+        assert!(
+            !workspace.0.join("report-marker").exists(),
+            "the report was evaluated: {detail}"
+        );
+        assert!(
+            workspace.0.join("selected-marker").exists(),
+            "--json after -- is an operation argument: {detail}"
+        );
+        if let Ok(history) = fs::read_to_string(workspace.0.join("history")) {
+            assert!(
+                !history.contains(&payload),
+                "reports must not be recorded as selected commands: {detail}"
+            );
+        }
+    }
+}
+
 /// A typo inside a loop is repaired in place through each shell's alias;
 /// the loop around it (and fish's block around that) is unchanged, and the
 /// corrected loop runs once.

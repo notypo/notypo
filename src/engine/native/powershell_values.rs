@@ -118,7 +118,19 @@ $hintsType = 'System.Management.Automation.ArgumentCompletionsAttribute' -as [ty
 if ($env:NOTYPO_PS_DEFINITIONS) { . ([scriptblock]::Create($env:NOTYPO_PS_DEFINITIONS)) }
 $lookup = @{ Name = [WildcardPattern]::Escape($env:NOTYPO_PS_NAME); CommandType = @('Function','Filter','Cmdlet'); ErrorAction = 'Stop' }
 if ($env:NOTYPO_PS_MODULE) { $lookup.Module = $env:NOTYPO_PS_MODULE }
-if ($env:NOTYPO_PS_ARGUMENTS) { $lookup.ArgumentList = @((Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $env:NOTYPO_PS_ARGUMENTS)) }
+if ($env:NOTYPO_PS_ARGUMENTS) {
+    $arguments = @()
+    $decoded = Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $env:NOTYPO_PS_ARGUMENTS
+    foreach ($record in $decoded.arguments) {
+        if ($record[0]) { $arguments += [string]$record[1] }
+        else {
+            $literal = [PSObject]::AsPSObject([string]$record[1])
+            $literal.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new('__notypo_literal', $true))
+            $arguments += ,$literal
+        }
+    }
+    $lookup.ArgumentList = $arguments
+}
 $info = Microsoft.PowerShell.Core\Get-Command @lookup |
     Microsoft.PowerShell.Utility\Select-Object -First 1
 $parameter = $info.Parameters[$env:NOTYPO_PS_PARAMETER]
@@ -283,7 +295,19 @@ if ($env:NOTYPO_PS_LOCATION) { Microsoft.PowerShell.Management\Set-Location -Lit
 if ($env:NOTYPO_PS_DEFINITIONS) { . ([scriptblock]::Create($env:NOTYPO_PS_DEFINITIONS)) }
 $lookup = @{ Name = [WildcardPattern]::Escape($env:NOTYPO_PS_NAME); CommandType = @('Function','Filter','Cmdlet'); ErrorAction = 'Stop' }
 if ($env:NOTYPO_PS_MODULE) { $lookup.Module = $env:NOTYPO_PS_MODULE }
-if ($env:NOTYPO_PS_ARGUMENTS) { $lookup.ArgumentList = @((Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $env:NOTYPO_PS_ARGUMENTS)) }
+if ($env:NOTYPO_PS_ARGUMENTS) {
+    $arguments = @()
+    $decoded = Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $env:NOTYPO_PS_ARGUMENTS
+    foreach ($record in $decoded.arguments) {
+        if ($record[0]) { $arguments += [string]$record[1] }
+        else {
+            $literal = [PSObject]::AsPSObject([string]$record[1])
+            $literal.PSObject.Properties.Add([System.Management.Automation.PSNoteProperty]::new('__notypo_literal', $true))
+            $arguments += ,$literal
+        }
+    }
+    $lookup.ArgumentList = $arguments
+}
 $null = Microsoft.PowerShell.Core\Get-Command @lookup
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($env:NOTYPO_PS_LINE, [ref]$null, [ref]$errors)
@@ -319,12 +343,11 @@ pub(super) fn bind_positional(
     let suffix = line_with_literals(description, context.following, context.literal_arguments.1)?;
     query_line.push_str(&suffix[command_name(description)?.len()..]);
     let metadata = if description.contextual {
-        serde_json::to_string(&super::powershell::metadata_arguments(
+        super::powershell::encode_metadata_arguments(&super::powershell::metadata_arguments(
             description,
             context,
             true,
         )?)
-        .expect("metadata arguments serialize")
     } else {
         String::new()
     };
@@ -429,12 +452,11 @@ pub(super) fn query_context(
         query_line.push_str(&suffix[command_name(description)?.len()..]);
     }
     let metadata = if description.contextual {
-        serde_json::to_string(&super::powershell::metadata_arguments(
+        super::powershell::encode_metadata_arguments(&super::powershell::metadata_arguments(
             description,
             context,
             true,
         )?)
-        .expect("metadata arguments serialize")
     } else {
         String::new()
     };

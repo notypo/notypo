@@ -529,6 +529,10 @@ impl Shell {
             function {name} () {{
                 local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${{PIPESTATUS[*]}}\";
                 local -x NOTYPO_SHELL_FUNCTIONS=\"$(compgen -A function -X '_*')\";
+                local notypo_report=0 notypo_argument;
+                for notypo_argument in \"$@\"; do
+                    case \"$notypo_argument\" in --) break;; --json|--explain) notypo_report=1;; esac
+                done
                 {BASH_WRAPPERS}
                 local -x NOTYPO_BASH_COMPLETIONS=\"$(
                     set -f; shopt -s extdebug
@@ -560,11 +564,17 @@ impl Shell {
                 export TF_ALIAS={name};
                 export TF_SHELL_ALIASES=$(alias);
                 export TF_HISTORY=$(fc -ln -10);
-                TF_CMD=$(
+                if TF_CMD=$(
                     {exe} {PLACEHOLDER} \"$@\"
-                ) && eval \"$TF_CMD\";
+                ); then
+                    if [ \"$notypo_report\" = 1 ]; then
+                        [ -z \"$TF_CMD\" ] || printf '%s\\n' \"$TF_CMD\"
+                    elif [ -n \"$TF_CMD\" ]; then
+                        eval \"$TF_CMD\";
+                        {}
+                    fi
+                fi
                 unset TF_HISTORY;
-                {}
             }}
         ",
                 if alter_history {
@@ -579,6 +589,10 @@ impl Shell {
                 local -x NOTYPO_EXIT_STATUS=$? NOTYPO_PIPESTATUS=\"${{pipestatus[*]}}\";
                 local -x NOTYPO_ZSH_FPATH=\"${{(j.:.)fpath}}\";
                 local -x NOTYPO_SHELL_FUNCTIONS=\"${{(k)functions[(I)[^_]*]}}\";
+                local notypo_report=0 notypo_argument;
+                for notypo_argument in \"$@\"; do
+                    case \"$notypo_argument\" in --) break;; --json|--explain) notypo_report=1;; esac
+                done
                 {ZSH_WRAPPERS}
                 local -x NOTYPO_ZSH_COMPLETIONS=\"$(
                     zmodload zsh/parameter 2>/dev/null
@@ -605,11 +619,17 @@ impl Shell {
                 export TF_SHELL_ALIASES;
                 TF_HISTORY=\"$(fc -ln -10)\";
                 export TF_HISTORY;
-                TF_CMD=$(
-                    {exe} {PLACEHOLDER} $@
-                ) && eval $TF_CMD;
+                if TF_CMD=$(
+                    {exe} {PLACEHOLDER} \"$@\"
+                ); then
+                    if [ \"$notypo_report\" = 1 ]; then
+                        [ -z \"$TF_CMD\" ] || printf '%s\\n' \"$TF_CMD\"
+                    elif [ -n \"$TF_CMD\" ]; then
+                        eval \"$TF_CMD\";
+                        {}
+                    fi
+                fi
                 unset TF_HISTORY;
-                {}
             }}
         ",
                 if alter_history {
@@ -621,6 +641,11 @@ impl Shell {
             Shell::Fish => format!(
                 "function {name} -d \"Correct your previous console command\"\n  \
                  set -l notypo_status $status $pipestatus\n  \
+                 set -l notypo_report 0\n  \
+                 for notypo_argument in $argv\n    \
+                   test \"$notypo_argument\" = '--'; and break\n    \
+                   contains -- $notypo_argument --json --explain; and set notypo_report 1\n  \
+                 end\n  \
                  set -lx NOTYPO_EXIT_STATUS $notypo_status[1]\n  \
                  set -lx NOTYPO_PIPESTATUS (string join ' ' -- $notypo_status[2..-1])\n  \
                  set -lx NOTYPO_SHELL_FUNCTIONS (functions --names | string match -v '_*')\n  \
@@ -670,7 +695,9 @@ impl Shell {
                  set -lx TF_SHELL fish\n  \
                  set -lx TF_ALIAS {name}\n  \
                  set -l unfucked_command ({exe} {PLACEHOLDER} $argv | string collect)\n  \
-                 if [ \"$unfucked_command\" != \"\" ]\n    \
+                 if test $notypo_report = 1\n    \
+                 test -z \"$unfucked_command\"; or printf '%s\\n' \"$unfucked_command\"\n  \
+                 else if [ \"$unfucked_command\" != \"\" ]\n    \
                  eval $unfucked_command\n{}  \
                  end\nend",
                 if alter_history {
@@ -692,7 +719,11 @@ impl Shell {
                      setenv TF_SHELL tcsh; setenv TF_ALIAS {name}; \
                      setenv NOTYPO_CURRENT_COMMAND \"`history -h 2 | head -n 1`\"; \
                      setenv TF_SHELL_ALIASES \"`alias | /usr/bin/tr '\\n' '\\036'`\"; \
-                     eval \"`{exe} {PLACEHOLDER} \\!*`\"; \
+                     set notypo_report = `printf '%s\\n' \\!* | /usr/bin/awk 'BEGIN {{r=0}} $0==\"--\" {{exit}} $0==\"--json\" || $0==\"--explain\" {{r=1}} END {{print r}}'`; \
+                     set notypo_result = \"`{exe} {PLACEHOLDER} \\!*`\"; \
+                     if ( $notypo_report == 1 ) printf '%s\\n' \"$notypo_result\"; \
+                     if ( $notypo_report == 0 ) eval \"$notypo_result\"; \
+                     unset notypo_report notypo_result; \
                      unsetenv NOTYPO_EXIT_STATUS NOTYPO_CURRENT_COMMAND TF_SHELL_ALIASES"
                 );
                 format!("alias {name} '{}'", body.replace('\'', "'\\''"))
@@ -731,9 +762,11 @@ impl Shell {
                  $env:TF_ALIAS = '{name}';\n        \
                  $env:NOTYPO_SHELL_FUNCTIONS = (Get-ChildItem alias:, function: -Name) -join ' ';\n        \
                  {POWERSHELL_WRAPPERS}\n        \
+                 $notypo_report = $false;\n        \
+                 foreach ($notypo_argument in $args) {{ if ($notypo_argument -eq '--') {{ break }}; if ($notypo_argument -in @('--json', '--explain')) {{ $notypo_report = $true }} }};\n        \
                  $fuck = $(& {exe} $args);\n        \
                  Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_POWERSHELL_COMPLETIONS, Env:NOTYPO_POWERSHELL_PARAMETERS, Env:NOTYPO_POWERSHELL_WRAPPERS, Env:NOTYPO_POWERSHELL_LOCATION, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
-                 if (-not [string]::IsNullOrWhiteSpace($fuck)) {{\n            \
+                 if ($notypo_report) {{ $fuck }} elseif (-not [string]::IsNullOrWhiteSpace($fuck)) {{\n            \
                  Microsoft.PowerShell.Utility\\Invoke-Expression -Command $fuck;\n        }}\n    }}\n    [Console]::ResetColor() \n}}\n"
             ),
             // A POSIX function: `$?` is read before anything else runs, the
@@ -743,10 +776,14 @@ impl Shell {
             Shell::Generic => format!(
                 "{name} () {{\n    \
                  notypo_status=$?\n    \
-                 notypo_cmd=$(NOTYPO_EXIT_STATUS=$notypo_status TF_SHELL=generic TF_ALIAS={name} \
+                 notypo_report=0\n    \
+                 for notypo_argument in \"$@\"; do case \"$notypo_argument\" in --) break;; --json|--explain) notypo_report=1;; esac; done\n    \
+                 if notypo_cmd=$(NOTYPO_EXIT_STATUS=$notypo_status TF_SHELL=generic TF_ALIAS={name} \
                  TF_HISTORY=\"$(fc -ln -10 2>/dev/null)\" {exe} {PLACEHOLDER} \"$@\") && \
-                 eval \"$notypo_cmd\"\n    \
-                 unset notypo_status notypo_cmd\n}}"
+                 [ -n \"$notypo_cmd\" ]; then\n        \
+                   if [ \"$notypo_report\" = 1 ]; then printf '%s\\n' \"$notypo_cmd\"; else eval \"$notypo_cmd\"; fi\n    \
+                 fi\n    \
+                 unset notypo_status notypo_cmd notypo_report notypo_argument\n}}"
             ),
         }
     }

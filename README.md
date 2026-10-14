@@ -38,7 +38,7 @@ Settings use thefuck's compatible location, `~/.config/thefuck/settings.py` (or 
 | Setting | Default | Purpose |
 |---|---:|---|
 | `trusted_completers` | `[]` | Allow generic CLI protocols and installed completion handlers. |
-| `trusted_help` | `[]` | Allow selected programs to be run with `--help`. |
+| `trusted_help` | `[]` | Allow selected programs to provide help and legacy metadata listings. |
 | `trusted_workspaces` | `[]` | Directories where programs may evaluate project files to list their commands; `*` trusts every directory. |
 | `disabled_sources` | `[]` | Disable evidence sources such as `native`, `help`, or `history`. |
 | `probe_timeout` | `3` seconds | Limit each completion or help probe. |
@@ -47,19 +47,13 @@ Settings use thefuck's compatible location, `~/.config/thefuck/settings.py` (or 
 
 See `notypo --help` for command-line options.
 
-Completion handlers execute code. The trust settings authorize that code to run during discovery. Probe timeouts and the offline environment limit discovery, but do not provide an operating system sandbox.
+Completion handlers execute code. The trust settings authorize that code to run during discovery. Probe timeouts and the offline environment limit discovery, but do not provide an operating system sandbox. Native and legacy discovery share one request budget. Legacy listings require `trusted_help`, with an audited exception for local Git branch names; project task listings also require workspace trust.
 
 ## Shell syntax
 
 The engine edits source spans and reparses each correction, preserving unchanged whitespace, quotes, comments, and redirections. Bash, Zsh, and POSIX shells support simple commands, pipelines, lists, and supported compound commands. Fish uses its own parser and quoting, including supported blocks. tcsh supports simple commands and operators; history substitutions that could be reinterpreted are refused. The generic integration uses the POSIX subset and needs a shell with `fc` to read the preceding command.
 
 PowerShell supports literal commands in argument mode, parameter names and values, aliases, pipelines, and redirections. Expressions and statement syntax remain unsupported. Here-documents, Bash arithmetic and `[[ ... ]]`, and Zsh forms outside the POSIX subset are also reported as unsupported. Substitutions and expansions are never evaluated during parsing or discovery.
-
-## Performance
-
-Measure parsing, ranking, safety, and complete correction fixtures with `cargo bench --bench engine`; measure the compatibility source with `cargo bench --bench correction`. Both benchmarks check their expected behavior and print JSON with median and p95 timings. Debug builds run only a fixture smoke check. Native CLI completion additionally pays the startup cost of the installed app, bounded by the shared probe budget.
-
-After building the release binary, run `python3 benchmarks/structured.py --installed` to measure cold and warm metadata caches, probe counts, and child peak memory. Results are written to `benchmarks/core-results.json`. Add `--powershell /path/to/pwsh` or `--baseline-python /path/to/venv/bin/python` for those optional runtimes. Missing clients are reported as unverified. These measurements use a warm operating system page cache; child peak memory is not aggregate process-tree memory.
 
 ## License
 

@@ -173,3 +173,101 @@ fn selected_echo_commands_are_executed_without_stripping_their_program_name() {
         );
     }
 }
+
+fn reports(output: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| {
+            let start = line.find('{')?;
+            serde_json::from_str::<serde_json::Value>(&line[start..])
+                .ok()
+                .filter(|value| value.get("candidates").is_some())
+        })
+        .collect()
+}
+
+#[test]
+fn dynamic_parameters_follow_literal_context_through_the_generated_alias() {
+    for (index, shell) in runtimes().into_iter().enumerate() {
+        let workspace = Workspace(std::env::temp_dir().join(format!(
+            "notypo-core-dynamic-{}-{index}",
+            std::process::id()
+        )));
+        fs::create_dir(&workspace.0).unwrap();
+        let marker = workspace.0.join("operation.log");
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let definition = "function Get-CoreFixture { [CmdletBinding()] param([string]$Scope) dynamicparam { $set = [System.Management.Automation.RuntimeDefinedParameterDictionary]::new(); if ($Scope -in @('west','-west')) { $attributes = [System.Collections.ObjectModel.Collection[System.Attribute]]::new(); $attributes.Add([System.Management.Automation.ParameterAttribute]::new()); $attributes.Add([System.Management.Automation.ValidateSetAttribute]::new([string[]]@('one','two'))); $set.Add('Flavor', [System.Management.Automation.RuntimeDefinedParameter]::new('Flavor',[string],$attributes)) }; $set } process { [IO.File]::WriteAllText(MARKER,'ran') } }".replace("MARKER", &quote(marker.to_str().unwrap()));
+        let input = format!(
+            "$env:TF_SHELL = 'powershell'\nInvoke-Expression ((& {} --alias corefix) -join \"`n\")\n{definition}\n\
+             Get-CoreFixture -Flavro one -Scope west\ncorefix --json\n\
+             Get-CoreFixture -Scope west -Flavor oen\ncorefix --json\n\
+             Get-CoreFixture '-west' -Flavro two\ncorefix --json\nexit\n",
+            quote(env!("CARGO_BIN_EXE_notypo"))
+        );
+        let (output, errors) = run(&shell, &workspace.0, &input);
+        let detail = format!(
+            "{}\n{}\n{}",
+            shell.display(),
+            String::from_utf8_lossy(&output),
+            String::from_utf8_lossy(&errors)
+        );
+        let reports = reports(&output);
+        assert_eq!(reports.len(), 3, "{detail}");
+        for (report, expected) in reports.iter().zip([
+            "Get-CoreFixture -Flavor one -Scope west",
+            "Get-CoreFixture -Scope west -Flavor one",
+            "Get-CoreFixture '-west' -Flavor two",
+        ]) {
+            assert_eq!(
+                report["candidates"][0]["command"].as_str(),
+                Some(expected),
+                "{detail}"
+            );
+        }
+        assert!(
+            !marker.exists(),
+            "discovery executed the failed operation: {detail}"
+        );
+    }
+}
+
+#[test]
+fn parent_provider_location_does_not_lend_filesystem_parameters() {
+    for (index, shell) in runtimes().into_iter().enumerate() {
+        let workspace = Workspace(std::env::temp_dir().join(format!(
+            "notypo-core-provider-{}-{index}",
+            std::process::id()
+        )));
+        fs::create_dir(&workspace.0).unwrap();
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let input = format!(
+            "$env:TF_SHELL = 'powershell'\nInvoke-Expression ((& {} --alias corefix) -join \"`n\")\n\
+             Set-Location Env:\nGet-ChildItem -Direcotry\ncorefix --json\n\
+             [Console]::Out.WriteLine('provider-context-left:' + [bool]$env:NOTYPO_POWERSHELL_LOCATION)\nexit\n",
+            quote(env!("CARGO_BIN_EXE_notypo"))
+        );
+        let (output, errors) = run(&shell, &workspace.0, &input);
+        let detail = format!(
+            "{}\n{}\n{}",
+            shell.display(),
+            String::from_utf8_lossy(&output),
+            String::from_utf8_lossy(&errors)
+        );
+        let reports = reports(&output);
+        assert_eq!(reports.len(), 1, "{detail}");
+        assert!(
+            !reports[0]["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains("-Directory"))),
+            "{detail}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("provider-context-left:False"),
+            "{detail}"
+        );
+    }
+}

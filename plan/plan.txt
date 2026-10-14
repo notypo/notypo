@@ -57,38 +57,48 @@ Status: first and second slices implemented in src/engine/ on branch
         no controlling terminal for probes, posener/cobra/handler argument
         and arity detection, cobra alias confirmation, case-sensitive short
         options, and password masking in reports.
-Core release work (2026-10-14, active; owner's current request): finish the
-engine implementation and validation for manual publication. Expansion of
-the 5A/5B application inventories and additional library protocols remains
-future work. Existing inventory requirements are retained below.
-    Restored the missing benches/engine.rs and benches/correction.rs targets
-    that prevented Cargo from parsing the manifest. Added CPU/provider stage
-    measurements and benchmarks/structured.py for cold/warm CLI latency,
-    probe counts, child RSS, checked corrections, and an optional upstream
-    Python baseline. New local app installations are recorded in plan/app.txt.
-    Shell callbacks now receive literal arguments on both sides of the
-    diagnosed token where their native API supports a cursor: Bash, Zsh,
-    and PowerShell. Cursor units are preserved (bytes, characters, UTF-16).
-    Context-dependent answers have separate request memo entries and cannot
-    persist arguments in the metadata cache. Opaque callback context abstains.
-    PowerShell native and parameter callbacks validate replacement ranges
-    against the queried source span, converting UTF-16 to UTF-8 boundaries;
-    literal native values containing spaces survive decoding. Optional newer
-    attribute types are guarded for Windows PowerShell compatibility.
-    Bash now uses its own compgen filtering/affixes for -F, -C, and -W
-    registrations. tcsh passes its session aliases instead of starting an
-    interactive shell and running startup files. Unsupported completion is
-    distinct from an empty answer and falls back to documentation/history;
-    resolved git aliases have explicit unjudged argument positions.
-    Current macOS evidence: 453 default tests pass with portable PowerShell
-    7.6.7 enabled, plus both benchmark smoke targets; host all-target/all-feature
-    Clippy passes. A portable PowerShell integration fixture now also runs on
-    Windows and checks status capture, parameter repair, cleanup, and exactly
-    one execution of each accepted command. Foreign runtime checks remain open.
-    Remaining work includes captured PowerShell module/closure data and
-    provider-dependent metadata, remaining shell completion result fidelity,
-    complete supported-protocol upgrade records, final performance artifacts,
-    platform validation, package verification, and the core rollout audit.
+Core engine release scope (owner request updated 2026-10-15): finish the
+engine implementation and verification for manual merge/publication. The
+5A/5B application inventories and additional protocols remain future work.
+The owner explicitly excluded benchmarks and benchmark directories; stale
+Cargo benchmark targets are removed instead of restoring those directories.
+New app installations are recorded in plan/app.txt with cleanup locations.
+    Literal arguments on both sides of a diagnosed token reach Bash, Zsh,
+    and PowerShell callbacks, with their native cursor units preserved.
+    Context-dependent answers have separate request memo entries and do not
+    persist argument data. Opaque callback context abstains. Unsupported
+    completion is distinguished from an authoritative empty answer.
+    PowerShell replacement ranges are checked in UTF-16 and converted to
+    UTF-8 boundaries; quoted native values containing spaces are retained.
+    Context-dependent command metadata and parent provider locations are
+    verified in real PowerShell. When omitting a misspelled parameter makes
+    Get-Command unable to bind its value, the native completion binder sees
+    the full literal line and cursor. Those lists are explicitly partial,
+    with unknown arity retained. Captured closure/module data remains open.
+    Bash -F/-C/-W registrations use native compgen filtering and affixes;
+    failed callbacks discard partial answers. tcsh passes session aliases
+    without launching startup files. PowerShell executes selected echo and
+    echo-prefixed commands exactly once. Over-limit Git replies fail closed.
+    Every legacy rule metadata probe now uses explicit argument vectors,
+    trusted_help (except the audited local Git branch read), workspace trust,
+    the offline environment and the remaining structured-engine budget.
+    Replies stay in request memory; project-dependent global/disk caches are
+    removed. Script views share a budget, while separate commands can reuse
+    a library Context independently. Explicit confirmed utility calls are
+    bounded too. Probes use the failure cwd without changing the parent cwd.
+    Persistent metadata includes the raw workspace path; captured errors
+    refresh cached words that an app no longer accepts.
+    Last verified full checkpoint: 472 local tests pass with PowerShell 7.6.7,
+    plus host Clippy. Generated aliases print --json reports as data, respect
+    the -- delimiter, and do not execute or add reports to shell history.
+    Portable PowerShell tests cover dynamic names/enum values, suffix context,
+    quoted dash data, provider location, environment cleanup and operation
+    markers. Windows compilation/Clippy passes for this checkpoint.
+    Windows/Linux/FreeBSD compilation checks passed an earlier checkpoint;
+    foreign runtime checks, final package verification and rollout remain open.
+    Remaining core work: captured PowerShell module/closure state, richer
+    shell results, supported-protocol
+    upgrade records, platform/package validation and the final release audit.
 
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.
@@ -168,9 +178,8 @@ CURRENT BASELINE
 [x] DONE: Captured-output readers, Unix shell logging, rerun timeouts, and
     native process/terminal support exist. Output acquisition may currently
     rerun the failed command; captured output is not always separate stderr.
-[x] DONE: Unit/CLI/rule fixtures, engine benchmarks, Python comparison
-    tooling, and platform CI exist. Benchmark directories are excluded
-    from crates.io packages.
+[x] DONE: Unit/CLI/rule fixtures and platform CI exist. Benchmarking is
+    excluded from the current release by the owner (2026-10-15).
 [x] DONE: Lossless AST, token diagnosis, unified providers, explainable
     ranking, and a mandatory safety gate are integrated end to end.
     Integrated in the default pipeline for sh/bash/zsh. Native completion,
@@ -4433,9 +4442,12 @@ executes it once. Aborting or a denied safety decision executes nothing.
     ambiguity/abstention rates, and unsafe automatic acceptances.
     tests/corpus.rs: top-1 99.0%, top-3 100%, asked 3.5%, abstained 0%,
     wrong automatic decisions 0%.
-[ ] NOT DONE: Benchmark each pipeline stage and end-to-end cold/warm CLI
+[-] SKIPPED: Benchmark each pipeline stage and end-to-end cold/warm CLI
     latency (median and p95), subprocess counts, cache behavior, and RSS.
     Compare with the current Rust engine and the existing Python baseline.
+    Owner exclusion (2026-10-15): benchmarking is outside the current core
+    release scope. Do not create or restore benchmark directories. Historical
+    measurement notes below are retained as history only.
     PARTIAL: benches/engine.rs (stages) and benchmarks/structured.py (cold/warm,
     probes, RSS), plus help-vocabulary and fish parse/quote stages;
     benchmarks/shell-results.md records eleven cold/warm runs through installed
@@ -4555,7 +4567,8 @@ executes it once. Aborting or a denied safety decision executes nothing.
     pipeline; legacy rule evaluation is unchanged.
 [x] DONE: Run cargo fmt --all -- --check; cargo test --locked --all-targets;
     cargo clippy --locked --all-targets --all-features -- -D warnings; and
-    relevant benchmarks. Keep Linux Clippy verification in CI.
+    Keep Linux Clippy verification in CI. Benchmark work was explicitly
+    excluded by the owner on 2026-10-15.
 [ ] NOT DONE: Validate Linux/macOS/Windows/FreeBSD builds and available real
     shell integrations. Report unavailable runtime coverage explicitly.
     PARTIAL: local macOS Bash/Zsh 5.9/fish 4.9.3 runtime checks pass, including
