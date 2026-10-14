@@ -225,11 +225,17 @@ impl Protocol {
             Mode::Probe(budget) => budget,
             Mode::Memo => {
                 let key: Vec<String> = key.iter().map(|k| k.to_string()).collect();
-                return backend.memo.borrow().get(&key).cloned().unwrap_or_else(|| {
-                    Err(CompletionError::Failed(
-                        "yargs level was not queried in this request".into(),
-                    ))
-                });
+                return backend
+                    .state
+                    .memo
+                    .borrow()
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Err(CompletionError::Failed(
+                            "yargs level was not queried in this request".into(),
+                        ))
+                    });
             }
         };
         if cfg!(windows) {
@@ -1165,7 +1171,7 @@ cat "$root/answers/$answer.$suffix"
         )
         .unwrap();
         let mut after = before.clone();
-        after.memo = Default::default();
+        after.state = Default::default();
         let listed = after.complete(&[], "", &mut budget).unwrap();
         assert_eq!(listed[1].value, "rollback");
         assert_eq!(listed[1].description.as_deref(), Some("Undo"));

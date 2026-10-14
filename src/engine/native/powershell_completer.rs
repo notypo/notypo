@@ -40,6 +40,7 @@ const MEMORY_LIMIT: usize = 64 * 1024;
 /// function can't stand in for the probe's own commands.
 const SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+if ($env:NOTYPO_PS_LOCATION) { Microsoft.PowerShell.Management\Set-Location -LiteralPath $env:NOTYPO_PS_LOCATION }
 if ($env:NOTYPO_PS_DEFINITIONS) { . ([scriptblock]::Create($env:NOTYPO_PS_DEFINITIONS)) }
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
 $tab = [string][char]9
@@ -50,7 +51,9 @@ function __notypo_emit([string[]] $Fields) {
 $global:NotypoCompleter = [scriptblock]::Create($env:NOTYPO_PS_COMPLETER)
 $global:NotypoAnswered = $null
 $global:NotypoFailure = $null
-Microsoft.PowerShell.Core\Register-ArgumentCompleter -Native -CommandName $env:NOTYPO_PS_NAME -ScriptBlock {
+$registration = @{ CommandName = $env:NOTYPO_PS_NAME }
+if ($PSVersionTable.PSVersion.Major -ge 6) { $registration.Native = $true }
+Microsoft.PowerShell.Core\Register-ArgumentCompleter @registration -ScriptBlock {
     param($word, $ast, $cursor)
     $ErrorActionPreference = 'Continue'
     try {
@@ -62,13 +65,15 @@ Microsoft.PowerShell.Core\Register-ArgumentCompleter -Native -CommandName $env:N
     }
 }
 $line = $env:NOTYPO_PS_LINE
-foreach ($name in 'NOTYPO_PS_DEFINITIONS', 'NOTYPO_PS_COMPLETER', 'NOTYPO_PS_NAME', 'NOTYPO_PS_LINE') {
+$cursor = [int]$env:NOTYPO_PS_CURSOR
+foreach ($name in 'NOTYPO_PS_DEFINITIONS', 'NOTYPO_PS_COMPLETER', 'NOTYPO_PS_NAME', 'NOTYPO_PS_LINE', 'NOTYPO_PS_CURSOR') {
     [Environment]::SetEnvironmentVariable($name, $null)
 }
-$result = [System.Management.Automation.CommandCompletion]::CompleteInput($line, $line.Length, $null)
+$result = [System.Management.Automation.CommandCompletion]::CompleteInput($line, $cursor, $null)
 if ($null -ne $global:NotypoFailure) { __notypo_emit 'failed'; return }
 if ($null -eq $global:NotypoAnswered) { __notypo_emit 'unanswered'; return }
 __notypo_emit 'answered'
+__notypo_emit 'range', ([string]$result.ReplacementIndex), ([string]$result.ReplacementLength)
 if ($global:NotypoAnswered -eq 0) { return }
 foreach ($match in $result.CompletionMatches) {
     __notypo_emit 'match', $match.CompletionText, ([string]$match.ResultType), ([string]$match.ToolTip -replace '[\x00-\x1f\x7f]', ' ')
@@ -134,22 +139,51 @@ fn line(name: &str, words: &[&str], prefix: &str) -> String {
 }
 
 /// The raw answer for one query line.
+#[cfg(test)]
 pub(super) fn query(
     shell: &Path,
     registration: &Registration,
     name: &str,
     words: &[&str],
     prefix: &str,
+    env: Vec<(OsString, Option<OsString>)>,
+    budget: &mut Budget,
+) -> Result<String, CompletionError> {
+    query_at(shell, registration, name, words, prefix, &[], env, budget)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn query_at(
+    shell: &Path,
+    registration: &Registration,
+    name: &str,
+    words: &[&str],
+    prefix: &str,
+    following: &[&str],
     mut env: Vec<(OsString, Option<OsString>)>,
     budget: &mut Budget,
 ) -> Result<String, CompletionError> {
+    let mut query_line = line(name, words, prefix);
+    let target_end = query_line.len();
+    let target_start = target_end
+        - if prefix.is_empty() {
+            0
+        } else {
+            parser::quote_word_with_dialect(prefix, Dialect::PowerShell).len()
+        };
+    let cursor = query_line.encode_utf16().count().to_string();
+    for word in following {
+        query_line.push(' ');
+        query_line.push_str(&parser::quote_word_with_dialect(word, Dialect::PowerShell));
+    }
     let set = |k: &str, v: &str| (OsString::from(k), Some(OsString::from(v)));
     env.extend(super::powershell::environment(&[]));
     env.extend([
         set("NOTYPO_PS_DEFINITIONS", &registration.definitions),
         set("NOTYPO_PS_COMPLETER", &registration.completer),
         set("NOTYPO_PS_NAME", name),
-        set("NOTYPO_PS_LINE", &line(name, words, prefix)),
+        set("NOTYPO_PS_LINE", &query_line),
+        set("NOTYPO_PS_CURSOR", &cursor),
     ]);
     let args = [
         "-NoProfile",
@@ -160,7 +194,67 @@ pub(super) fn query(
     ]
     .map(OsString::from)
     .to_vec();
-    run_stdout(shell, args, env, budget, true)
+    let text = run_stdout(shell, args, env, budget, true)?;
+    normalize_replacement(
+        &text,
+        &query_line,
+        parser::Span {
+            start: target_start,
+            end: target_end,
+        },
+    )
+}
+
+/// CommandCompletion reports UTF-16 offsets into the query, while edits in
+/// our AST use UTF-8 byte spans. Only the queried word may be replaced: a
+/// completer that selects a preceding argument cannot authorize editing it.
+/// https://learn.microsoft.com/dotnet/api/system.management.automation.commandcompletion
+pub(super) fn normalize_replacement(
+    text: &str,
+    source: &str,
+    target: parser::Span,
+) -> Result<String, CompletionError> {
+    let text = text
+        .strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .replace("\r\n", "\n");
+    let Some(records) = text.strip_prefix("answered\n") else {
+        return Ok(text);
+    };
+    let (header, records) = records.split_once('\n').unwrap_or((records, ""));
+    let fields: Vec<&str> = header.split('\t').collect();
+    let ["range", start, length] = fields.as_slice() else {
+        return Err(CompletionError::Failed(
+            "missing PowerShell completion replacement range".into(),
+        ));
+    };
+    // PowerShell may use sentinel offsets when it has no completions.
+    if *start == "-1" && *length == "-1" && records.is_empty() {
+        return Ok("answered\n".into());
+    }
+    let byte_at = |offset: usize| {
+        let mut units = 0;
+        for (byte, character) in source.char_indices() {
+            if units == offset {
+                return Some(byte);
+            }
+            units += character.len_utf16();
+        }
+        (units == offset).then_some(source.len())
+    };
+    let normalized = start
+        .parse::<usize>()
+        .ok()
+        .zip(length.parse::<usize>().ok())
+        .and_then(|(start, length)| start.checked_add(length).map(|end| (start, end)))
+        .and_then(|(start, end)| byte_at(start).zip(byte_at(end)))
+        .map(|(start, end)| parser::Span { start, end });
+    if normalized != Some(target) {
+        return Err(CompletionError::Unsupported(
+            "PowerShell completion replaces a different source span".into(),
+        ));
+    }
+    Ok(format!("answered\n{records}"))
 }
 
 /// Reads the probe's records. Each completion text is PowerShell code, the
@@ -208,10 +302,7 @@ pub(super) fn parse(
         let Some(value) = literal(completion) else {
             continue;
         };
-        if value.is_empty()
-            || value.contains(char::is_whitespace)
-            || value.contains(char::is_control)
-        {
+        if value.is_empty() || value.contains(char::is_control) {
             continue;
         }
         if items.iter().any(|item| item.value == value) {
@@ -301,6 +392,34 @@ mod tests {
     }
 
     #[test]
+    fn replacement_ranges_use_utf16_and_must_match_the_target_word() {
+        let source = "tool '🦀' --";
+        let target = parser::Span {
+            start: source.len() - 2,
+            end: source.len(),
+        };
+        let start = source[..target.start].encode_utf16().count();
+        let reply =
+            format!("answered\nrange\t{start}\t2\nmatch\t--verbose\tParameterName\tVerbose\n");
+        let normalized = normalize_replacement(&reply, source, target).unwrap();
+        assert_eq!(
+            parse(&normalized, "tool", 10).unwrap()[0].value,
+            "--verbose"
+        );
+        for reply in [
+            "answered\nrange\t0\t4\nmatch\tx\tText\t\n",
+            "answered\nrange\t7\t1\nmatch\tx\tText\t\n", // middle of a surrogate pair
+            "answered\nrange\t999\t1\nmatch\tx\tText\t\n",
+            "answered\nmatch\tx\tText\t\n",
+        ] {
+            assert!(
+                normalize_replacement(reply, source, target).is_err(),
+                "{reply}"
+            );
+        }
+    }
+
+    #[test]
     fn answers_keep_the_literal_words_tab_would_insert() {
         let text = "answered\n\
                     match\t--verbose\tParameterName\tUse verbose output\n\
@@ -316,10 +435,20 @@ mod tests {
                     match\tGet-Item\tCommand\t\n";
         let items = parse(text, "tool", 16).unwrap();
         let values: Vec<&str> = items.iter().map(|i| i.value.as_str()).collect();
-        assert_eq!(values, ["--verbose", "build", "it's", "x$y", "--target"]);
+        assert_eq!(
+            values,
+            [
+                "--verbose",
+                "build",
+                "with space",
+                "it's",
+                "x$y",
+                "--target"
+            ]
+        );
         assert_eq!(items[0].description.as_deref(), Some("Use verbose output"));
-        assert_eq!(items[3].description, None, "a tooltip repeating the word");
-        assert_eq!(items[4].takes_value, Some(true));
+        assert_eq!(items[4].description, None, "a tooltip repeating the word");
+        assert_eq!(items[5].takes_value, Some(true));
         assert!(parse("answered\n", "tool", 16).unwrap().is_empty());
         assert!(matches!(
             parse("unanswered\n", "tool", 16),
@@ -346,6 +475,30 @@ mod tests {
     #[test]
     fn script_has_no_double_quotes() {
         assert!(!SCRIPT.contains('"'));
+    }
+
+    #[test]
+    fn middle_slots_give_native_callbacks_the_full_ast_and_original_cursor() {
+        let Some(pwsh) = super::super::powershell::tests::pwsh() else {
+            return;
+        };
+        let registration = Registration {
+            completer: "param($w, $ast, $cursor) if ($cursor -eq 10 -and $ast.CommandElements[-1].Value -eq '三 west') { 'build' }".into(),
+            definitions: String::new(),
+        };
+        let mut budget = Budget::new(Duration::from_secs(20), Duration::from_secs(5), 8);
+        let text = query_at(
+            &pwsh,
+            &registration,
+            "tool",
+            &["🦀"],
+            "",
+            &["--scope", "三 west"],
+            Vec::new(),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(parse(&text, "tool", 10).unwrap()[0].value, "build");
     }
 
     /// The probe defines the session's functions, runs the completer as Tab

@@ -112,9 +112,13 @@ impl Snapshot {
 const SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
+if ($env:NOTYPO_PS_LOCATION) { Microsoft.PowerShell.Management\Set-Location -LiteralPath $env:NOTYPO_PS_LOCATION }
+$factoryType = 'System.Management.Automation.ArgumentCompleterFactoryAttribute' -as [type]
+$hintsType = 'System.Management.Automation.ArgumentCompletionsAttribute' -as [type]
 if ($env:NOTYPO_PS_DEFINITIONS) { . ([scriptblock]::Create($env:NOTYPO_PS_DEFINITIONS)) }
 $lookup = @{ Name = [WildcardPattern]::Escape($env:NOTYPO_PS_NAME); CommandType = @('Function','Filter','Cmdlet'); ErrorAction = 'Stop' }
 if ($env:NOTYPO_PS_MODULE) { $lookup.Module = $env:NOTYPO_PS_MODULE }
+if ($env:NOTYPO_PS_ARGUMENTS) { $lookup.ArgumentList = @((Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $env:NOTYPO_PS_ARGUMENTS)) }
 $info = Microsoft.PowerShell.Core\Get-Command @lookup |
     Microsoft.PowerShell.Utility\Select-Object -First 1
 $parameter = $info.Parameters[$env:NOTYPO_PS_PARAMETER]
@@ -133,7 +137,7 @@ if ($env:NOTYPO_PS_COMPLETER) {
     }
     if (-not $global:NotypoOriginal) { foreach ($attribute in $parameter.Attributes) {
         if ($attribute -is [System.Management.Automation.ArgumentCompleterAttribute]) {
-            if ($attribute -is [System.Management.Automation.ArgumentCompleterFactoryAttribute]) {
+            if ($factoryType -and $factoryType.IsInstanceOfType($attribute)) {
                 $global:NotypoInstance = $attribute.Create()
             } elseif ($attribute.Type) {
                 $global:NotypoInstance = [Activator]::CreateInstance($attribute.Type)
@@ -143,7 +147,7 @@ if ($env:NOTYPO_PS_COMPLETER) {
     } }
     if (-not $global:NotypoOriginal -and -not $global:NotypoInstance) {
         foreach ($attribute in $parameter.Attributes) {
-            if ($attribute -is [System.Management.Automation.ArgumentCompletionsAttribute]) { $global:NotypoInstance = $attribute; break }
+            if ($hintsType -and $hintsType.IsInstanceOfType($attribute)) { $global:NotypoInstance = $attribute; break }
         }
     }
 }
@@ -174,13 +178,14 @@ $callbacks = @{}
 $callbacks[$info.Name + ':' + $parameter.Name] = $wrapper
 $line = $env:NOTYPO_PS_LINE
 $cursor = [int]$env:NOTYPO_PS_CURSOR
-foreach ($name in 'NOTYPO_PS_DEFINITIONS', 'NOTYPO_PS_COMPLETER', 'NOTYPO_PS_NAME', 'NOTYPO_PS_MODULE', 'NOTYPO_PS_PARAMETER', 'NOTYPO_PS_LINE', 'NOTYPO_PS_CURSOR') {
+foreach ($name in 'NOTYPO_PS_DEFINITIONS', 'NOTYPO_PS_COMPLETER', 'NOTYPO_PS_NAME', 'NOTYPO_PS_MODULE', 'NOTYPO_PS_PARAMETER', 'NOTYPO_PS_LINE', 'NOTYPO_PS_CURSOR', 'NOTYPO_PS_ARGUMENTS', 'NOTYPO_PS_LOCATION') {
     [Environment]::SetEnvironmentVariable($name, $null)
 }
 $result = [System.Management.Automation.CommandCompletion]::CompleteInput($line, $cursor, @{ CustomArgumentCompleters = $callbacks })
 if ($global:NotypoFailure) { [Console]::Out.WriteLine('failed'); return }
 if ($null -eq $global:NotypoAnswered) { [Console]::Out.WriteLine('unanswered'); return }
 [Console]::Out.WriteLine('answered')
+[Console]::Out.WriteLine('range' + [char]9 + $result.ReplacementIndex + [char]9 + $result.ReplacementLength)
 if ($global:NotypoAnswered -eq 0) { return }
 foreach ($match in $result.CompletionMatches) {
     $fields = @('match', $match.CompletionText, [string]$match.ResultType, ([string]$match.ToolTip -replace '[\x00-\x1f\x7f]', ' '))
@@ -274,9 +279,11 @@ fn line_with_literals(
 const BIND_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
+if ($env:NOTYPO_PS_LOCATION) { Microsoft.PowerShell.Management\Set-Location -LiteralPath $env:NOTYPO_PS_LOCATION }
 if ($env:NOTYPO_PS_DEFINITIONS) { . ([scriptblock]::Create($env:NOTYPO_PS_DEFINITIONS)) }
 $lookup = @{ Name = [WildcardPattern]::Escape($env:NOTYPO_PS_NAME); CommandType = @('Function','Filter','Cmdlet'); ErrorAction = 'Stop' }
 if ($env:NOTYPO_PS_MODULE) { $lookup.Module = $env:NOTYPO_PS_MODULE }
+if ($env:NOTYPO_PS_ARGUMENTS) { $lookup.ArgumentList = @((Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $env:NOTYPO_PS_ARGUMENTS)) }
 $null = Microsoft.PowerShell.Core\Get-Command @lookup
 $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseInput($env:NOTYPO_PS_LINE, [ref]$null, [ref]$errors)
@@ -311,11 +318,22 @@ pub(super) fn bind_positional(
     let cursor = query_line.encode_utf16().count().to_string();
     let suffix = line_with_literals(description, context.following, context.literal_arguments.1)?;
     query_line.push_str(&suffix[command_name(description)?.len()..]);
+    let metadata = if description.contextual {
+        serde_json::to_string(&super::powershell::metadata_arguments(
+            description,
+            context,
+            true,
+        )?)
+        .expect("metadata arguments serialize")
+    } else {
+        String::new()
+    };
     let env = super::powershell::environment(&[
         ("NOTYPO_PS_NAME", &description.name),
         ("NOTYPO_PS_MODULE", &description.module),
         ("NOTYPO_PS_LINE", &query_line),
         ("NOTYPO_PS_CURSOR", &cursor),
+        ("NOTYPO_PS_ARGUMENTS", &metadata),
         (
             "NOTYPO_PS_DEFINITIONS",
             snapshot.map_or("", |s| s.definitions.as_str()),
@@ -399,21 +417,34 @@ pub(super) fn query_context(
     }
     let mut query_line =
         line_with_literals(description, context.words, context.literal_arguments.0)?;
+    let target_start = query_line.len();
     if !context.following.is_empty() {
         query_line.push_str("''");
     }
+    let target_end = query_line.len();
     let cursor = query_line.encode_utf16().count().to_string();
     if !context.following.is_empty() {
         let suffix =
             line_with_literals(description, context.following, context.literal_arguments.1)?;
         query_line.push_str(&suffix[command_name(description)?.len()..]);
     }
+    let metadata = if description.contextual {
+        serde_json::to_string(&super::powershell::metadata_arguments(
+            description,
+            context,
+            true,
+        )?)
+        .expect("metadata arguments serialize")
+    } else {
+        String::new()
+    };
     let env = super::powershell::environment(&[
         ("NOTYPO_PS_NAME", &description.name),
         ("NOTYPO_PS_MODULE", &description.module),
         ("NOTYPO_PS_PARAMETER", &parameter.name),
         ("NOTYPO_PS_LINE", &query_line),
         ("NOTYPO_PS_CURSOR", &cursor),
+        ("NOTYPO_PS_ARGUMENTS", &metadata),
         (
             "NOTYPO_PS_DEFINITIONS",
             snapshot.map_or("", |s| s.definitions.as_str()),
@@ -433,6 +464,14 @@ pub(super) fn query_context(
     .map(OsString::from)
     .to_vec();
     let text = super::run_stdout(shell, args, env, budget, true)?;
+    let text = super::powershell_completer::normalize_replacement(
+        &text,
+        &query_line,
+        crate::engine::parser::Span {
+            start: target_start,
+            end: target_end,
+        },
+    )?;
     parse(&text, budget.max_candidates)
 }
 

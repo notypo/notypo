@@ -42,7 +42,7 @@ pub(super) fn complete(
     };
     let builtins = list(backend, "builtins", budget)?;
     if !builtins.lines().any(|b| b.trim() == command) {
-        return Err(CompletionError::Unsupported(format!(
+        return Err(CompletionError::UnjudgedArguments(format!(
             "git {command} is not a builtin, so its arguments are not probed"
         )));
     }
@@ -287,7 +287,7 @@ mod tests {
         // `co` is an alias: git never runs it to learn its arguments.
         assert!(matches!(
             backend.complete(&["co"], "", &mut budget),
-            Err(CompletionError::Unsupported(_))
+            Err(CompletionError::UnjudgedArguments(_))
         ));
         assert!(!dir.0.join("bin/ran").exists());
         let calls = std::fs::read_to_string(dir.0.join("bin/calls")).unwrap();

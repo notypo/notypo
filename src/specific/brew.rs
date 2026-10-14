@@ -1,18 +1,14 @@
-use crate::utils::{run_stdout, which};
-use std::sync::OnceLock;
+use crate::engine::legacy;
+use crate::types::Command;
+use crate::utils::which;
 
 pub fn brew_available() -> bool {
     which("brew").is_some()
 }
 
-/// `brew --prefix`, memoized.
-pub fn get_brew_path_prefix() -> Option<&'static str> {
-    static PREFIX: OnceLock<Option<String>> = OnceLock::new();
-    PREFIX
-        .get_or_init(|| {
-            run_stdout("brew", &["--prefix"])
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-        })
-        .as_deref()
+/// `brew --prefix`, under the correction request's trust policy and budget.
+pub fn get_brew_path_prefix(command: &Command) -> Option<String> {
+    legacy::stdout(command, "brew", &["--prefix"])
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }

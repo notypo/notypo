@@ -190,7 +190,7 @@ pub(super) fn resources(backend: &Backend, words: &[&str]) -> bool {
     let Some(command) = args.first() else {
         return false;
     };
-    let memo = backend.memo.borrow();
+    let memo = backend.state.memo.borrow();
     let key = vec!["npm".to_owned(), String::new()];
     let Some(Ok(root)) = memo.get(&key) else {
         return false;

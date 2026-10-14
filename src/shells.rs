@@ -535,9 +535,10 @@ impl Shell {
                     notypo_specs=$(complete -p 2>/dev/null) notypo_found= notypo_files=
                     for notypo_word in $(fc -ln -2 2>/dev/null || fc -ln -1 2>/dev/null); do
                         while IFS= read -r notypo_spec; do
-                            case $notypo_spec in (*\" -F \"*\" $notypo_word\") ;; (*) continue;; esac
+                            case $notypo_spec in (*\" -F \"*\" $notypo_word\"|*\" -C \"*\" $notypo_word\"|*\" -W \"*\" $notypo_word\") ;; (*) continue;; esac
                             case $notypo_found in (*\"$notypo_spec\"*) continue;; esac
                             notypo_found=\"$notypo_found$notypo_spec\"$'\\n'
+                            case $notypo_spec in (*\" -F \"*) ;; (*) continue;; esac
                             notypo_function=${{notypo_spec#* -F }}
                             notypo_file=$(declare -F \"${{notypo_function%% *}}\")
                             notypo_files=\"$notypo_files ${{notypo_file#* * }}\"$'\\n'
@@ -550,8 +551,9 @@ impl Shell {
                             (*\" ${{notypo_line#* * }}\"$'\\n'*) notypo_names=\"$notypo_names ${{notypo_line%% *}}\";;
                         esac
                     done <<< \"$(declare -F $(compgen -A function))\"
-                    [ -n \"$notypo_names\" ] || exit 0
-                    notypo_text=\"$notypo_found#notypo-functions\"$'\\n'\"$(declare -f $notypo_names)\"
+                    notypo_definitions=
+                    [ -z \"$notypo_names\" ] || notypo_definitions=$(declare -f $notypo_names)
+                    notypo_text=\"$notypo_found#notypo-functions\"$'\\n'\"$notypo_definitions\"
                     [ ${{#notypo_text}} -le 65536 ] && printf '%s' \"$notypo_text\"
                 )\";
                 export TF_SHELL=bash;
@@ -685,14 +687,15 @@ impl Shell {
             // double quotes aren't globbed, while text inside backquotes
             // would be lexed again. `\!*` forwards the alias's arguments.
             Shell::Tcsh => {
-                let exe = exe.replace('\'', "'\\''");
-                format!(
-                    "alias {name} 'setenv NOTYPO_EXIT_STATUS $status; \
+                let body = format!(
+                    "setenv NOTYPO_EXIT_STATUS $status; \
                      setenv TF_SHELL tcsh; setenv TF_ALIAS {name}; \
                      setenv NOTYPO_CURRENT_COMMAND \"`history -h 2 | head -n 1`\"; \
+                     setenv TF_SHELL_ALIASES \"`alias | /usr/bin/tr '\\n' '\\036'`\"; \
                      eval \"`{exe} {PLACEHOLDER} \\!*`\"; \
-                     unsetenv NOTYPO_EXIT_STATUS NOTYPO_CURRENT_COMMAND'"
-                )
+                     unsetenv NOTYPO_EXIT_STATUS NOTYPO_CURRENT_COMMAND TF_SHELL_ALIASES"
+                );
+                format!("alias {name} '{}'", body.replace('\'', "'\\''"))
             }
             // `$?` is read first. The session's own error records for the
             // history entry stand in for an exit status and output: 127 when
@@ -706,6 +709,7 @@ impl Shell {
                  $notypo_event = Get-History -Count 1;\n    \
                  $history = $notypo_event.CommandLine;\n    \
                  if (-not [string]::IsNullOrWhiteSpace($history)) {{\n        \
+                 $env:NOTYPO_POWERSHELL_LOCATION = [string]$ExecutionContext.SessionState.Path.CurrentLocation;\n        \
                  $notypo_errors = @($global:Error | Where-Object {{ $_.InvocationInfo -and $_.InvocationInfo.HistoryId -eq $notypo_event.Id }});\n        \
                  [array]::Reverse($notypo_errors);\n        \
                  $notypo_failures = @($notypo_errors | Where-Object {{ $_.FullyQualifiedErrorId -notlike 'NativeCommandError*' }});\n        \
@@ -728,10 +732,9 @@ impl Shell {
                  $env:NOTYPO_SHELL_FUNCTIONS = (Get-ChildItem alias:, function: -Name) -join ' ';\n        \
                  {POWERSHELL_WRAPPERS}\n        \
                  $fuck = $(& {exe} $args);\n        \
-                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_POWERSHELL_COMPLETIONS, Env:NOTYPO_POWERSHELL_PARAMETERS, Env:NOTYPO_POWERSHELL_WRAPPERS, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
+                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_POWERSHELL_COMPLETIONS, Env:NOTYPO_POWERSHELL_PARAMETERS, Env:NOTYPO_POWERSHELL_WRAPPERS, Env:NOTYPO_POWERSHELL_LOCATION, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
                  if (-not [string]::IsNullOrWhiteSpace($fuck)) {{\n            \
-                 if ($fuck.StartsWith(\"echo\")) {{ $fuck = $fuck.Substring(5); }}\n            \
-                 else {{ iex \"$fuck\"; }}\n        }}\n    }}\n    [Console]::ResetColor() \n}}\n"
+                 Microsoft.PowerShell.Utility\\Invoke-Expression -Command $fuck;\n        }}\n    }}\n    [Console]::ResetColor() \n}}\n"
             ),
             // A POSIX function: `$?` is read before anything else runs, the
             // recent history lets notypo skip this call's own line (ksh's
@@ -836,14 +839,7 @@ impl Shell {
                 }
                 aliases
             }
-            Shell::Tcsh => utils::run_stdout("tcsh", &["-ic", "alias"])
-                .map(|out| {
-                    out.split('\n')
-                        .filter_map(|l| l.split_once('\t'))
-                        .map(|(n, v)| (n.into(), v.into()))
-                        .collect()
-                })
-                .unwrap_or_default(),
+            Shell::Tcsh => parse_aliases(self, &env::var("TF_SHELL_ALIASES").unwrap_or_default()),
             Shell::Powershell => parse_powershell_wrappers(
                 &env::var("NOTYPO_POWERSHELL_WRAPPERS").unwrap_or_default(),
             ),
@@ -1080,6 +1076,16 @@ impl Shell {
 /// Parses `alias` output from bash (`alias ll='ls -l'`), zsh (`ll='ls -l'`),
 /// or fish (`alias ll 'ls -l'`, read with fish's quoting).
 pub fn parse_aliases(shell: Shell, raw: &str) -> HashMap<String, String> {
+    if shell == Shell::Tcsh {
+        // Backquote substitution joins newlines in tcsh. The parent uses
+        // record separators so spaces in one alias cannot join another.
+        return raw
+            .split(['\n', '\u{1e}'])
+            .filter_map(|line| line.split_once('\t'))
+            .filter(|(name, value)| !name.is_empty() && !value.is_empty())
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect();
+    }
     if shell == Shell::Fish {
         return raw.lines().filter_map(parse_fish_alias).collect();
     }
@@ -1343,6 +1349,15 @@ mod tests {
         let zsh = parse_aliases(Shell::Zsh, "l='ls -CF'\nla='ls -A'\ngst=git status");
         assert_eq!(zsh["gst"], "git status");
         assert_eq!(zsh.len(), 3);
+    }
+
+    #[test]
+    fn parses_tcsh_aliases_from_the_parent_session() {
+        let aliases = parse_aliases(Shell::Tcsh, "gs\tgit status\u{1e}ll\tls -l\u{1e}");
+        assert_eq!(aliases["gs"], "git status");
+        assert_eq!(aliases["ll"], "ls -l");
+        assert_eq!(aliases.len(), 2);
+        assert!(parse_aliases(Shell::Tcsh, "broken\u{1e}\tno-name\u{1e}empty\t").is_empty());
     }
 
     /// fish's `alias` listing quotes values with fish's own rules.

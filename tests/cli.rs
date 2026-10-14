@@ -321,7 +321,7 @@ fn fake_aws(workspace: &Workspace) -> PathBuf {
     script("aws", "#!/bin/sh\ntouch \"$(dirname \"$0\")/ran\"\n");
     script(
         "aws_completer",
-        "#!/bin/sh\n# awscli test double\nline=${COMP_LINE#aws }\nprefix=${line##* }\ncontext=${line% *}\n[ \"$context\" = \"$line\" ] && context=\nwhile IFS='|' read -r pattern word; do\n  case $context in\n    $pattern) case $word in \"$prefix\"*) printf '%s\\n' \"$word\";; esac;;\n  esac\ndone < \"$(dirname \"$0\")/tree\"\n",
+        "#!/bin/sh\n# awscli test double\nline=$(printf '%s' \"$COMP_LINE\" | cut -c \"1-$COMP_POINT\")\nline=${line#aws }\nprefix=${line##* }\ncontext=${line% *}\n[ \"$context\" = \"$line\" ] && context=\nwhile IFS='|' read -r pattern word; do\n  case $context in\n    $pattern) case $word in \"$prefix\"*) printf '%s\\n' \"$word\";; esac;;\n  esac\ndone < \"$(dirname \"$0\")/tree\"\n",
     );
     fs::write(
         bin.join("tree"),
@@ -2158,6 +2158,12 @@ fn tcsh_alias_repairs_the_previous_event_without_reinterpreting_it() {
         return;
     };
     let workspace = Workspace::new();
+    let startup_marker = workspace.0.join("startup-marker");
+    fs::write(
+        workspace.0.join(".tcshrc"),
+        format!("touch '{}'\n", startup_marker.display()),
+    )
+    .unwrap();
     let bin = workspace.0.join("bin");
     fs::create_dir(&bin).unwrap();
     let git = bin.join("git");
@@ -2185,6 +2191,7 @@ fn tcsh_alias_repairs_the_previous_event_without_reinterpreting_it() {
     );
     let mut child = workspace
         .program(&tcsh, "")
+        .env("HOME", &workspace.0)
         .env("TF_SHELL", "tcsh")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .args(["-f", "-i"])
@@ -2212,6 +2219,7 @@ fn tcsh_alias_repairs_the_previous_event_without_reinterpreting_it() {
     );
     let mut child = workspace
         .program(&tcsh, "")
+        .env("HOME", &workspace.0)
         .env("TF_SHELL", "tcsh")
         .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
         .args(["-f", "-i"])
@@ -2230,6 +2238,10 @@ fn tcsh_alias_repairs_the_previous_event_without_reinterpreting_it() {
         "status [a b]\nstatus [*.txt]\nstatus [it's]\n",
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !startup_marker.exists(),
+        "alias discovery must not start an interactive tcsh"
     );
 }
 

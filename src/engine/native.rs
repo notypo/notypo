@@ -66,6 +66,9 @@ impl CompletionItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompletionError {
+    /// The app has resolved this command, but its remaining arguments have
+    /// no finite command vocabulary (for example, an opaque git alias).
+    UnjudgedArguments(String),
     /// The protocol can't answer for this position (for example, gcloud's
     /// static completion data has no positional arguments).
     Unsupported(String),
@@ -77,6 +80,7 @@ pub enum CompletionError {
 impl std::fmt::Display for CompletionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CompletionError::UnjudgedArguments(why) => write!(f, "unjudged arguments: {why}"),
             CompletionError::Unsupported(why) => write!(f, "unsupported: {why}"),
             CompletionError::Failed(why) => write!(f, "failed: {why}"),
             CompletionError::BudgetExhausted => f.write_str("probe budget exhausted"),
@@ -224,6 +228,51 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
         prefix: &str,
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError>;
+    /// Query a slot inside a command. Protocols whose cursor API exposes
+    /// the rest of the command receive those words too. Argument-vector
+    /// protocols that define completion only up to the cursor use `complete`.
+    fn complete_at(
+        &self,
+        words: &[&str],
+        prefix: &str,
+        _following: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        self.complete(words, prefix, budget)
+    }
+
+    /// Completion with lexical literal markers, used by binders where a
+    /// quoted dash-prefixed argument must not become a parameter name.
+    fn complete_context(
+        &self,
+        context: &ValueContext<'_>,
+        prefix: &str,
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        self.complete_at(context.words, prefix, context.following, budget)
+    }
+
+    /// Restore metadata for this position before capabilities, binding and
+    /// resource classification are read, including on provider memo hits.
+    fn prepare_query_context(
+        &self,
+        _context: &ValueContext<'_>,
+        _value_slot: bool,
+        _budget: &mut Budget,
+    ) -> Result<(), CompletionError> {
+        Ok(())
+    }
+    /// Shell callbacks must not receive made-up values for expansions that
+    /// have not been evaluated by the user's shell.
+    fn requires_literal_completion_context(&self) -> bool {
+        false
+    }
+    /// Whether later arguments can change this protocol's answer. False is
+    /// reserved for protocols verified to inspect only text before the cursor;
+    /// their command-only metadata can still use the persistent cache.
+    fn completion_uses_following(&self) -> bool {
+        true
+    }
     /// Where the answers come from, for reports (the completer's path).
     fn location(&self) -> String {
         self.id().to_owned()
@@ -304,6 +353,14 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
         self.complete_values(words, budget)
+    }
+
+    fn complete_offline_value_context(
+        &self,
+        context: &ValueContext<'_>,
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        self.complete_offline_values(context.words, budget)
     }
 
     /// Whether `typed`, missing from a partial list after `words`, is still
@@ -468,8 +525,16 @@ const AUDITED_GO_APPS: &[(&str, Flavor)] = &[
     ),
 ];
 
-/// Raw probe answers within one run, keyed by the arguments that asked.
-type ProbeMemo = Rc<RefCell<HashMap<Vec<String>, Result<String, CompletionError>>>>;
+/// Shared request state. Keeping both tables behind one allocation also
+/// keeps Discovery's largest variant small on Windows without boxing the
+/// public Backend or changing its identity fields.
+#[derive(Debug, Default)]
+struct RequestState {
+    /// Raw probe answers, keyed by the arguments that asked.
+    memo: RefCell<HashMap<Vec<String>, Result<String, CompletionError>>>,
+    /// Cobra contexts whose answer lets the shell complete files too.
+    cobra_files: RefCell<HashSet<Vec<String>>>,
+}
 
 #[derive(Clone, Debug)]
 pub struct Backend {
@@ -498,9 +563,7 @@ pub struct Backend {
     /// State of the later bridges, boxed together so `Backend` stays small
     /// (Clippy limits `Discovery::Found`'s size on Windows targets).
     bridge: Option<Box<Bridge>>,
-    memo: ProbeMemo,
-    /// cobra contexts whose answer let the shell complete files too.
-    cobra_files: Rc<RefCell<HashSet<Vec<String>>>>,
+    state: Rc<RequestState>,
 }
 
 #[derive(Clone, Debug)]
@@ -559,8 +622,7 @@ impl Backend {
                 }
                 _ => Trust::UserTrusted,
             },
-            memo: ProbeMemo::default(),
-            cobra_files: Rc::default(),
+            state: Rc::default(),
         }
     }
 
@@ -717,11 +779,11 @@ impl Backend {
         probe: impl FnOnce() -> Result<String, CompletionError>,
     ) -> Result<String, CompletionError> {
         let key: Vec<String> = key.iter().map(|k| k.to_string()).collect();
-        if let Some(hit) = self.memo.borrow().get(&key) {
+        if let Some(hit) = self.state.memo.borrow().get(&key) {
             return hit.clone();
         }
         let result = probe();
-        self.memo.borrow_mut().insert(key, result.clone());
+        self.state.memo.borrow_mut().insert(key, result.clone());
         result
     }
 }
@@ -2450,6 +2512,7 @@ impl NativeCompletionBackend for Backend {
         if self.flavor == Flavor::Cobra
             && !words.is_empty()
             && self
+                .state
                 .cobra_files
                 .borrow()
                 .iter()
@@ -2538,13 +2601,47 @@ impl NativeCompletionBackend for Backend {
     ) -> Result<Vec<CompletionItem>, CompletionError> {
         if self.flavor == Flavor::Git {
             let items = git::complete(self, words, prefix, budget)?;
-            return Ok(items
+            let items: Vec<_> = items
                 .into_iter()
                 .filter(|i| i.value.starts_with(prefix))
-                .take(budget.max_candidates)
-                .collect());
+                .take(budget.max_candidates.saturating_add(1))
+                .collect();
+            if items.len() > budget.max_candidates {
+                return Err(over_limit());
+            }
+            return Ok(items);
         }
         self.query(words, prefix, budget, offline_env(self.flavor))
+    }
+
+    fn complete_at(
+        &self,
+        words: &[&str],
+        prefix: &str,
+        following: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        if self.flavor == Flavor::Git {
+            return self.complete(words, prefix, budget);
+        }
+        self.query_at(words, prefix, following, budget, offline_env(self.flavor))
+    }
+
+    fn requires_literal_completion_context(&self) -> bool {
+        matches!(
+            self.flavor,
+            Flavor::BashFunction
+                | Flavor::FishScript
+                | Flavor::ZshFunction
+                | Flavor::PowerShellCompleter
+        )
+    }
+
+    fn completion_uses_following(&self) -> bool {
+        matches!(
+            self.flavor,
+            Flavor::BashFunction | Flavor::ZshFunction | Flavor::PowerShellCompleter
+        )
     }
 
     fn complete_values(
@@ -2606,6 +2703,40 @@ impl NativeCompletionBackend for Backend {
             return self.complete_values(words, budget);
         }
         self.query(words, "", budget, offline_env(self.flavor))
+    }
+
+    fn complete_values_with_following(
+        &self,
+        words: &[&str],
+        following: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        if !self.completion_uses_following() {
+            return self.complete_values(words, budget);
+        }
+        let env = if self.network {
+            network_env(self.flavor)
+        } else {
+            offline_env(self.flavor)
+        };
+        self.query_at(words, "", following, budget, env)
+    }
+
+    fn complete_offline_value_context(
+        &self,
+        context: &ValueContext<'_>,
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        if !self.completion_uses_following() {
+            return self.complete_offline_values(context.words, budget);
+        }
+        self.query_at(
+            context.words,
+            "",
+            context.following,
+            budget,
+            offline_env(self.flavor),
+        )
     }
 
     fn arguments_end_options(&self) -> bool {
@@ -2699,6 +2830,17 @@ impl Backend {
         &self,
         words: &[&str],
         prefix: &str,
+        budget: &mut Budget,
+        env: Vec<(OsString, Option<OsString>)>,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        self.query_at(words, prefix, &[], budget, env)
+    }
+
+    fn query_at(
+        &self,
+        words: &[&str],
+        prefix: &str,
+        following: &[&str],
         budget: &mut Budget,
         mut env: Vec<(OsString, Option<OsString>)>,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
@@ -2816,18 +2958,21 @@ impl Backend {
             }
         }
         if let Some(registration) = self.powershell_memory() {
-            let key = ["powershell-completer"]
+            let head = format!("powershell-completer:{}", words.len());
+            let key = [head.as_str()]
                 .into_iter()
                 .chain(words.iter().copied())
                 .chain([prefix])
+                .chain(following.iter().copied())
                 .collect::<Vec<_>>();
             let text = self.memoized(&key, || {
-                powershell_completer::query(
+                powershell_completer::query_at(
                     &self.completer,
                     registration,
                     &self.name,
                     words,
                     prefix,
+                    following,
                     env,
                     budget,
                 )
@@ -2842,12 +2987,13 @@ impl Backend {
                     return Err(CompletionError::Unsupported("no completion script".into()));
                 }
             };
-            return bash::complete(
+            return bash::complete_at(
                 &self.completer,
                 &source,
                 &self.name,
                 words,
                 prefix,
+                following,
                 env,
                 budget,
             );
@@ -2883,17 +3029,18 @@ impl Backend {
                     ));
                 }
             };
-            return zsh::complete(
+            return zsh::complete_at(
                 &self.completer,
                 &source,
                 &self.name,
                 words,
                 prefix,
+                following,
                 env,
                 budget,
             );
         }
-        let line = completion_line(&self.name, words, prefix);
+        let mut line = completion_line(&self.name, words, prefix);
         // aws_completer and gcloud's lookup slice the line as Python text;
         // argcomplete expects the byte offset bash supplies.
         let point = match self.flavor {
@@ -2926,6 +3073,10 @@ impl Backend {
             }
             Flavor::Azure | Flavor::Argcomplete | Flavor::Posener => line.len(),
         };
+        for word in following {
+            line.push(' ');
+            line.push_str(&shlex::quote(word));
+        }
         env.push(("COMP_LINE".into(), Some(line.into())));
         env.push(("COMP_POINT".into(), Some(point.to_string().into())));
         let capture = if matches!(self.flavor, Flavor::AwsCompleter | Flavor::Posener) {
@@ -3118,7 +3269,8 @@ impl Backend {
         // files besides the answer: rclone's remotes after `copy` are not
         // the only valid arguments, local paths are too.
         if directive & 4 == 0 && prefix.is_empty() {
-            self.cobra_files
+            self.state
+                .cobra_files
                 .borrow_mut()
                 .insert(words.iter().map(|word| word.to_string()).collect());
         }
@@ -3250,6 +3402,18 @@ pub(crate) mod tests {
 
     fn budget() -> Budget {
         Budget::new(Duration::from_secs(20), Duration::from_secs(10), 16)
+    }
+
+    #[test]
+    fn git_lists_over_the_candidate_limit_fail_instead_of_becoming_partial_authority() {
+        let dir = Dir::new("git-candidate-limit");
+        let app = dir.script("git", FAKE_GIT);
+        let backend = Backend::new(Flavor::Git, "git", app);
+        let mut budget = budget();
+        budget.max_candidates = 1;
+        assert!(
+            matches!(backend.complete(&[], "", &mut budget), Err(CompletionError::Failed(why)) if why.contains("candidate limit"))
+        );
     }
 
     /// A git double that records every invocation, so tests can check that

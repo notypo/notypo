@@ -19,6 +19,7 @@ pub mod cache;
 mod data_help;
 pub mod diagnosis;
 pub mod docs;
+pub(crate) mod legacy;
 pub mod native;
 pub mod parser;
 pub mod probe;
@@ -229,6 +230,8 @@ pub struct Report {
     /// Capability limits, discovery results, and probe failures.
     pub notes: Vec<String>,
     pub probes: usize,
+    /// Transferred once to lazy compatibility discovery in the CLI.
+    pub(crate) discovery_budget: std::sync::Mutex<Option<Budget>>,
 }
 
 /// Reads the status the shell function captured before it ran anything.
@@ -268,11 +271,13 @@ pub fn correct_with_backends(
     if let Some(native) = run.native.as_mut() {
         native.persist();
     }
+    let probes = run.budget.spawned();
     Report {
         outcome,
         suspicions: run.suspicions,
-        probes: run.budget.spawned(),
+        probes,
         notes: run.notes,
+        discovery_budget: std::sync::Mutex::new(Some(run.budget)),
     }
 }
 
@@ -619,7 +624,7 @@ impl<'a> Run<'a> {
         Run {
             failure,
             ctx,
-            budget: Budget::for_timeout(settings.probe_timeout),
+            budget: Budget::for_timeout(settings.probe_timeout).with_cwd(failure.cwd.as_deref()),
             notes,
             native: enabled(Source::NativeCompletion).then(|| {
                 providers::NativeCompletion::new(
@@ -1653,6 +1658,8 @@ impl<'a> Run<'a> {
             context: &[],
             command_path: &[],
             typed: name,
+            following: Some(&[]),
+            literal_arguments: (&[], &[]),
             fresh: false,
         };
         let providers::Answer::Words(vocabulary) = provider.vocabulary(&slot, &mut self.budget)
@@ -1758,7 +1765,7 @@ impl<'a> Run<'a> {
                 detail: format!("`{head}` is installed and `{name}` starts with it"),
             });
             if !tail.starts_with('-') {
-                match self.check(&state, TokenRole::Subcommand, tail) {
+                match self.check(&state, TokenRole::Subcommand, tail, &[]) {
                     Check::Valid {
                         confirmed: true, ..
                     } => {
@@ -1796,9 +1803,15 @@ impl<'a> Run<'a> {
 
     /// Asks the app's completer about one word of the walk, or, for apps
     /// without one, what documentation and history know.
-    fn check(&mut self, state: &State, role: TokenRole, typed: &str) -> Check {
+    fn check(
+        &mut self,
+        state: &State,
+        role: TokenRole,
+        typed: &str,
+        following: &[parser::Word],
+    ) -> Check {
         let mut check = if self.has_native(state) {
-            self.native_check(state, role, typed)
+            self.native_check(state, role, typed, following)
         } else {
             self.fallback_check(state, role, typed)
         };
@@ -1830,10 +1843,36 @@ impl<'a> Run<'a> {
         check
     }
 
-    fn native_check(&mut self, state: &State, role: TokenRole, typed: &str) -> Check {
+    fn native_check(
+        &mut self,
+        state: &State,
+        role: TokenRole,
+        typed: &str,
+        following: &[parser::Word],
+    ) -> Check {
         let Some(native) = self.native.as_mut() else {
             return Check::Unknown;
         };
+        let following_literals: Vec<usize> = following
+            .iter()
+            .enumerate()
+            .filter_map(|(index, word)| {
+                (state.powershell
+                    && word.literal().is_some_and(|value| value.starts_with('-'))
+                    && word
+                        .option_name_span_with(&self.failure.source, ':')
+                        .is_none())
+                .then_some(index)
+            })
+            .collect();
+        let following: Option<Vec<String>> = (!state.opaque_context)
+            .then(|| {
+                following
+                    .iter()
+                    .map(|word| word.literal().map(str::to_owned))
+                    .collect()
+            })
+            .flatten();
         let mut slot = providers::Slot {
             role,
             program: &state.program,
@@ -1841,6 +1880,8 @@ impl<'a> Run<'a> {
             context: &state.context,
             command_path: &state.command_path,
             typed,
+            following: following.as_deref(),
+            literal_arguments: (&state.literal_arguments, &following_literals),
             fresh: false,
         };
         let mut answer = native.vocabulary(&slot, &mut self.budget);
@@ -1848,12 +1889,22 @@ impl<'a> Run<'a> {
         // calling a word invalid or a level free of subcommands.
         if let providers::Answer::Words(vocabulary) = &answer
             && vocabulary.cached
-            && (vocabulary.words.is_empty() || !vocabulary.contains(typed))
+            && (vocabulary.words.is_empty()
+                || !vocabulary.contains(typed)
+                || self.diagnosis.mentions(
+                    if role == TokenRole::OptionName {
+                        ProblemKind::UnknownOption
+                    } else {
+                        ProblemKind::UnknownCommand
+                    },
+                    typed,
+                ))
         {
             slot.fresh = true;
             answer = native.vocabulary(&slot, &mut self.budget);
         }
         match answer {
+            providers::Answer::Arguments => Check::Arguments,
             providers::Answer::Words(vocabulary) => {
                 if let Some(word) = vocabulary.words.iter().find(|w| w.value == typed) {
                     Check::Valid {
@@ -1950,6 +2001,8 @@ impl<'a> Run<'a> {
             context: &state.context,
             command_path: &state.command_path,
             typed,
+            following: Some(&[]),
+            literal_arguments: (&[], &[]),
             fresh: false,
         };
         let answers = [
@@ -2198,7 +2251,7 @@ impl<'a> Run<'a> {
                 } else {
                     (TokenRole::Subcommand, text)
                 };
-                let vocabulary = match self.check(&state, role, typed) {
+                let vocabulary = match self.check(&state, role, typed, &words[i + 1..]) {
                     Check::Valid {
                         takes_value,
                         confirmed,
@@ -2519,6 +2572,8 @@ impl<'a> Run<'a> {
                 context: &context,
                 command_path: &state.command_path,
                 typed,
+                following: Some(&[]),
+                literal_arguments: (&[], &[]),
                 fresh: false,
             };
             match self.help.as_mut()?.vocabulary(&slot, &mut self.budget) {
@@ -2736,6 +2791,8 @@ impl<'a> Run<'a> {
                 context: &[],
                 command_path: &[],
                 typed: &problem.token,
+                following: Some(&[]),
+                literal_arguments: (&[], &[]),
                 fresh: false,
             };
             let Some(providers::Answer::Words(vocabulary)) = self
@@ -3045,7 +3102,8 @@ mod tests {
     /// command surface between requests.
     const TREE_COMPLETER: &str = r#"#!/bin/sh
 # awscli test double
-line=${COMP_LINE#aws }
+line=$(printf '%s' "$COMP_LINE" | cut -c "1-$COMP_POINT")
+line=${line#aws }
 prefix=${line##* }
 context=${line% *}
 [ "$context" = "$line" ] && context=
@@ -4197,8 +4255,49 @@ esac
         assert_eq!(run(Ok(Vec::new()), false).as_deref(), Some("tool build"));
         let broken = Err(native::CompletionError::Failed("exited with 2".into()));
         assert_eq!(run(broken, false).as_deref(), Some("tool build"));
+        let unsupported = Err(native::CompletionError::Unsupported(
+            "no data for this slot".into(),
+        ));
+        assert_eq!(run(unsupported, true).as_deref(), Some("tool build"));
         // A complete list with nothing in it means no subcommands here.
         assert_eq!(run(Ok(Vec::new()), true), None);
+    }
+
+    #[test]
+    fn discovery_uses_the_failure_directory_without_changing_the_parent_directory() {
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let fake = fake_aws();
+        let cwd = fake.dir.0.join("workspace");
+        fs::create_dir(&cwd).unwrap();
+        fs::write(cwd.join("completion-context"), "").unwrap();
+        let app = fake
+            .dir
+            .script("bin/tool", "#!/bin/sh\ntouch operation-marker\n");
+        let helper = fake.dir.script("_tool.bash", "_tool() { [ -f completion-context ] && COMPREPLY=(build deploy); }\ncomplete -F _tool tool\n");
+        let backend =
+            native::Backend::new(native::Flavor::BashFunction, "tool", bash).with_helper(helper);
+        let ctx = Context::new(Settings::default(), Shell::Bash, "typo".into())
+            .with_which("tool", Some(app.to_str().unwrap()))
+            .with_which("man", None)
+            .with_aliases(&[])
+            .with_history::<&str>(&[]);
+        let mut failed = failure("tool biuld");
+        failed.cwd = Some(cwd.clone());
+        let parent = std::env::current_dir().unwrap();
+        let report = correct_with_backends(
+            &failed,
+            &ctx,
+            vec![("tool".into(), std::rc::Rc::new(backend))],
+        );
+        assert_eq!(
+            report.outcome.candidates()[0].script,
+            "tool build",
+            "{report:?}"
+        );
+        assert_eq!(std::env::current_dir().unwrap(), parent);
+        assert!(!cwd.join("operation-marker").exists());
     }
 
     const NESTED_HELP: &str = r#"#!/bin/sh
@@ -4665,7 +4764,7 @@ esac
             &format!("sdk/bin/{app}"),
             &format!(
                 "#!/bin/sh\n{marker}\n[ \"$_ARGCOMPLETE\" = 1 ] || {{ touch \"$(dirname \"$0\")/ran\"; exit 0; }}\n\
-line=${{COMP_LINE#{app} }}\nprefix=${{line##* }}\ncontext=${{line% *}}\n[ \"$context\" = \"$line\" ] && context=\n\
+line=$(printf '%s' \"$COMP_LINE\" | cut -c \"1-$COMP_POINT\")\nline=${{line#{app} }}\nprefix=${{line##* }}\ncontext=${{line% *}}\n[ \"$context\" = \"$line\" ] && context=\n\
 while IFS='|' read -r pattern word; do\n  case $context in\n    $pattern) case $word in \"$prefix\"*) printf '%s\\v' \"$word\" >&8;; esac;;\n  esac\n\
 done < \"$(dirname \"$0\")/tree\"\n"
             ),
@@ -5160,6 +5259,30 @@ esac
     }
 
     #[test]
+    fn captured_errors_refresh_even_previously_valid_cached_words() {
+        let fake = fake_aws();
+        let ctx = context(&fake);
+        let initial = correct(&failure("aws ec2 describe-instances --dry-run"), &ctx);
+        assert!(matches!(initial.outcome, Outcome::NoCorrection(_)));
+        fs::write(
+            fake.dir.0.join("bin/tree"),
+            TREE.replace("ec2|describe-instances\n", "ec2|describe-instants\n"),
+        )
+        .unwrap();
+        let mut failed = failure("aws ec2 describe-instances");
+        failed.output = CapturedOutput::Combined {
+            text: "error: unknown command 'describe-instances'".into(),
+            origin: OutputOrigin::ShellLogger,
+        };
+        let refreshed = correct(&failed, &ctx);
+        let corrected = scripts(&refreshed.outcome);
+        assert_eq!(corrected.first(), Some(&"aws ec2 describe-instants"));
+        assert!(!corrected.contains(&"aws ec2 describe-instances"));
+        assert!(refreshed.probes > 0);
+        assert!(!fake.dir.0.join("bin/ran").exists());
+    }
+
+    #[test]
     fn option_values_are_checked_against_the_apps_list() {
         let fake = fake_aws();
         let ctx = context(&fake);
@@ -5494,6 +5617,7 @@ esac
             module: "Microsoft.PowerShell.Management".into(),
             shipped: true,
             open,
+            contextual: false,
             parameters,
         };
         let gci = describe(

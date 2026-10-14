@@ -196,11 +196,17 @@ impl Protocol {
             Mode::Probe(budget) => budget,
             Mode::Memo => {
                 let key: Vec<String> = key.iter().map(|k| k.to_string()).collect();
-                return backend.memo.borrow().get(&key).cloned().unwrap_or_else(|| {
-                    Err(CompletionError::Failed(
-                        "urfave/cli level was not queried in this request".into(),
-                    ))
-                });
+                return backend
+                    .state
+                    .memo
+                    .borrow()
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Err(CompletionError::Failed(
+                            "urfave/cli level was not queried in this request".into(),
+                        ))
+                    });
             }
         };
         self.permit(backend, !path.is_empty())?;

@@ -35,6 +35,7 @@ use std::rc::Rc;
 const SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
+if ($env:NOTYPO_PS_LOCATION) { Microsoft.PowerShell.Management\Set-Location -LiteralPath $env:NOTYPO_PS_LOCATION }
 $tab = [string][char]9
 function __notypo_emit([string[]] $Fields) {
     foreach ($field in $Fields) { if ($field -match '[\x00-\x1f\x7f]') { return } }
@@ -82,6 +83,7 @@ if (-not ($shipped -or $trusted -contains '*' -or $trusted -contains ('module:' 
 }
 $lookup = @{ Name = $command.Name; CommandType = $command.CommandType }
 if ($command.Module) { $lookup.Module = $module }
+if ($env:NOTYPO_PS_ARGUMENTS) { $lookup.ArgumentList = @((Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $env:NOTYPO_PS_ARGUMENTS)) }
 $info = Microsoft.PowerShell.Core\Get-Command @lookup | Microsoft.PowerShell.Utility\Select-Object -First 1
 $reflection = [System.Reflection.BindingFlags]'NonPublic,Instance'
 $context = $ExecutionContext.GetType().GetField('_context', $reflection).GetValue($ExecutionContext)
@@ -95,12 +97,15 @@ $open = -not $binding
 $common = @([System.Management.Automation.Cmdlet]::CommonParameters) + @([System.Management.Automation.Cmdlet]::OptionalCommonParameters)
 if ($binding -and $binding.SupportsPaging) { $common += 'First', 'Skip', 'IncludeTotalCount' }
 $parameters = @(if ($info.Parameters) { $info.Parameters.Values })
+$argumentHintsType = 'System.Management.Automation.ArgumentCompletionsAttribute' -as [type]
 foreach ($parameter in $parameters) {
     foreach ($attribute in $parameter.Attributes) {
         if ($attribute -is [System.Management.Automation.ParameterAttribute] -and $attribute.ValueFromRemainingArguments) { $open = $true }
     }
 }
 __notypo_emit 'command', $info.Name, ([string]$info.CommandType), $module, $(if ($shipped) { 'shipped' } else { 'trusted' }), $(if ($open) { 'open' } else { 'closed' })
+if (($info -is [System.Management.Automation.CmdletInfo] -and [System.Management.Automation.IDynamicParameters].IsAssignableFrom($info.ImplementingType)) -or
+    ($info -is [System.Management.Automation.FunctionInfo] -and ($info.ScriptBlock.Ast.DynamicParamBlock -or $info.ScriptBlock.Ast.Body.DynamicParamBlock))) { __notypo_emit 'contextual' }
 foreach ($parameter in $parameters) {
     __notypo_emit 'parameter', $parameter.Name, $(if ($parameter.SwitchParameter) { 'switch' } else { 'value' }), $(if ($common -contains $parameter.Name) { 'common' } else { 'declared' }), $(if ($parameter.IsDynamic) { 'dynamic' } else { 'static' })
     if (@($parameter.ParameterSets.Values | Microsoft.PowerShell.Core\Where-Object { $_.Position -ge 0 }).Count) { __notypo_emit 'positional', $parameter.Name }
@@ -118,7 +123,7 @@ foreach ($parameter in $parameters) {
             foreach ($value in $attribute.ValidValues) { __notypo_emit 'value', $parameter.Name, $value }
             if (-not $attribute.IgnoreCase) { __notypo_emit 'exact', $parameter.Name }
         }
-        if ($attribute -is [System.Management.Automation.ArgumentCompleterAttribute] -or $attribute -is [System.Management.Automation.ArgumentCompletionsAttribute]) { __notypo_emit 'completer', $parameter.Name }
+        if ($attribute -is [System.Management.Automation.ArgumentCompleterAttribute] -or ($argumentHintsType -and $argumentHintsType.IsInstanceOfType($attribute))) { __notypo_emit 'completer', $parameter.Name }
     }
     if ($callbacks -and ($callbacks.ContainsKey($info.Name + ':' + $parameter.Name) -or $callbacks.ContainsKey($parameter.Name))) { __notypo_emit 'completer', $parameter.Name }
 }
@@ -188,6 +193,8 @@ pub struct Description {
     /// Parameters it doesn't declare are accepted too: a simple function's
     /// `$args`, or a parameter taking the remaining arguments.
     pub open: bool,
+    /// Dynamic parameter metadata can depend on bound literal arguments.
+    pub contextual: bool,
     pub parameters: Vec<Parameter>,
 }
 
@@ -281,9 +288,11 @@ pub fn parse(text: &str) -> Result<Answer, String> {
                     module: (*module).to_owned(),
                     shipped: *origin == "shipped",
                     open: *open == "open",
+                    contextual: false,
                     parameters: Vec::new(),
                 });
             }
+            (["contextual"], Some(d)) if !d.contextual => d.contextual = true,
             (["parameter", name, arity, role, origin], Some(d))
                 if parameter_name(name)
                     && matches!(*arity, "switch" | "value")
@@ -382,9 +391,15 @@ pub(super) fn environment(query: &[(&str, &str)]) -> Vec<(OsString, Option<OsStr
             "NOTYPO_PS_SESSION",
             "NOTYPO_PS_CURSOR",
             "NOTYPO_PS_MODULE",
+            "NOTYPO_PS_ARGUMENTS",
+            "NOTYPO_PS_LOCATION",
         ]
         .map(|k| (OsString::from(k), None)),
     );
+    env.push((
+        "NOTYPO_PS_LOCATION".into(),
+        std::env::var_os("NOTYPO_POWERSHELL_LOCATION"),
+    ));
     env.extend(query.iter().map(|(k, v)| set(k, v)));
     env
 }
@@ -451,12 +466,16 @@ pub struct Command {
     shell: PathBuf,
     trusted: String,
     described: RefCell<Option<Result<Rc<Description>, CompletionError>>>,
+    active: RefCell<Option<Rc<Description>>>,
+    contextual: RefCell<ContextualDescriptions>,
     snapshot: Result<Option<Snapshot>, CompletionError>,
     positional_bindings: RefCell<PositionalBindings>,
 }
 
 type PositionalBindings = HashMap<PositionalKey, Result<Option<Parameter>, CompletionError>>;
 type PositionalKey = (Vec<String>, Vec<String>, Vec<usize>, Vec<usize>);
+type ContextualDescriptions =
+    HashMap<(PositionalKey, bool), Result<Rc<Description>, CompletionError>>;
 
 impl Command {
     pub fn new(name: &str, shell: PathBuf, trusted: &[String]) -> Command {
@@ -465,6 +484,8 @@ impl Command {
             shell,
             trusted: trust_entries(trusted),
             described: RefCell::new(None),
+            active: RefCell::new(None),
+            contextual: RefCell::new(HashMap::new()),
             snapshot: powershell_values::memory(name),
             positional_bindings: RefCell::new(HashMap::new()),
         }
@@ -477,6 +498,8 @@ impl Command {
             shell: PathBuf::new(),
             trusted: String::new(),
             described: RefCell::new(Some(Ok(Rc::new(description)))),
+            active: RefCell::new(None),
+            contextual: RefCell::new(HashMap::new()),
             snapshot: Ok(None),
             positional_bindings: RefCell::new(HashMap::new()),
         }
@@ -486,6 +509,18 @@ impl Command {
         if let Some(known) = self.described.borrow().as_ref() {
             return known.clone();
         }
+        let result = self.query_description(None, budget);
+        if result != Err(CompletionError::BudgetExhausted) {
+            *self.described.borrow_mut() = Some(result.clone());
+        }
+        result
+    }
+
+    fn query_description(
+        &self,
+        arguments: Option<&[String]>,
+        budget: &mut Budget,
+    ) -> Result<Rc<Description>, CompletionError> {
         let snapshot = self.snapshot.as_ref().map_err(Clone::clone)?;
         let definitions = if let Some(snapshot) = snapshot {
             if !snapshot.definitions.is_empty() {
@@ -506,6 +541,9 @@ impl Command {
             ""
         };
         let answer = if is_command_name(&self.name) {
+            let arguments = arguments
+                .map(|arguments| serde_json::to_string(arguments).expect("string array serializes"))
+                .unwrap_or_default();
             run(
                 &self.shell,
                 &[
@@ -513,6 +551,7 @@ impl Command {
                     ("NOTYPO_PS_NAME", &self.name),
                     ("NOTYPO_PS_TRUSTED", &self.trusted),
                     ("NOTYPO_PS_DEFINITIONS", definitions),
+                    ("NOTYPO_PS_ARGUMENTS", &arguments),
                     (
                         "NOTYPO_PS_SESSION",
                         if snapshot.as_ref().is_some_and(|s| s.session) {
@@ -531,7 +570,7 @@ impl Command {
                 self.name
             )))
         };
-        let result = match answer {
+        match answer {
             Ok(Answer::Described(description)) => Ok(Rc::new(description)),
             Ok(Answer::Missing) => Err(CompletionError::Failed(format!(
                 "PowerShell without your profile has no command `{}`",
@@ -542,16 +581,42 @@ impl Command {
                  describe it; add `powershell:{module}` to trusted_completers to allow that"
             ))),
             Err(error) => Err(error),
-        };
-        // A spent budget may recover on a later request; other answers stand.
-        if result != Err(CompletionError::BudgetExhausted) {
-            *self.described.borrow_mut() = Some(result.clone());
         }
-        result
     }
 
     fn known(&self) -> Option<Rc<Description>> {
-        self.described.borrow().as_ref()?.as_ref().ok().cloned()
+        self.active
+            .borrow()
+            .clone()
+            .or_else(|| self.described.borrow().as_ref()?.as_ref().ok().cloned())
+    }
+
+    fn describe_context(
+        &self,
+        context: &ValueContext<'_>,
+        value_slot: bool,
+        budget: &mut Budget,
+    ) -> Result<Rc<Description>, CompletionError> {
+        let base = self.describe(budget)?;
+        if !base.contextual || context.words.is_empty() && context.following.is_empty() {
+            *self.active.borrow_mut() = Some(base.clone());
+            return Ok(base);
+        }
+        let key = (Self::positional_key(context), value_slot);
+        let cached = self.contextual.borrow().get(&key).cloned();
+        let result = match cached {
+            Some(known) => known,
+            None => {
+                let known = self.known().unwrap_or_else(|| base.clone());
+                metadata_arguments(&known, context, value_slot)
+                    .and_then(|arguments| self.query_description(Some(&arguments), budget))
+            }
+        };
+        if result != Err(CompletionError::BudgetExhausted) {
+            self.contextual.borrow_mut().insert(key, result.clone());
+        }
+        *self.active.borrow_mut() = result.as_ref().ok().cloned();
+        result
     }
 
     fn session_trusted(&self, name: &str) -> bool {
@@ -665,11 +730,48 @@ impl super::NativeCompletionBackend for Command {
 
     fn complete(
         &self,
-        _words: &[&str],
+        words: &[&str],
         prefix: &str,
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
-        let description = self.describe(budget)?;
+        self.complete_context(
+            &ValueContext {
+                words,
+                following: &[],
+                literal_arguments: (&[], &[]),
+                positional: false,
+            },
+            prefix,
+            budget,
+        )
+    }
+
+    fn complete_at(
+        &self,
+        words: &[&str],
+        prefix: &str,
+        following: &[&str],
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        self.complete_context(
+            &ValueContext {
+                words,
+                following,
+                literal_arguments: (&[], &[]),
+                positional: false,
+            },
+            prefix,
+            budget,
+        )
+    }
+
+    fn complete_context(
+        &self,
+        context: &ValueContext<'_>,
+        prefix: &str,
+        budget: &mut Budget,
+    ) -> Result<Vec<CompletionItem>, CompletionError> {
+        let description = self.describe_context(context, false, budget)?;
         if !prefix.starts_with('-') {
             return Ok(Vec::new());
         }
@@ -680,6 +782,21 @@ impl super::NativeCompletionBackend for Command {
             .map(Command::option)
             .filter(|item| item.value.to_lowercase().starts_with(&typed))
             .collect())
+    }
+
+    fn requires_literal_completion_context(&self) -> bool {
+        self.known()
+            .is_none_or(|description| description.contextual)
+    }
+
+    fn prepare_query_context(
+        &self,
+        context: &ValueContext<'_>,
+        value_slot: bool,
+        budget: &mut Budget,
+    ) -> Result<(), CompletionError> {
+        self.describe_context(context, value_slot, budget)
+            .map(|_| ())
     }
 
     fn location(&self) -> String {
@@ -705,16 +822,7 @@ impl super::NativeCompletionBackend for Command {
         following: &[&str],
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
-        let description = self.describe(budget)?;
-        let Some(option) = words.last().filter(|w| w.starts_with('-')) else {
-            return Ok(Vec::new());
-        };
-        let Binding::Bound(parameter) = description.bind(option) else {
-            return Ok(Vec::new());
-        };
-        self.parameter_values(
-            &description,
-            parameter,
+        self.complete_value_context(
             &ValueContext {
                 words,
                 following,
@@ -751,7 +859,7 @@ impl super::NativeCompletionBackend for Command {
         context: &ValueContext<'_>,
         budget: &mut Budget,
     ) -> Result<Vec<CompletionItem>, CompletionError> {
-        let description = self.describe(budget)?;
+        let description = self.describe_context(context, true, budget)?;
         if !context.positional {
             let Some(option) = context.words.last().filter(|w| w.starts_with('-')) else {
                 return Ok(Vec::new());
@@ -863,7 +971,7 @@ impl super::NativeCompletionBackend for Command {
         typed: &str,
         budget: &mut Budget,
     ) -> Option<CompletionItem> {
-        let description = self.describe(budget).ok()?;
+        let description = self.known().or_else(|| self.describe(budget).ok())?;
         // `-?` asks for help.
         if typed == "-?" {
             return Some(CompletionItem {
@@ -877,6 +985,88 @@ impl super::NativeCompletionBackend for Command {
             _ => None,
         }
     }
+}
+
+/// Get-Command's ArgumentList distinguishes named parameters from positional
+/// data through `--`, rather than source quotes. Put named bindings first and
+/// preserve the order of positional arguments after that delimiter.
+pub(super) fn metadata_arguments(
+    description: &Description,
+    context: &ValueContext<'_>,
+    value_slot: bool,
+) -> Result<Vec<String>, CompletionError> {
+    let before = context
+        .words
+        .len()
+        .saturating_sub(usize::from(value_slot && !context.positional));
+    let words: Vec<_> = context.words[..before]
+        .iter()
+        .enumerate()
+        .map(|(index, word)| (*word, context.literal_arguments.0.contains(&index)))
+        .chain(
+            context
+                .following
+                .iter()
+                .enumerate()
+                .map(|(index, word)| (*word, context.literal_arguments.1.contains(&index))),
+        )
+        .collect();
+    let mut named = Vec::new();
+    let mut positional = Vec::new();
+    let mut index = 0;
+    let mut after_delimiter = false;
+    while let Some(&(word, literal)) = words.get(index) {
+        if word.contains(char::is_control) {
+            return Err(CompletionError::Unsupported(
+                "PowerShell metadata context contains control characters".into(),
+            ));
+        }
+        if !literal && word == "--" {
+            after_delimiter = true;
+        } else if !literal
+            && !after_delimiter
+            && word
+                .strip_prefix('-')
+                .is_some_and(|rest| rest.starts_with(char::is_alphabetic))
+        {
+            let (name, attached) = word
+                .split_once(':')
+                .map_or((word, None), |(name, value)| (name, Some(value)));
+            let Binding::Bound(parameter) = description.bind(name) else {
+                return Err(CompletionError::Unsupported(format!(
+                    "PowerShell metadata context contains an unresolved parameter {name}"
+                )));
+            };
+            let canonical = format!("-{}", parameter.name);
+            if let Some(value) = attached {
+                named.push(format!("{canonical}:{value}"));
+            } else if parameter.switch {
+                named.push(canonical);
+            } else {
+                let Some(&(value, _)) = words.get(index + 1) else {
+                    return Err(CompletionError::Unsupported(format!(
+                        "PowerShell metadata context lacks a value for {name}"
+                    )));
+                };
+                if value.contains(char::is_control) {
+                    return Err(CompletionError::Unsupported(
+                        "PowerShell metadata context contains control characters".into(),
+                    ));
+                }
+                named.push(canonical);
+                named.push(value.to_owned());
+                index += 1;
+            }
+        } else {
+            positional.push(word.to_owned());
+        }
+        index += 1;
+    }
+    if !positional.is_empty() {
+        named.push("--".into());
+        named.extend(positional);
+    }
+    Ok(named)
 }
 
 fn prepare_values(
@@ -934,6 +1124,176 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn metadata_arguments_keep_quoted_dash_data_and_named_bindings() {
+        let description = Description {
+            name: "Get-Fixture".into(),
+            parameters: vec![
+                parameter("Scope", &["s"], false),
+                parameter("Target", &[], false),
+                Parameter {
+                    switch: true,
+                    ..parameter("Loud", &[], false)
+                },
+            ],
+            ..Description::default()
+        };
+        let context = ValueContext {
+            words: &["-west", "-s", "east", "-Loud"],
+            following: &["-Scope"],
+            literal_arguments: (&[0], &[0]),
+            positional: false,
+        };
+        assert_eq!(
+            metadata_arguments(&description, &context, false).unwrap(),
+            ["-Scope", "east", "-Loud", "--", "-west", "-Scope"]
+        );
+        let context = ValueContext {
+            words: &["-Scope:-west", "-Target"],
+            following: &[],
+            literal_arguments: (&[], &[]),
+            positional: false,
+        };
+        assert_eq!(
+            metadata_arguments(&description, &context, true).unwrap(),
+            ["-Scope:-west"]
+        );
+        assert!(metadata_arguments(&description, &context, false).is_err());
+    }
+
+    #[test]
+    fn real_dynamic_metadata_uses_both_sides_and_never_runs_the_operation() {
+        let Some(shell) = pwsh() else { return };
+        let dir = super::super::tests::Dir::new("ps-dynamic-metadata");
+        let marker = dir.0.join("operation");
+        let definitions = r#"function Get-DynamicFixture {
+ [CmdletBinding()] param([string]$Scope)
+ dynamicparam {
+  $set = [System.Management.Automation.RuntimeDefinedParameterDictionary]::new()
+  if ($Scope -in @('west','-west')) {
+   $attributes = [System.Collections.ObjectModel.Collection[System.Attribute]]::new()
+   $attributes.Add([System.Management.Automation.ParameterAttribute]::new())
+   $attributes.Add([System.Management.Automation.ValidateSetAttribute]::new([string[]]@('one','two')))
+   $set.Add('Flavor', [System.Management.Automation.RuntimeDefinedParameter]::new('Flavor',[string],$attributes))
+  }
+  $set
+ }
+ process { [IO.File]::WriteAllText('OPERATION_MARKER','ran') }
+}"#.replace("OPERATION_MARKER", &marker.to_string_lossy().replace('\'', "''"));
+        let mut backend = Command::new("Get-DynamicFixture", shell, &["Get-DynamicFixture".into()]);
+        let mut snapshot = Snapshot::default();
+        snapshot.session = true;
+        snapshot.portable = true;
+        snapshot.definitions = definitions;
+        backend.snapshot = Ok(Some(snapshot));
+        let mut probes = budget();
+        assert!(backend.describe(&mut probes).unwrap().contextual);
+        for (before, after, literals, expected) in [
+            (vec!["-Scope", "west"], vec![], vec![], true),
+            (vec![], vec!["-Scope", "east"], vec![], false),
+            (vec![], vec!["-Scope", "west"], vec![], true),
+            (vec!["-west"], vec![], vec![0], true),
+        ] {
+            let context = ValueContext {
+                words: &before,
+                following: &after,
+                literal_arguments: (&literals, &[]),
+                positional: false,
+            };
+            let options = backend
+                .complete_context(&context, "-", &mut probes)
+                .unwrap();
+            assert_eq!(
+                options.iter().any(|option| option.value == "-Flavor"),
+                expected,
+                "{context:?}"
+            );
+            let spawned = probes.spawned();
+            assert_eq!(
+                backend
+                    .complete_context(&context, "-", &mut probes)
+                    .unwrap(),
+                options
+            );
+            assert_eq!(probes.spawned(), spawned);
+        }
+        let context = ValueContext {
+            words: &["-Scope", "west", "-Flavor"],
+            following: &[],
+            literal_arguments: (&[], &[]),
+            positional: false,
+        };
+        let values = backend
+            .complete_value_context(&context, &mut probes)
+            .unwrap();
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.value.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+        let scope = backend
+            .resolve_option(&["-Scope", "west"], "-flav", &mut probes)
+            .unwrap();
+        assert_eq!(scope.value, "-Flavor");
+        assert_eq!(scope.takes_value, Some(true));
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn provider_metadata_uses_explicit_paths_and_parent_provider_location() {
+        let Some(shell) = pwsh() else { return };
+        let backend = Command::new("Get-ChildItem", shell.clone(), &[]);
+        let mut probes = budget();
+        let file_options = backend.complete(&[], "-", &mut probes).unwrap();
+        assert!(
+            file_options
+                .iter()
+                .any(|option| option.value == "-Directory")
+        );
+        let env_options = backend
+            .complete_at(&[], "-", &["Env:"], &mut probes)
+            .unwrap();
+        assert!(
+            !env_options
+                .iter()
+                .any(|option| option.value == "-Directory")
+        );
+        let returned = run(
+            &shell,
+            &[
+                ("NOTYPO_PS_QUERY", "describe"),
+                ("NOTYPO_PS_NAME", "Get-ChildItem"),
+                ("NOTYPO_PS_LOCATION", "Env:"),
+            ],
+            &mut probes,
+        )
+        .unwrap();
+        let Answer::Described(description) = parse(&returned).unwrap() else {
+            panic!("missing provider metadata")
+        };
+        assert!(
+            !description
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == "Directory")
+        );
+        let malformed = run(
+            &shell,
+            &[
+                ("NOTYPO_PS_QUERY", "describe"),
+                ("NOTYPO_PS_NAME", "Get-ChildItem"),
+                ("NOTYPO_PS_LOCATION", "NotypoMissingProvider:"),
+            ],
+            &mut probes,
+        );
+        assert!(
+            malformed.is_err(),
+            "an unavailable provider must not fall through to filesystem metadata"
+        );
+    }
+
     /// Get-ChildItem's parameters as PowerShell 7.6 lists them in a
     /// file-system location (abridged).
     fn get_child_item() -> Description {
@@ -975,6 +1335,7 @@ pub(crate) mod tests {
             module: "Microsoft.PowerShell.Management".into(),
             shipped: true,
             open: false,
+            contextual: false,
             parameters,
         }
     }

@@ -89,12 +89,14 @@ _notypo_complete() {
 }
 zle -C notypo-complete complete-word _notypo_complete
 zle-line-init() {
+    CURSOR=$notypo_cursor
     zle notypo-complete
     zle accept-line
 }
 zle -N zle-line-init
 bindkey -e
 typeset notypo_buffer=$5
+typeset -gi notypo_cursor=$6
 vared notypo_buffer || exit 4
 (( notypo_called )) || exit 5
 (( notypo_status <= 1 )) || exit 6
@@ -205,12 +207,27 @@ fn memory_in(text: &str, name: &str) -> Option<(String, String)> {
     Some((definitions.to_owned(), function.to_owned()))
 }
 
+#[cfg(all(test, unix))]
 pub(super) fn complete(
     zsh: &Path,
     source: &Source<'_>,
     name: &str,
     words: &[&str],
     prefix: &str,
+    env: Vec<(OsString, Option<OsString>)>,
+    budget: &mut Budget,
+) -> Result<Vec<CompletionItem>, CompletionError> {
+    complete_at(zsh, source, name, words, prefix, &[], env, budget)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn complete_at(
+    zsh: &Path,
+    source: &Source<'_>,
+    name: &str,
+    words: &[&str],
+    prefix: &str,
+    following: &[&str],
     mut env: Vec<(OsString, Option<OsString>)>,
     budget: &mut Budget,
 ) -> Result<Vec<CompletionItem>, CompletionError> {
@@ -222,6 +239,11 @@ pub(super) fn complete(
     line.push(' ');
     if !prefix.is_empty() {
         line.push_str(&parser::quote_word_with_dialect(prefix, Dialect::Posix));
+    }
+    let cursor = line.chars().count();
+    for word in following {
+        line.push(' ');
+        line.push_str(&parser::quote_word_with_dialect(word, Dialect::Posix));
     }
     env.extend([
         ("TERM".into(), Some("dumb".into())),
@@ -250,6 +272,7 @@ pub(super) fn complete(
                 function.into(),
                 name.into(),
                 line.into(),
+                cursor.to_string().into(),
             ],
             env,
             capture: Capture::Descriptor(8),
@@ -347,6 +370,27 @@ mod tests {
             values(backend.complete(&[], "", &mut budget).unwrap())
                 .contains(&"newly-installed".into())
         );
+    }
+
+    #[test]
+    fn middle_slots_keep_the_later_arguments_in_real_zle() {
+        let Some(zsh) = crate::utils::which("zsh") else {
+            return;
+        };
+        let dir = Dir::new("zsh-middle");
+        let script = dir.script("_tool", "#compdef tool\n[[ $CURRENT == 3 && ${(Q)words[2]} == '🦀' && $words[4] == --scope && ${(Q)words[5]} == '三 west' ]] && compadd build deploy\n");
+        let items = complete_at(
+            &zsh,
+            &Source::File(&script),
+            "tool",
+            &["🦀"],
+            "",
+            &["--scope", "三 west"],
+            Vec::new(),
+            &mut budget(),
+        )
+        .unwrap();
+        assert_eq!(values(items), ["build", "deploy"]);
     }
 
     #[test]

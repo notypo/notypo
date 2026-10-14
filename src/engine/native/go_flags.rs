@@ -483,7 +483,7 @@ exit 0
         );
         assert!(!dir.0.join("operation-marker").exists());
         let mut next_request = backend.clone();
-        next_request.memo = Default::default();
+        next_request.state = Default::default();
         next_request.complete_values(&words, &mut budget).unwrap();
         assert_eq!(budget.spawned(), spawned + 2);
     }
@@ -607,7 +607,7 @@ exit 0
             "list      # List resources\nnodes     # Manage nodes\nrollback  # Undo\n",
         );
         let mut after = before.clone();
-        after.memo = Default::default();
+        after.state = Default::default();
         let listed = after.complete(&[], "", &mut budget).unwrap();
         assert_eq!(listed[2].value, "rollback");
         assert_eq!(listed[2].description.as_deref(), Some("Undo"));

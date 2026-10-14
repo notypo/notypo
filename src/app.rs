@@ -377,6 +377,14 @@ struct EngineSuggestions<'c, 'a> {
 
 impl<'c, 'a> EngineSuggestions<'c, 'a> {
     fn new(report: &Report, command: &'c Command<'a>) -> Self {
+        if let Some(budget) = report
+            .discovery_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            *command.discovery.borrow_mut() = Some(engine::legacy::Request::new(budget));
+        }
         let candidates = report.outcome.candidates();
         let ambiguous = matches!(report.outcome, Outcome::Ambiguous(_));
         let native = candidates

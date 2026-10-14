@@ -13,7 +13,7 @@ use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command as Process, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -26,6 +26,8 @@ pub struct Budget {
     per_probe: Duration,
     subprocesses_left: usize,
     spawned: usize,
+    /// The failed command's directory, shared by all discovery providers.
+    cwd: Option<PathBuf>,
     /// Bytes read from one probe before its output counts as truncated.
     pub max_output: usize,
     /// Results kept from one probe.
@@ -39,6 +41,7 @@ impl Budget {
             per_probe,
             subprocesses_left: subprocesses,
             spawned: 0,
+            cwd: None,
             max_output: 1024 * 1024,
             max_candidates: 5000,
         }
@@ -52,6 +55,17 @@ impl Budget {
 
     pub fn spawned(&self) -> usize {
         self.spawned
+    }
+
+    pub(crate) fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+
+    /// Set the default directory for this request without changing the
+    /// calling process's cwd (which would race other library users).
+    pub fn with_cwd(mut self, cwd: Option<&Path>) -> Self {
+        self.cwd = cwd.map(Path::to_owned);
+        self
     }
 
     pub fn exhausted(&self) -> bool {
@@ -74,6 +88,8 @@ impl Budget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capture {
     Stdout,
+    /// Separate stdout and stderr, with one shared output-size limit.
+    Separate,
     /// stdout and stderr through one pipe (help text goes to either).
     Combined,
     /// An extra inherited descriptor, such as argcomplete's fd 8. stdout and
@@ -94,6 +110,8 @@ pub struct Probe<'a> {
 pub struct ProbeOutput {
     pub status: Option<i32>,
     pub data: Vec<u8>,
+    /// Populated only for `Capture::Separate`.
+    pub stderr: Vec<u8>,
     pub truncated: bool,
 }
 
@@ -167,11 +185,18 @@ fn run_inner(
         ));
     }
     let timeout = budget.reserve()?;
-    let (mut reader, writer) = io::pipe().map_err(ProbeError::Spawn)?;
+    let (reader, writer) = io::pipe().map_err(ProbeError::Spawn)?;
     let mut process = Process::new(probe.program);
     process.args(&probe.args).stdin(Stdio::null());
-    if let Some(dir) = dir {
+    if let Some(dir) = dir.or(budget.cwd.as_deref()) {
         process.current_dir(dir);
+        #[cfg(unix)]
+        let directory = std::fs::canonicalize(dir).or_else(|_| std::path::absolute(dir));
+        #[cfg(not(unix))]
+        let directory = std::path::absolute(dir);
+        if let Ok(absolute) = directory {
+            process.env("PWD", absolute);
+        }
     }
     for (key, value) in &probe.env {
         match value {
@@ -185,9 +210,15 @@ fn run_inner(
     // The child inherits the extra descriptor at fork; the parent's copy must
     // close right after the spawn so the reader sees EOF.
     let mut extra_writer = None;
+    let mut stderr_reader = None;
     match probe.capture {
         Capture::Stdout => {
             process.stdout(writer).stderr(Stdio::null());
+        }
+        Capture::Separate => {
+            let (reader, stderr_writer) = io::pipe().map_err(ProbeError::Spawn)?;
+            stderr_reader = Some(reader);
+            process.stdout(writer).stderr(stderr_writer);
         }
         Capture::Combined => {
             process
@@ -267,17 +298,28 @@ fn run_inner(
     }
 
     let limit = budget.max_output;
-    let (done, finished) = mpsc::channel();
-    thread::spawn(move || {
-        let mut data = Vec::new();
-        let _ = (&mut reader).take(limit as u64 + 1).read_to_end(&mut data);
-        // Keep draining so a chatty child cannot block on a full pipe.
-        let _ = io::copy(&mut reader, &mut io::sink());
-        let _ = done.send(data);
-    });
+    let read = |mut reader: io::PipeReader| {
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            let mut data = Vec::new();
+            let _ = (&mut reader).take(limit as u64 + 1).read_to_end(&mut data);
+            // Keep draining so a chatty child cannot block on a full pipe.
+            let _ = io::copy(&mut reader, &mut io::sink());
+            let _ = done.send(data);
+        });
+        finished
+    };
+    let finished = read(reader);
+    let stderr_finished = stderr_reader.map(read);
     let deadline = Instant::now() + timeout;
     let data = finished.recv_timeout(timeout).ok();
-    let status = data.as_ref().and_then(|_| {
+    let stderr = match stderr_finished {
+        Some(finished) => finished
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok(),
+        None => Some(Vec::new()),
+    };
+    let status = data.as_ref().zip(stderr.as_ref()).and_then(|_| {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
@@ -298,13 +340,15 @@ fn run_inner(
     }
     #[cfg(windows)]
     job.terminate();
-    match (data, status) {
-        (Some(mut data), Some(status)) => {
-            let truncated = data.len() > limit;
+    match (data, stderr, status) {
+        (Some(mut data), Some(mut stderr), Some(status)) => {
+            let truncated = data.len().saturating_add(stderr.len()) > limit;
             data.truncate(limit);
+            stderr.truncate(limit.saturating_sub(data.len()));
             Ok(ProbeOutput {
                 status: status.code(),
                 data,
+                stderr,
                 truncated,
             })
         }
@@ -372,6 +416,41 @@ mod tests {
         };
         let output = run(&probe, &mut budget()).unwrap();
         assert_eq!(output.data, b"a\x0bb");
+    }
+
+    #[test]
+    fn separate_streams_share_one_size_limit_and_are_drained_concurrently() {
+        let (program, args) = sh("printf stdout; printf stderr >&2");
+        let probe = Probe {
+            program: &program,
+            args,
+            env: Vec::new(),
+            capture: Capture::Separate,
+        };
+        let output = run(&probe, &mut budget()).unwrap();
+        assert_eq!(output.data, b"stdout");
+        assert_eq!(output.stderr, b"stderr");
+        assert!(!output.truncated);
+        let mut limits = budget();
+        limits.max_output = 8;
+        let output = run(&probe, &mut limits).unwrap();
+        assert_eq!(output.data.len() + output.stderr.len(), 8);
+        assert!(output.truncated);
+        let (program, args) = sh(
+            "i=0; while [ $i -lt 10000 ]; do printf '1234567890\\n' >&2; i=$((i+1)); done; printf done",
+        );
+        let output = run(
+            &Probe {
+                program: &program,
+                args,
+                env: Vec::new(),
+                capture: Capture::Separate,
+            },
+            &mut limits,
+        )
+        .unwrap();
+        assert_eq!(output.data, b"done");
+        assert!(output.truncated);
     }
 
     #[test]

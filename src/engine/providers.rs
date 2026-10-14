@@ -23,6 +23,11 @@ pub struct Slot<'s> {
     pub path: Option<&'s PathBuf>,
     /// The words between the program and the slot, as corrected so far.
     pub context: &'s [String],
+    /// Literal words after the affected slot. None means that some context
+    /// contains an unevaluated expansion and cannot be passed to callbacks.
+    pub following: Option<&'s [String]>,
+    /// Quoted dash-prefixed data before and after the queried token.
+    pub literal_arguments: (&'s [usize], &'s [usize]),
     /// The subcommands among them (`stash` in `git -C x stash pop`).
     pub command_path: &'s [String],
     pub typed: &'s str,
@@ -57,6 +62,9 @@ pub enum Answer {
     Words(Vocabulary),
     /// The provider has nothing to say about this slot.
     NotApplicable,
+    /// The app resolved the command; its remaining arguments cannot be
+    /// classified as a finite subcommand vocabulary by this backend.
+    Arguments,
     /// The provider should know, but failed.
     Failed(String),
 }
@@ -121,8 +129,17 @@ impl CandidateProvider for Executables<'_> {
 
 /// Completer answers by (program, context words, prefix) within one run,
 /// and whether each came from the disk cache.
-type Memo =
-    HashMap<(String, Vec<String>, String), (Result<Vec<CompletionItem>, CompletionError>, bool)>;
+type Memo = HashMap<
+    (
+        String,
+        Vec<String>,
+        String,
+        Vec<String>,
+        Vec<usize>,
+        Vec<usize>,
+    ),
+    (Result<Vec<CompletionItem>, CompletionError>, bool),
+>;
 
 /// The installed app's own completer, for its subcommands and options.
 pub struct NativeCompletion<'c> {
@@ -244,6 +261,10 @@ impl<'c> NativeCompletion<'c> {
         let following = request.following;
         let positional = request.positional;
         let backend = self.backend(program, path, budget)?;
+        if let Err(error) = backend.prepare_query_context(&request, true, budget) {
+            self.note(format!("{program} argument metadata: {error}"));
+            return None;
+        }
         if !backend.capabilities().values || (positional && !backend.supports_positional_values()) {
             return None;
         }
@@ -260,6 +281,9 @@ impl<'c> NativeCompletion<'c> {
                 serde_json::to_string(&(following, request.literal_arguments))
                     .expect("value context")
             ),
+            following.iter().map(|word| (*word).to_owned()).collect(),
+            request.literal_arguments.0.to_vec(),
+            request.literal_arguments.1.to_vec(),
         );
         let result = match self.memo.get(&key) {
             Some((hit, _)) => hit.clone(),
@@ -298,12 +322,18 @@ impl<'c> NativeCompletion<'c> {
         // With network lookups on, words the offline answer lacks are
         // resource names. If that answer fails, every word counts as one.
         let mut resources: Vec<String> = if backend.capabilities().resources {
-            let key = (program.to_owned(), context.to_vec(), "\0offline".to_owned());
+            let key = (
+                program.to_owned(),
+                context.to_vec(),
+                "\0offline".to_owned(),
+                following.iter().map(|word| (*word).to_owned()).collect(),
+                request.literal_arguments.0.to_vec(),
+                request.literal_arguments.1.to_vec(),
+            );
             let offline = match self.memo.get(&key) {
                 Some((hit, _)) => hit.clone(),
                 None => {
-                    let query: Vec<&str> = context.iter().map(String::as_str).collect();
-                    let result = backend.complete_offline_values(&query, budget);
+                    let result = backend.complete_offline_value_context(&request, budget);
                     self.memo.insert(key, (result.clone(), false));
                     result
                 }
@@ -464,10 +494,22 @@ impl<'c> NativeCompletion<'c> {
         program: &str,
         backend: &dyn NativeCompletionBackend,
     ) -> Option<&mut CompletionCache> {
+        let cwd = self
+            .workspace
+            .cwd
+            .as_ref()
+            .map(|cwd| cwd.canonicalize().unwrap_or_else(|_| cwd.clone()));
         self.caches
             .entry(program.to_owned())
             .or_insert_with(|| {
                 let identity = backend.cache_identity()?;
+                let identity = match &cwd {
+                    Some(cwd) => super::cache::fingerprint(
+                        std::slice::from_ref(cwd),
+                        &["workspace", &identity],
+                    ),
+                    None => identity,
+                };
                 CompletionCache::open(backend.id(), &identity)
             })
             .as_mut()
@@ -601,8 +643,29 @@ impl CandidateProvider for NativeCompletion<'_> {
         let Some(backend) = self.backend(slot.program, slot.path, budget) else {
             return Answer::NotApplicable;
         };
+        if slot.following.is_none() && backend.requires_literal_completion_context() {
+            let why = "native completion requires literal context on both sides of the token";
+            self.note(format!("{}: {why}", slot.program));
+            return Answer::Failed(why.into());
+        }
         // An empty prefix enumerates the level; a dash prefix its options.
         let context: Vec<&str> = slot.context.iter().map(String::as_str).collect();
+        let following: Vec<&str> = slot
+            .following
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let query = native::ValueContext {
+            words: &context,
+            following: &following,
+            literal_arguments: slot.literal_arguments,
+            positional: false,
+        };
+        if let Err(error) = backend.prepare_query_context(&query, false, budget) {
+            self.note(format!("{} completion metadata: {error}", slot.program));
+            return Answer::Failed(error.to_string());
+        }
         let capabilities = backend.capabilities_for(&context);
         let options = slot.role == TokenRole::OptionName;
         let short = backend.is_short_option(slot.typed);
@@ -619,11 +682,20 @@ impl CandidateProvider for NativeCompletion<'_> {
         // Only an authoritative command-only context may reach disk.
         let cacheable = capabilities.complete_subcommands
             && capabilities.complete_options
-            && slot.context == slot.command_path;
+            && slot.context == slot.command_path
+            && (!backend.completion_uses_following()
+                || slot.following.is_some_and(<[_]>::is_empty));
         let key = (
             slot.program.to_owned(),
             slot.context.to_vec(),
             prefix.to_owned(),
+            if backend.completion_uses_following() {
+                slot.following.unwrap_or_default().to_vec()
+            } else {
+                Vec::new()
+            },
+            slot.literal_arguments.0.to_vec(),
+            slot.literal_arguments.1.to_vec(),
         );
         let disk_key = format!("{}\x1e{prefix}", slot.context.join("\x1f"));
         let (result, cached) = match self.memo.get(&key) {
@@ -636,8 +708,7 @@ impl CandidateProvider for NativeCompletion<'_> {
                 match from_disk {
                     Some(items) => (Ok(items), true),
                     None => {
-                        let words: Vec<&str> = slot.context.iter().map(String::as_str).collect();
-                        let result = backend.complete(&words, prefix, budget);
+                        let result = backend.complete_context(&query, prefix, budget);
                         if cacheable
                             && let Ok(items) = &result
                             && let Some(cache) = self.cache(slot.program, &*backend)
@@ -682,27 +753,13 @@ impl CandidateProvider for NativeCompletion<'_> {
                     resources,
                 })
             }
-            // SDK refusals cover untrusted projects and line shapes its
-            // tokenizer cannot preserve. They do not prove a positional word
-            // is valid, and their reason must remain visible to the user.
-            Err(error @ CompletionError::Unsupported(_)) if backend.id() == "dotnet" => {
-                self.note(format!(
-                    "{} completion after `{}`: {error}",
-                    slot.program,
-                    slot.context.join(" ")
-                ));
-                Answer::Failed(error.to_string())
+            Err(CompletionError::UnjudgedArguments(why)) => {
+                self.note(format!("{}: {why}", slot.program));
+                Answer::Arguments
             }
-            // The protocol has no data for this position (gcloud's static
-            // tree and positionals): nothing here is a subcommand.
-            Err(CompletionError::Unsupported(_)) => Answer::Words(Vocabulary {
-                words: Vec::new(),
-                authoritative: true,
-                via,
-                source: Source::NativeCompletion,
-                cached: false,
-                resources: Vec::new(),
-            }),
+            // Unsupported is different from a complete, empty answer. A
+            // protocol may lack this slot or need unavailable session state;
+            // report the limit and let help/man/history supply evidence.
             Err(error) => {
                 self.note(format!(
                     "{} completion after `{}`: {error}",
@@ -1618,6 +1675,72 @@ mod completion_cache_tests {
     use std::time::Duration;
 
     #[test]
+    fn persistent_metadata_is_scoped_to_the_failure_workspace() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let dir = Dir::new("workspace-cache");
+        let app = dir.script("app", "#!/bin/sh\ncat words\nprintf ':4\\n'\n");
+        let backend = Rc::new(Backend::new(Flavor::Cobra, "app", app));
+        let workspaces = [
+            (OsString::from("west"), "west-command"),
+            (OsString::from("east"), "east-command"),
+            (
+                OsString::from_vec(b"nonutf8-\xff".to_vec()),
+                "first-command",
+            ),
+            (
+                OsString::from_vec(b"nonutf8-\xfe".to_vec()),
+                "second-command",
+            ),
+        ];
+        assert_ne!(
+            super::super::cache::fingerprint(&[dir.0.join(&workspaces[2].0)], &["workspace"]),
+            super::super::cache::fingerprint(&[dir.0.join(&workspaces[3].0)], &["workspace"]),
+            "distinct raw paths must not collide after lossy UTF-8 conversion"
+        );
+        let mut available = Vec::new();
+        for (name, word) in &workspaces {
+            if let Err(error) = std::fs::create_dir(dir.0.join(name)) {
+                if cfg!(target_os = "macos") && error.raw_os_error() == Some(92) {
+                    // APFS requires valid Unicode filenames. The fingerprint
+                    // assertion above still checks the raw-path distinction.
+                    continue;
+                }
+                panic!("could not create cache fixture: {error}");
+            }
+            std::fs::write(dir.0.join(name).join("words"), format!("{word}\n")).unwrap();
+            available.push((name, word));
+        }
+        for (name, word) in available.iter().chain(available.iter()).copied() {
+            let cwd = dir.0.join(name);
+            let mut provider = NativeCompletion::new(&[], false)
+                .with_workspace(Workspace {
+                    cwd: Some(cwd.clone()),
+                    trusted: &[],
+                })
+                .with_backend("app", backend.clone());
+            let mut budget =
+                Budget::new(Duration::from_secs(5), Duration::from_secs(2), 8).with_cwd(Some(&cwd));
+            let slot = Slot {
+                role: TokenRole::Subcommand,
+                program: "app",
+                path: None,
+                context: &[],
+                following: Some(&[]),
+                command_path: &[],
+                typed: "typo",
+                literal_arguments: (&[], &[]),
+                fresh: false,
+            };
+            let Answer::Words(answer) = provider.vocabulary(&slot, &mut budget) else {
+                panic!("missing completion")
+            };
+            assert_eq!(answer.words[0].value, *word);
+            provider.persist();
+        }
+    }
+
+    #[test]
     fn option_values_never_reach_disk_but_requests_still_memoize_answers() {
         let dir = Dir::new("cache-arguments");
         let app = dir.script("app", "#!/bin/sh\nprintf '%s\\n' '--verbose' ':4'\n");
@@ -1636,6 +1759,8 @@ mod completion_cache_tests {
             context: &context,
             command_path: &command_path,
             typed: "--verbose",
+            following: Some(&[]),
+            literal_arguments: (&[], &[]),
             fresh: false,
         };
         let mut budget = Budget::new(Duration::from_secs(5), Duration::from_secs(2), 8);
@@ -1691,6 +1816,8 @@ mod completion_cache_tests {
             context: &[],
             command_path: &[],
             typed: "private-resoruce",
+            following: Some(&[]),
+            literal_arguments: (&[], &[]),
             fresh: false,
         };
         let mut budget = Budget::new(Duration::from_secs(5), Duration::from_secs(2), 4);
@@ -1794,6 +1921,8 @@ mod help_tests {
             context: commands,
             command_path: commands,
             typed: "biuld",
+            following: Some(&[]),
+            literal_arguments: (&[], &[]),
             fresh: false,
         }
     }

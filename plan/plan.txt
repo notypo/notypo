@@ -57,6 +57,39 @@ Status: first and second slices implemented in src/engine/ on branch
         no controlling terminal for probes, posener/cobra/handler argument
         and arity detection, cobra alias confirmation, case-sensitive short
         options, and password masking in reports.
+Core release work (2026-10-14, active; owner's current request): finish the
+engine implementation and validation for manual publication. Expansion of
+the 5A/5B application inventories and additional library protocols remains
+future work. Existing inventory requirements are retained below.
+    Restored the missing benches/engine.rs and benches/correction.rs targets
+    that prevented Cargo from parsing the manifest. Added CPU/provider stage
+    measurements and benchmarks/structured.py for cold/warm CLI latency,
+    probe counts, child RSS, checked corrections, and an optional upstream
+    Python baseline. New local app installations are recorded in plan/app.txt.
+    Shell callbacks now receive literal arguments on both sides of the
+    diagnosed token where their native API supports a cursor: Bash, Zsh,
+    and PowerShell. Cursor units are preserved (bytes, characters, UTF-16).
+    Context-dependent answers have separate request memo entries and cannot
+    persist arguments in the metadata cache. Opaque callback context abstains.
+    PowerShell native and parameter callbacks validate replacement ranges
+    against the queried source span, converting UTF-16 to UTF-8 boundaries;
+    literal native values containing spaces survive decoding. Optional newer
+    attribute types are guarded for Windows PowerShell compatibility.
+    Bash now uses its own compgen filtering/affixes for -F, -C, and -W
+    registrations. tcsh passes its session aliases instead of starting an
+    interactive shell and running startup files. Unsupported completion is
+    distinct from an empty answer and falls back to documentation/history;
+    resolved git aliases have explicit unjudged argument positions.
+    Current macOS evidence: 453 default tests pass with portable PowerShell
+    7.6.7 enabled, plus both benchmark smoke targets; host all-target/all-feature
+    Clippy passes. A portable PowerShell integration fixture now also runs on
+    Windows and checks status capture, parameter repair, cleanup, and exactly
+    one execution of each accepted command. Foreign runtime checks remain open.
+    Remaining work includes captured PowerShell module/closure data and
+    provider-dependent metadata, remaining shell completion result fidelity,
+    complete supported-protocol upgrade records, final performance artifacts,
+    platform validation, package verification, and the core rollout audit.
+
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.
         [ ] NOT DONE = work required to deliver this plan.
@@ -4303,8 +4336,13 @@ executes it once. Aborting or a denied safety decision executes nothing.
 
 [x] DONE: Keep existing rule fixtures passing through the compatibility
     source; record deliberate behavior changes separately during migration.
-[ ] NOT DONE: Add parser/edit fixtures for nested quotes, Unicode, pipelines,
+[x] DONE: Add parser/edit fixtures for nested quotes, Unicode, pipelines,
     wrappers, redirects, substitutions, malformed input, and each dialect.
+    Closed for the implemented dialects (2026-10-14): existing POSIX, fish,
+    tcsh, and PowerShell parser/edit/oracle fixtures pass with real installed
+    shells and PowerShell 7.6.7. Unsupported forms are fixture-tested as
+    unsupported. tests/engine_contract.rs adds portable correction checks in
+    all six shell selections; Windows runtime coverage is tracked separately.
     PARTIAL: sh/Bash/zsh, fish, and tcsh fixtures exist, including malformed
     escapes, quotes, substitutions, byte escapes, operators, actual quote
     execution, and compound commands/blocks checked against the installed
@@ -4344,9 +4382,15 @@ executes it once. Aborting or a denied safety decision executes nothing.
     no check. The clap, pip, npm, Cargo, urfave/cli, click, go-flags, and
     yargs bridges have upgrade fixtures too; none of them writes answers to
     the disk cache.
-[ ] NOT DONE: Test mid-command token replacement, empty-prefix enumeration,
+[x] DONE: Test mid-command token replacement, empty-prefix enumeration,
     multiple typos, nested groups, global flags, enum/resource values, quoting,
     and shell-specific native completion responses.
+    Closed for supported protocols (2026-10-14): the existing protocol and
+    engine fixtures, including real PowerShell parameter callbacks, pass.
+    New real Bash/ZLE/PowerShell fixtures exercise later arguments, Unicode
+    cursor units, and replacement ranges. Portable tests verify context-aware
+    repair, separate suffix memoization, and refusal of opaque callback context.
+    Complete per-application inventory checks remain the separate task below.
     PARTIAL: mid-command, empty-prefix, multiple typos, nested groups, global
     options, enum values, and quoting are covered, including Bash/fish/Zsh native
     responses and quoted attached values. Resource values are covered with a

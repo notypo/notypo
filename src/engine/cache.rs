@@ -24,7 +24,7 @@ const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const MAX_ENTRIES: usize = 2000;
 // Start a fresh namespace after restricting persistence to command paths,
 // so old entries carrying argument values cannot be loaded and saved again.
-const CACHE_FORMAT_VERSION: u8 = 2;
+const CACHE_FORMAT_VERSION: u8 = 3;
 
 /// A stable digest of everything that can change an app's answers.
 pub fn fingerprint(files: &[PathBuf], extra: &[&str]) -> String {

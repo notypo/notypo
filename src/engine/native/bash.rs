@@ -27,19 +27,60 @@ const DRIVER: &str = r#"case $1 in
   *) exit 3;;
 esac
 command=$3
-shift 3
+COMP_CWORD=$4
+COMP_LINE=$5
+COMP_POINT=$6
+shift 6
 spec=$(complete -p "$command" 2>/dev/null) || exit 4
-[[ $spec =~ -F\ ([^ ]+) ]] || exit 5
-function=${BASH_REMATCH[1]}
 COMP_WORDS=("$command" "$@")
-COMP_CWORD=$((${#COMP_WORDS[@]} - 1))
-COMP_LINE="${COMP_WORDS[*]}"
-COMP_POINT=${#COMP_LINE}
 COMP_TYPE=9
 COMP_KEY=9
-COMPREPLY=()
-"$function" "$command" "${COMP_WORDS[COMP_CWORD]}" "${COMP_WORDS[COMP_CWORD-1]}" >/dev/null 2>&1
-printf '%s\n' "${COMPREPLY[@]}"
+# complete -p emits reusable, shell-quoted code. Only the registration is
+# decoded; command words remain array elements and never enter eval text.
+eval "notypo_spec=(${spec#complete })" || exit 5
+notypo_spec=("${notypo_spec[@]:0:${#notypo_spec[@]}-1}")
+notypo_words=("${COMP_WORDS[@]}")
+notypo_cword=$COMP_CWORD notypo_line=$COMP_LINE notypo_point=$COMP_POINT
+notypo_word=${COMP_WORDS[COMP_CWORD]} notypo_previous=${COMP_WORDS[COMP_CWORD-1]}
+notypo_function= notypo_external=
+for ((notypo_i=0; notypo_i<${#notypo_spec[@]}; notypo_i++)); do
+    case ${notypo_spec[notypo_i]} in
+        -F) notypo_function=${notypo_spec[notypo_i+1]}; notypo_spec[notypo_i+1]=_notypo_function;;
+        -C) notypo_external=${notypo_spec[notypo_i+1]}; notypo_spec[notypo_i+1]=_notypo_external;;
+    esac
+done
+_notypo_context() {
+    COMP_WORDS=("${notypo_words[@]}")
+    COMP_CWORD=$notypo_cword COMP_LINE=$notypo_line COMP_POINT=$notypo_point
+    COMP_TYPE=9 COMP_KEY=9
+}
+_notypo_function() {
+    _notypo_context
+    COMPREPLY=()
+    "$notypo_function" "$command" "$notypo_word" "$notypo_previous" >/dev/null 2>&1
+    notypo_callback_status=$?
+    if (( notypo_callback_status > 1 )); then
+        COMPREPLY=()
+        printf '\036notypo-completion-failed\n'
+    fi
+    return $notypo_callback_status
+}
+_notypo_external() {
+    _notypo_context
+    export COMP_LINE COMP_POINT COMP_TYPE COMP_KEY
+    # Only the explicitly trusted registration supplies code here. These
+    # variable references pass query words literally, including $() text.
+    eval "$notypo_external \"\$command\" \"\$notypo_word\" \"\$notypo_previous\""
+    notypo_callback_status=$?
+    if (( notypo_callback_status > 1 )); then printf '\036notypo-completion-failed\n'; fi
+    return $notypo_callback_status
+}
+# Bash applies -W/-G, -X filters and -P/-S affixes in its own implementation.
+# https://www.gnu.org/software/bash/manual/html_node/Programmable-Completion.html
+compgen "${notypo_spec[@]}" -- "$notypo_word"
+notypo_result=$?
+(( notypo_result <= 1 )) || exit 5
+exit 0
 "#;
 
 /// The bash completion script installed for `name`, from the usual
@@ -112,12 +153,16 @@ fn index_registrations(dirs: &[PathBuf]) -> HashMap<String, PathBuf> {
             };
             for line in text.lines().map(str::trim) {
                 // Only registrations are worth splitting.
-                if !line.starts_with("complete") || !line.contains("-F") {
+                if !line.starts_with("complete")
+                    || !["-F", "-C", "-W"].iter().any(|flag| line.contains(flag))
+                {
                     continue;
                 }
                 if let Ok(words) = crate::shlex::split(line)
                     && words.first().is_some_and(|word| word == "complete")
-                    && words.iter().any(|word| word == "-F")
+                    && words
+                        .iter()
+                        .any(|word| matches!(word.as_ref(), "-F" | "-C" | "-W"))
                     && let Some(name) = words.last()
                 {
                     index
@@ -159,24 +204,41 @@ fn memory_script_in(text: &str, name: &str) -> Option<String> {
     let spec = specs.lines().find(|line| {
         crate::shlex::split(line).is_ok_and(|words| {
             words.first().is_some_and(|word| word == "complete")
-                && words
-                    .windows(2)
-                    .any(|pair| pair[0] == "-F" && !pair[1].is_empty())
+                && words.windows(2).any(|pair| {
+                    matches!(pair[0].as_ref(), "-F" | "-C" | "-W") && !pair[1].is_empty()
+                })
                 && words.last().is_some_and(|word| word == name)
         })
     })?;
-    if functions.trim().is_empty() {
+    if functions.trim().is_empty()
+        && crate::shlex::split(spec).is_ok_and(|words| words.iter().any(|word| word == "-F"))
+    {
         return None;
     }
     Some(format!("{functions}\n{spec}\n"))
 }
 
+#[cfg(all(test, unix))]
 pub(super) fn complete(
     bash: &Path,
     source: &Source<'_>,
     name: &str,
     words: &[&str],
     prefix: &str,
+    env: Vec<(OsString, Option<OsString>)>,
+    budget: &mut Budget,
+) -> Result<Vec<CompletionItem>, CompletionError> {
+    complete_at(bash, source, name, words, prefix, &[], env, budget)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn complete_at(
+    bash: &Path,
+    source: &Source<'_>,
+    name: &str,
+    words: &[&str],
+    prefix: &str,
+    following: &[&str],
     mut env: Vec<(OsString, Option<OsString>)>,
     budget: &mut Budget,
 ) -> Result<Vec<CompletionItem>, CompletionError> {
@@ -186,6 +248,12 @@ pub(super) fn complete(
         Source::File(script) => ("file", script.into(), script.display().to_string()),
         Source::Text(text) => ("text", text.into(), "your bash session".into()),
     };
+    let mut line = super::completion_line(name, words, prefix);
+    let point = line.len();
+    for word in following {
+        line.push(' ');
+        line.push_str(&crate::shlex::quote(word));
+    }
     let mut args: Vec<OsString> = vec![
         "--norc".into(),
         "--noprofile".into(),
@@ -195,9 +263,13 @@ pub(super) fn complete(
         mode.into(),
         code,
         name.into(),
+        (words.len() + 1).to_string().into(),
+        line.into(),
+        point.to_string().into(),
     ];
     args.extend(words.iter().map(OsString::from));
     args.push(prefix.into());
+    args.extend(following.iter().map(OsString::from));
     // A script that registers nothing (yadm's needs git's handler loaded
     // first) is broken, not a statement that nothing here is a command:
     // documentation still applies.
@@ -211,6 +283,11 @@ pub(super) fn complete(
         }
         other => other,
     })?;
+    if text.contains("\u{1e}notypo-completion-failed") {
+        return Err(CompletionError::Failed(
+            "the registered bash completer failed".into(),
+        ));
+    }
     super::normalize_bounded(
         text.lines(),
         super::Flavor::BashFunction,
@@ -226,6 +303,77 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn failed_callbacks_cannot_lend_their_partial_output_to_a_correction() {
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let dir = Dir::new("bash-callback-failure");
+        let external = dir.script("completer", "#!/bin/sh\nprintf 'build\\n'\nexit 2\n");
+        let scripts = [
+            "_tool() { COMPREPLY=(build); return 2; }\ncomplete -F _tool tool\n".to_owned(),
+            format!("complete -C '{}' -P prefix tool\n", external.display()),
+        ];
+        for text in scripts {
+            let mut budget = Budget::new(Duration::from_secs(10), Duration::from_secs(5), 8);
+            assert!(matches!(
+                complete(
+                    &bash,
+                    &Source::Text(&text),
+                    "tool",
+                    &[],
+                    "",
+                    Vec::new(),
+                    &mut budget
+                ),
+                Err(CompletionError::Failed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn word_lists_and_external_completers_use_bash_filtering_and_literal_arguments() {
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let mut budget = Budget::new(Duration::from_secs(10), Duration::from_secs(5), 8);
+        let text = "complete -W 'build deploy danger' -X 'danger' -P '--' tool\n";
+        let items = complete(
+            &bash,
+            &Source::Text(text),
+            "tool",
+            &[],
+            "",
+            Vec::new(),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>(),
+            ["--build", "--deploy"]
+        );
+        let dir = Dir::new("bash-external");
+        let external = dir.script("completer", "#!/bin/sh\n[ \"$1\" = tool ] && [ \"$2\" = '' ] && [ \"$3\" = tool ] && [ \"$COMP_LINE\" = 'tool  --scope west' ] && [ \"$COMP_POINT\" = 5 ] || exit 3\nprintf 'build\\ndeploy\\n'\n");
+        let text = format!("complete -C '{}' tool\n", external.display());
+        let items = complete_at(
+            &bash,
+            &Source::Text(&text),
+            "tool",
+            &[],
+            "",
+            &["--scope", "west"],
+            Vec::new(),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>(),
+            ["build", "deploy"]
+        );
+        let snapshot = "complete -W 'build deploy' tool\n#notypo-functions\n";
+        assert!(memory_script_in(snapshot, "tool").is_some());
+    }
+
+    #[test]
     fn shared_compatibility_files_are_found_by_their_registrations() {
         let dir = Dir::new("bash-compat");
         let sdk = dir.script(
@@ -237,9 +385,43 @@ mod tests {
         for name in ["gcloud", "bq", "gsutil"] {
             assert_eq!(registering_script(name, &dirs), Some(sdk.clone()), "{name}");
         }
-        for name in ["gsutil-old", "words-only", "complete", "missing"] {
+        assert_eq!(
+            registering_script("words-only", &dirs),
+            Some(dir.0.join("bash_completion.d/other"))
+        );
+        for name in ["gsutil-old", "complete", "missing"] {
             assert_eq!(registering_script(name, &dirs), None, "{name}");
         }
+    }
+
+    #[test]
+    fn middle_slots_keep_later_words_and_a_byte_cursor_in_the_quoted_line() {
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let text = r#"_tool() {
+            [[ $COMP_CWORD == 2 && ${COMP_WORDS[1]} == '🦀' && ${COMP_WORDS[2]} == '' && ${COMP_WORDS[3]} == --scope && ${COMP_WORDS[4]} == '三 west' ]] || return
+            [[ $COMP_POINT == 12 && $COMP_LINE == "tool '🦀'  --scope '三 west'" ]] || return
+            COMPREPLY=(build deploy)
+        }
+        complete -F _tool tool
+        "#;
+        let mut budget = Budget::new(Duration::from_secs(10), Duration::from_secs(5), 8);
+        let items = complete_at(
+            &bash,
+            &Source::Text(text),
+            "tool",
+            &["🦀"],
+            "",
+            &["--scope", "三 west"],
+            Vec::new(),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.value.as_str()).collect::<Vec<_>>(),
+            ["build", "deploy"]
+        );
     }
 
     #[test]
@@ -256,10 +438,10 @@ mod tests {
             None,
             "names must match exactly"
         );
-        assert_eq!(
-            memory_script_in(text, "words"),
-            None,
-            "only -F registrations"
+        assert!(
+            memory_script_in(text, "words")
+                .unwrap()
+                .contains("complete -W 'a b' words")
         );
         assert_eq!(memory_script_in(text, "missing"), None);
         assert_eq!(

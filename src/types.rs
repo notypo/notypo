@@ -5,7 +5,7 @@
 use crate::settings::Settings;
 use crate::shells::{PowerShellCommand, Shell};
 use crate::{path_index, utils};
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -171,6 +171,9 @@ pub struct Command<'a> {
     ctx: &'a Context,
     parts: OnceCell<Vec<String>>,
     output_lower: OnceCell<String>,
+    /// Script views of the same correction share discovery; unrelated
+    /// commands can reuse a Context without sharing a budget or answers.
+    pub(crate) discovery: std::rc::Rc<RefCell<Option<crate::engine::legacy::Request>>>,
 }
 
 impl<'a> Command<'a> {
@@ -185,12 +188,15 @@ impl<'a> Command<'a> {
             ctx,
             parts: OnceCell::new(),
             output_lower: OnceCell::new(),
+            discovery: std::rc::Rc::new(RefCell::new(None)),
         }
     }
 
     /// `command.update(script=...)`: same output, new script.
     pub fn with_script(&self, script: impl Into<String>) -> Command<'a> {
-        Command::new(script, self.output, self.ctx)
+        let mut command = Command::new(script, self.output, self.ctx);
+        command.discovery = self.discovery.clone();
+        command
     }
 
     pub fn has_output(&self) -> bool {

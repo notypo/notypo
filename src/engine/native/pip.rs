@@ -123,7 +123,7 @@ pub(super) fn complete(
 }
 
 pub(super) fn resources(backend: &Backend, words: &[&str]) -> bool {
-    let memo = backend.memo.borrow();
+    let memo = backend.state.memo.borrow();
     let key = vec!["pip".to_owned(), String::new()];
     let Some(Ok(root)) = memo.get(&key) else {
         return false;
