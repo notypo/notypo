@@ -2817,7 +2817,6 @@ mod tests {
             "function; end",
             "switch a; echo bad; end",
             "if\ntrue; end",
-            "not\ntrue",
             "for x a; end",
             "begin; git sttus",
             "if a; else; if b; end",
@@ -2831,7 +2830,9 @@ mod tests {
             "{ echo a && }",
             "{ echo a; end",
         ],
-        &[],
+        // Valid syntax the parser intentionally leaves unread: `not` can
+        // continue onto the next line in fish.
+        &["not\ntrue"],
     );
 
     #[test]
