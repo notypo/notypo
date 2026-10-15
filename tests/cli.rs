@@ -66,8 +66,20 @@ impl Workspace {
             .env_remove("THEFUCK_OUTPUT_LOG")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
+            .stderr(Stdio::piped());
+        // VM runners can give the test process a controlling terminal.
+        // An interactive Bash in a new background process group would stop
+        // itself with SIGTTIN before running the fixture. Detach the session
+        // as well as the process group, consistently with piped stdin.
+        // SAFETY: setsid is async-signal-safe and runs only in the child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         command
     }
 }
@@ -122,9 +134,23 @@ fn finish_within(mut child: Child, limit: Duration) -> Output {
             };
         }
         if Instant::now() >= deadline {
+            // SAFETY: the fixture owns the session/process group whose id
+            // is this unreaped child's id. Kill descendants before reading
+            // their pipes, so a failed shell cannot leave a stopped child.
+            unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
             let _ = child.kill();
             let _ = child.wait();
-            panic!("CLI did not exit within {limit:?}");
+            let stdout = stdout
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_default();
+            let stderr = stderr
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_default();
+            panic!(
+                "CLI did not exit within {limit:?}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
         }
         thread::sleep(Duration::from_millis(10));
     }

@@ -125,6 +125,13 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     pre-exec terminal setup can retry once under the same request budget.
     Existing protocol upgrade/endpoint fixtures pass. No additional feature
     implementation is planned for this release.
+    Hosted CI follow-up (2026-10-15): interactive Bash fixtures reproduced
+    the FreeBSD timeout when their parent owned a terminal. Fixtures now
+    start in a detached session; the same terminal-backed regression passes.
+    Timeout cleanup kills the fixture process group and reports captured
+    output. Windows probe startup skips already-running threads until it
+    resumes the suspended primary thread; production probe limits stay the
+    same. These fixes await the next hosted validation run.
     Current release work: hosted CI verification, package validation and the
     final publication audit. All other unchecked features and inventories
     are deferred by the owner (2026-10-15).
