@@ -98,6 +98,11 @@ if (-not ($shipped -or $trusted -contains '*' -or $trusted -contains ('module:' 
 $lookup = @{ Name = $command.Name; CommandType = $command.CommandType }
 if ($command.Module) { $lookup.Module = $module }
 if ($env:NOTYPO_PS_QUERY -eq 'options') {
+    # Classic completion resolves function names in the runspace's global
+    # scope. Publish only this trusted restored definition inside the probe.
+    if ($session -and $command -is [System.Management.Automation.FunctionInfo]) {
+        Microsoft.PowerShell.Management\Set-Item -LiteralPath ('Function:global:' + $command.Name) -Value $command.ScriptBlock
+    }
     $null = Microsoft.PowerShell.Core\Get-Command @lookup
     $result = [System.Management.Automation.CommandCompletion]::CompleteInput($env:NOTYPO_PS_LINE, [int]$env:NOTYPO_PS_CURSOR, $null)
     __notypo_emit 'answered'
@@ -429,6 +434,7 @@ pub(super) fn environment(query: &[(&str, &str)]) -> Vec<(OsString, Option<OsStr
             "NOTYPO_PS_PARAMETER",
             "NOTYPO_PS_SESSION",
             "NOTYPO_PS_CURSOR",
+            "NOTYPO_PS_START",
             "NOTYPO_PS_MODULE",
             "NOTYPO_PS_ARGUMENTS",
             "NOTYPO_PS_LOCATION",

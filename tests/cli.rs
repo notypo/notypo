@@ -3,6 +3,7 @@
 use notypo::logs::USER_COMMAND_MARK;
 use notypo::shells::Shell;
 use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -30,6 +31,9 @@ impl Workspace {
     }
 
     fn program(&self, program: impl AsRef<std::ffi::OsStr>, rules: &str) -> Command {
+        let interactive_bash = std::path::Path::new(program.as_ref())
+            .file_name()
+            .is_some_and(|name| name == "bash");
         let mut command = Command::new(program);
         command
             .current_dir(&self.0)
@@ -67,20 +71,62 @@ impl Workspace {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // VM runners can give the test process a controlling terminal.
-        // An interactive Bash in a new background process group would stop
-        // itself with SIGTTIN before running the fixture. Detach the session
-        // as well as the process group, consistently with piped stdin.
-        // SAFETY: setsid is async-signal-safe and runs only in the child.
+        if interactive_bash {
+            let (mut master, mut slave) = (-1, -1);
+            // SAFETY: valid descriptor pointers; optional PTY settings are null.
+            assert_eq!(
+                unsafe {
+                    libc::openpty(
+                        &mut master,
+                        &mut slave,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            // SAFETY: openpty returned two newly owned descriptors.
+            let (mut master, slave) =
+                unsafe { (fs::File::from_raw_fd(master), fs::File::from_raw_fd(slave)) };
+            for file in [&master, &slave] {
+                // SAFETY: these descriptors remain owned by the Files above.
+                assert_ne!(
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+                    -1
+                );
+            }
+            // Bash initializes job control before evaluating -c. Give it its
+            // own foreground terminal; the script closes stdin afterward.
+            command.stdin(slave);
+            thread::spawn(move || {
+                let _ = std::io::copy(&mut master, &mut std::io::sink());
+            });
+        }
+        // SAFETY: only async-signal-safe calls run in the child before exec.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if interactive_bash
+                    && libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
         command
+    }
+}
+
+fn shell_script(shell: &str, script: &str) -> String {
+    if shell == "bash" {
+        // Preserve noninteractive -y refusal after interactive shell startup.
+        format!("exec </dev/null\n{script}")
+    } else {
+        script.to_owned()
     }
 }
 
@@ -1547,6 +1593,7 @@ fn shell_aliases_pass_function_names() {
             _ => unreachable!(),
         };
         let script = format!("{alias}\n{function}\n{seed}\ndeploy_site now\nfuck -y\n");
+        let script = shell_script(shell, &script);
         let output = finish(
             workspace
                 .program(&path, "")
@@ -1596,6 +1643,7 @@ fn bash_passes_session_completion_functions_without_running_its_startup() {
         "{alias}\neval \"$(printf '%s\\n' '{generated}')\"\n_unrelated() {{ touch '{}'; }}\nset -o history\nhistory -s 'tool biuld'\nfuck --explain\n",
         marker.display()
     );
+    let script = shell_script("bash", &script);
     let output = finish(
         workspace
             .program(&bash, "")
@@ -1869,6 +1917,7 @@ fn wrapper_functions_use_their_commands_vocabulary_and_safety_policy() {
              {seed} 'll --colro=auto boom'\nfalse; fuck --explain\n\
              {seed} 'rmf ./buidl'\nfalse; fuck --explain\nfalse; fuck -y\n"
         );
+        let script = shell_script(shell, &script);
         let output = finish(
             workspace
                 .program(&path, "")
@@ -2125,6 +2174,7 @@ fn shell_aliases_pass_the_exit_status_to_the_native_engine() {
             _ => unreachable!(),
         };
         let script = format!("{alias}\n{seed}\ngti status\nfuck -y\n");
+        let script = shell_script(shell, &script);
         let output = finish(
             workspace
                 .program(&path, "")
@@ -2169,6 +2219,7 @@ fn shell_aliases_print_reports_without_evaluating_them_or_changing_history() {
         fs::set_permissions(&selector, fs::Permissions::from_mode(0o755)).unwrap();
         let alias = shell.app_alias("corefix", selector.to_str().unwrap(), true);
         let script = format!("{alias}\ncorefix --json\ncorefix -- --json\n");
+        let script = shell_script(name, &script);
         let mut command = workspace.program(&path, "");
         command.args(&flags);
         let child = if shell == Shell::Tcsh {
@@ -2265,6 +2316,7 @@ fn shell_aliases_repair_commands_inside_loops() {
         };
         let quoted = Shell::Bash.quote(typed);
         let script = format!("{alias}\n{seed} {quoted}\n{typed}\nfuck -y\n");
+        let script = shell_script(shell, &script);
         let output = finish(
             workspace
                 .program(&path, "")

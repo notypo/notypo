@@ -55,8 +55,7 @@ $global:NotypoCompleter = [scriptblock]::Create($env:NOTYPO_PS_COMPLETER)
 $global:NotypoPrefix = [string]$env:NOTYPO_PS_PREFIX
 $global:NotypoAnswered = $null
 $global:NotypoFailure = $null
-$nativeCompleters = @{}
-$nativeCompleters[$env:NOTYPO_PS_NAME] = {
+$nativeWrapper = {
     param($word, $ast, $cursor)
     $ErrorActionPreference = 'Stop'
     try {
@@ -67,14 +66,31 @@ $nativeCompleters[$env:NOTYPO_PS_NAME] = {
         $global:NotypoFailure = [string]$_
     }
 }
+$nativeCompleters = @{}
+$nativeCompleters[$env:NOTYPO_PS_NAME] = $nativeWrapper
 $line = $env:NOTYPO_PS_LINE
 $cursor = [int]$env:NOTYPO_PS_CURSOR
-foreach ($name in 'NOTYPO_PS_DEFINITIONS', 'NOTYPO_PS_COMPLETER', 'NOTYPO_PS_NAME', 'NOTYPO_PS_LINE', 'NOTYPO_PS_CURSOR', 'NOTYPO_PS_PREFIX') {
+$start = [int]$env:NOTYPO_PS_START
+foreach ($name in 'NOTYPO_PS_DEFINITIONS', 'NOTYPO_PS_COMPLETER', 'NOTYPO_PS_NAME', 'NOTYPO_PS_LINE', 'NOTYPO_PS_CURSOR', 'NOTYPO_PS_PREFIX', 'NOTYPO_PS_START') {
     [Environment]::SetEnvironmentVariable($name, $null)
 }
 # Explicit options keep the registered callback in the completion runspace
 # on Windows PowerShell 5.1 as well as PowerShell 7.
 $result = [System.Management.Automation.CommandCompletion]::CompleteInput($line, $cursor, @{ NativeArgumentCompleters = $nativeCompleters })
+if ($null -eq $global:NotypoAnswered -and $null -eq $global:NotypoFailure -and $PSVersionTable.PSVersion.Major -lt 6) {
+    # Classic PowerShell can omit native callback dispatch. Its callback
+    # contract is the literal prefix, parsed command AST and UTF-16 cursor.
+    # Invoke only the captured callback, never the application's command.
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($line, [ref]$null, [ref]$null).Find({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)
+    if ($ast) {
+        $matches = @(foreach ($match in @(& $nativeWrapper $global:NotypoPrefix $ast $cursor)) {
+            if ($match -is [System.Management.Automation.CompletionResult]) { $match }
+            elseif ($match -is [string] -and $match.Length) { [System.Management.Automation.CompletionResult]::new($match, $match, 'ParameterValue', $match) }
+            elseif ($null -ne $match) { $global:NotypoFailure = 'unsupported native callback result' }
+        })
+        $result = [pscustomobject]@{ ReplacementIndex = $start; ReplacementLength = $cursor - $start; CompletionMatches = $matches }
+    }
+}
 if ($null -ne $global:NotypoFailure) { __notypo_emit 'failed'; return }
 if ($null -eq $global:NotypoAnswered) { __notypo_emit 'unanswered'; return }
 __notypo_emit 'answered'
@@ -252,6 +268,10 @@ pub(super) fn query_at(
             parser::quote_word_with_dialect(prefix, Dialect::PowerShell).len()
         };
     let cursor = query_line.encode_utf16().count().to_string();
+    let start = query_line[..target_start]
+        .encode_utf16()
+        .count()
+        .to_string();
     for word in following {
         query_line.push(' ');
         query_line.push_str(&parser::quote_word_with_dialect(word, Dialect::PowerShell));
@@ -265,6 +285,7 @@ pub(super) fn query_at(
         set("NOTYPO_PS_LINE", &query_line),
         set("NOTYPO_PS_CURSOR", &cursor),
         set("NOTYPO_PS_PREFIX", prefix),
+        set("NOTYPO_PS_START", &start),
     ]);
     let args = [
         "-NoProfile",
