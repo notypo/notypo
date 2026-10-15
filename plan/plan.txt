@@ -160,6 +160,12 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     PowerShell metadata helper and excludes /plan/. No crate was uploaded.
     CI evidence: https://github.com/notypo/notypo/actions/runs/38733428540
     PR: https://github.com/notypo/notypo/pull/1
+    Final CI stability follow-up: the installed Node protocol test retains
+    every help/completion assertion with the real-runtime test allowance of
+    30 seconds per probe, 60 seconds overall. A hosted Windows first-use help
+    query exceeded its earlier test-only limit. Production timeouts and the
+    dedicated probe-limit fixtures are unchanged; final PR checks validate
+    the pushed follow-up commit.
     The owner merges and publishes manually. All other unchecked features and
     inventories are deferred by the owner; historical pending records below
     describe earlier checkpoints rather than the current release validation.

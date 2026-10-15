@@ -207,9 +207,11 @@ complete -o filenames -o nospace -o bashdefault -F _node_complete node node_g
             eprintln!("skipped: node is not installed");
             return;
         };
+        // Verify the installed runtime's protocol independently of hosted
+        // Windows cold-start delays; production probe limits are unchanged.
         let mut budget = Budget::new(
-            std::time::Duration::from_secs(10),
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
             2,
         );
         let env = || vec![(OsString::from("NODE_OPTIONS"), None)];
