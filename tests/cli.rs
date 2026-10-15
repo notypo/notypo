@@ -2,7 +2,7 @@
 
 use notypo::logs::USER_COMMAND_MARK;
 use notypo::shells::Shell;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -84,9 +84,42 @@ fn finish(child: Child) -> Output {
 
 fn finish_within(mut child: Child, limit: Duration) -> Output {
     let deadline = Instant::now() + limit;
+    // Drain both pipes while the shell runs; BSD pipe buffers can be small.
+    let read = |stream: Option<Box<dyn Read + Send>>| {
+        let (send, receive) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut data = Vec::new();
+            if let Some(mut stream) = stream {
+                stream.read_to_end(&mut data).unwrap();
+            }
+            let _ = send.send(data);
+        });
+        receive
+    };
+    let stdout = read(
+        child
+            .stdout
+            .take()
+            .map(|stream| Box::new(stream) as Box<dyn Read + Send>),
+    );
+    let stderr = read(
+        child
+            .stderr
+            .take()
+            .map(|stream| Box::new(stream) as Box<dyn Read + Send>),
+    );
     loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
+        if let Some(status) = child.try_wait().unwrap() {
+            let remaining = || deadline.saturating_duration_since(Instant::now());
+            return Output {
+                status,
+                stdout: stdout
+                    .recv_timeout(remaining())
+                    .expect("stdout did not close"),
+                stderr: stderr
+                    .recv_timeout(remaining())
+                    .expect("stderr did not close"),
+            };
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -333,6 +366,16 @@ fn fake_aws(workspace: &Workspace) -> PathBuf {
 
 /// `bin` first, then the system directories the fake scripts rely on.
 fn system_path(bin: &std::path::Path) -> String {
+    // FreeBSD installs these in /usr/local/bin. Link just the required
+    // shells so unrelated installed programs cannot affect fixture ranking.
+    for name in ["bash", "zsh", "fish", "tcsh", "ksh"] {
+        let link = bin.join(name);
+        if !link.exists()
+            && let Some(shell) = notypo::utils::which(name)
+        {
+            std::os::unix::fs::symlink(shell, link).unwrap();
+        }
+    }
     format!("{}:/usr/bin:/bin", bin.display())
 }
 
@@ -1240,7 +1283,7 @@ fn developer_operations_require_approval_and_y_emits_nothing_to_execute() {
         let command = || {
             let mut command = workspace.command("");
             command
-                .env("PATH", system_path(&bin))
+                .env("PATH", &bin)
                 .env("NOTYPO_DISABLED_SOURCES", "native:help:man:history:legacy")
                 .env("TF_HISTORY", &source)
                 .env("NOTYPO_EXIT_STATUS", "127");

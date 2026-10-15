@@ -46,8 +46,11 @@ function __notypo_emit([string[]] $Fields) {
 }
 $order = 'Alias', 'Function', 'Filter', 'Cmdlet'
 if ($env:NOTYPO_PS_QUERY -eq 'list') {
-    foreach ($command in Microsoft.PowerShell.Core\Get-Command -CommandType $order -ErrorAction SilentlyContinue) {
+    foreach ($command in Microsoft.PowerShell.Core\Get-Command -ListImported -CommandType $order -ErrorAction SilentlyContinue) {
         __notypo_emit 'command', $command.Name
+    }
+    foreach ($available in (Microsoft.PowerShell.Core\Get-Module -ListAvailable -ErrorAction SilentlyContinue)) {
+        foreach ($exported in $available.ExportedCommands.Keys) { __notypo_emit 'command', $exported }
     }
     return
 }
@@ -68,14 +71,14 @@ $shippedRoot = [IO.Path]::GetFullPath($PSHOME).TrimEnd($separator) + $separator
 for ($hop = 0; $hop -lt 4; $hop++) {
     # A wildcard lookup reads module manifests without importing modules.
     $pattern = $name.Substring(0, $name.Length - 1) + '[' + $name[-1] + ']'
-    $command = Microsoft.PowerShell.Core\Get-Command -Name $pattern -CommandType $order -ErrorAction SilentlyContinue |
+    $command = Microsoft.PowerShell.Core\Get-Command -ListImported -Name $pattern -CommandType $order -ErrorAction SilentlyContinue |
         Microsoft.PowerShell.Core\Where-Object { $_.Name -eq $name } |
         Microsoft.PowerShell.Utility\Sort-Object { $order.IndexOf([string]$_.CommandType) } |
         Microsoft.PowerShell.Utility\Select-Object -First 1
     if (-not $command) {
         # An updated module search path may not yet be in Get-Command's index.
         # ListAvailable reads exports without importing the module's code.
-        foreach ($available in (Microsoft.PowerShell.Core\Get-Module -ListAvailable)) {
+        foreach ($available in (Microsoft.PowerShell.Core\Get-Module -ListAvailable -ErrorAction SilentlyContinue)) {
             $exported = $available.ExportedCommands[$name]
             if ($exported -and [string]$exported.CommandType -in $order) { $command = $exported; break }
         }
@@ -501,9 +504,11 @@ pub fn commands(shell: &Path, budget: &mut Budget) -> Result<Vec<String>, Comple
     Ok(names)
 }
 
+const MAX_COMMAND_SNAPSHOT: usize = 4 * 1024 * 1024;
+
 fn command_snapshot(text: &str, limit: usize) -> Result<Vec<String>, CompletionError> {
     let invalid = || CompletionError::Failed("invalid PowerShell command-name snapshot".into());
-    if text.len() > 1024 * 1024 {
+    if text.len() > MAX_COMMAND_SNAPSHOT {
         return Err(invalid());
     }
     let root: serde_json::Value = serde_json::from_str(text).map_err(|_| invalid())?;
@@ -534,7 +539,7 @@ fn command_snapshot_file(path: &Path) -> Result<Vec<String>, CompletionError> {
         |error| CompletionError::Failed(format!("PowerShell command-name snapshot: {error}"));
     let file = std::fs::File::open(path).map_err(failed)?;
     let mut text = String::new();
-    file.take(1024 * 1024 + 1)
+    file.take(MAX_COMMAND_SNAPSHOT as u64 + 1)
         .read_to_string(&mut text)
         .map_err(failed)?;
     command_snapshot(&text, 65_536)
@@ -1374,7 +1379,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(command_snapshot_file(&path).unwrap().len(), 6000);
-        std::fs::write(&path, " ".repeat(1024 * 1024 + 1)).unwrap();
+        std::fs::write(&path, " ".repeat(MAX_COMMAND_SNAPSHOT + 1)).unwrap();
         assert!(command_snapshot_file(&path).is_err());
         std::fs::write(&path, "{\"version\":1,\"names\":[\"bad name\"]}").unwrap();
         assert!(command_snapshot_file(&path).is_err());
