@@ -16,9 +16,9 @@ Status: first and second slices implemented in src/engine/ on branch
         registered in a PowerShell session are bridged (2026-10-05);
         named parameter-value callbacks for PowerShell's own commands are
         bridged (2026-10-06), and positional binding is bridged too.
-        PowerShell provider coverage,
-        captured module/closure state, broader app coverage, and rollout
-        validation remain unfinished.
+        Bounded primitive module/closure state is bridged. Broader provider
+        and application coverage remains future work; the current release's
+        platform and packaging validation is recorded below.
         Fourth slice in progress: npm, pip, clap, Cargo, .NET SDK, urfave/cli,
         click, kingpin, go-flags, yargs, oclif, Symfony Console, and
         RabbitMQ CLI bridges are implemented (section 5B shared-protocol
@@ -91,14 +91,16 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     bounded too. Probes use the failure cwd without changing the parent cwd.
     Persistent metadata includes the raw workspace path; captured errors
     refresh cached words that an app no longer accepts.
-    Last verified full checkpoint: 494 local tests pass with PowerShell 7.6.7,
+    Last verified full checkpoint: 495 local tests pass with PowerShell 7.6.7,
     plus host Clippy. Generated aliases print --json reports as data, respect
     the -- delimiter, and do not execute or add reports to shell history.
     Portable PowerShell tests cover dynamic names/enum values, suffix context,
     quoted dash data, provider location, environment cleanup and operation
     markers. Windows compilation/Clippy passes for this checkpoint.
-    Windows/Linux/FreeBSD compilation checks passed an earlier checkpoint;
-    foreign runtime checks, final package verification and rollout remain open.
+    Release source checkpoint 55201dc passes hosted native tests on Linux,
+    both macOS architectures, Windows and FreeBSD, plus ARM compilation jobs.
+    Clean package verification and publish dry-run pass; no upload occurred.
+    The remaining full-inventory rollout work is deferred to a later release.
     Core progress (2026-10-15): Zsh preserves visible/hidden prefixes and
     suffixes, native quoting, matching transformations, and descriptions.
     Shell-shaped insertion code is accepted only as one literal word.
@@ -151,9 +153,16 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     original literal argument list. A real-shell fixture covers context on
     both sides, quoted dash data, Unicode cursor ranges, invalid/opaque
     context, and an untouched operation marker. No command catalog is added.
-    Current release work: hosted CI verification, package validation and the
-    final publication audit. All other unchecked features and inventories
-    are deferred by the owner (2026-10-15).
+    Publication readiness verified (2026-10-15): source checkpoint 55201dc
+    has a successful terminal CI run, 495 passing local tests, an optimized
+    release build and print-only correction smoke check, and a clean 114-file
+    package with successful publish dry-run. The archive includes the classic
+    PowerShell metadata helper and excludes /plan/. No crate was uploaded.
+    CI evidence: https://github.com/notypo/notypo/actions/runs/38733428540
+    PR: https://github.com/notypo/notypo/pull/1
+    The owner merges and publishes manually. All other unchecked features and
+    inventories are deferred by the owner; historical pending records below
+    describe earlier checkpoints rather than the current release validation.
 
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.
@@ -4493,8 +4502,16 @@ executes it once. Aborting or a denied safety decision executes nothing.
 [x] DONE: Run cargo fmt --all -- --check; cargo test --locked --all-targets;
     cargo clippy --locked --all-targets --all-features -- -D warnings; and
     keep Linux Clippy verification in CI.
-[ ] NOT DONE: Validate Linux/macOS/Windows/FreeBSD builds and available real
+[x] DONE: Validate Linux/macOS/Windows/FreeBSD builds and available real
     shell integrations. Report unavailable runtime coverage explicitly.
+    Verified 2026-10-15 at 55201dc: Linux x86_64, macOS ARM64/Intel, Windows
+    x86_64 MSVC and FreeBSD 14 VM native tests pass in PR CI. The Windows run
+    passes all 193 unit tests and all eight portable PowerShell integrations,
+    including the dynamic-parameter and captured-native-callback regressions.
+    Linux ARM64/armv7 and Windows ARM64 compile checks pass; they do not run
+    target binaries. Rustfmt and Linux Clippy pass. Installed applications,
+    absent shell runtimes and additional runtime versions remain future work.
+    Historical validation record:
     PARTIAL: local macOS Bash/Zsh 5.9/fish 4.9.3 runtime checks pass, including
     real ZLE queries. cargo check --locked --all-targets passes locally for
     aarch64-unknown-linux-gnu, x86_64-pc-windows-msvc, and x86_64-unknown-freebsd;
@@ -4507,6 +4524,11 @@ executes it once. Aborting or a denied safety decision executes nothing.
     one correction corpus, three rule fixture tests).
 [x] DONE: Verify cargo package and cargo publish --dry-run --locked;
     retain the /plan/ exclusion and update public docs.
+    Verified 2026-10-15 at clean source checkpoint 55201dc: 114 files; required
+    source scripts, README, licenses and NOTICE included; /plan/ excluded.
+    Package VCS metadata matches the pushed commit without a dirty marker.
+    Both commands pass with --locked and without --allow-dirty. No upload.
+    Historical package records:
     Verified on macOS with --allow-dirty for the implementation worktree;
     the 72-file archive includes the fish/Zsh handlers and shared Unix terminal
     support, and excludes /plan/. No crate was uploaded.
