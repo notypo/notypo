@@ -114,7 +114,7 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     probe, with credentials and remote roots excluded. A real fixture uses
     spaces, Unicode and apostrophes in the drive root, preserves named value
     completion and never replays its operation. Malformed/duplicate drive
-    data fails closed. Parent-session command names avoid a redundant cold
+    data fails closed. Parent-session command names avoid a redundant
     discovery shell; module export discovery has a read-only fallback.
     PowerShell 7.6 NativeFallback registrations retain captured state, with
     command-specific registrations taking precedence (real runtime fixture).
@@ -135,7 +135,7 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     resumes the suspended primary thread; production probe limits stay the
     same. These fixes await the next hosted validation run.
     Windows follow-up: all 192 unit tests now pass on the hosted runner.
-    Portable PowerShell scripts allow time for multiple cold requests while
+    Portable PowerShell scripts allow time for multiple startup requests while
     retaining their operation, context and cleanup assertions. Native probes
     pass their callback through PowerShell's explicit completion options for
     classic-shell compatibility. The filesystem-drive fixture uses a UTF-8
@@ -670,8 +670,8 @@ and ls --colro=auto the option name while preserving its value.
     case-sensitive, [Flags] values combine with commas, and numbers are
     left to PowerShell. A closed command's list is authoritative; an open
     one gets no parameter checks. Revalidation doesn't stat PowerShell
-    commands. Each probe takes about 0.4 s; descriptions are not cached on
-    disk. TabExpansion2 argument completers for these commands' parameters
+    commands. Descriptions are not cached on disk. TabExpansion2 argument
+    completers for these commands' parameters
     (`Register-ArgumentCompleter -ParameterName`, ArgumentCompleter
     attributes, which run module script blocks), positional values, and
     dynamic parameters of other providers (`Get-ChildItem HKLM:\`) are not
@@ -1524,8 +1524,8 @@ SHARED IMPLEMENTATION AND COVERAGE TASKS
     for pre-1.18 layouts and files without such a section. vault 2.1.1's
     macOS executable (536,915,920 bytes) exceeded the scan's 512 MiB limit,
     so it was routed to Homebrew's `complete -C` file instead of posener.
-    All 31 Go executables in /opt/homebrew/bin match `go version -m` (about
-    0.2 ms each, without reading the file through). Unit fixtures cover
+    All 31 Go executables in /opt/homebrew/bin match `go version -m`
+    without reading the entire file. Unit fixtures cover
     Mach-O, universal, ELF32 big-endian, ELF64, and PE headers with an
     earlier decoy record, malformed headers (a zero-sized load command,
     oversized tables, a Java class file), and a sparse file beyond the
@@ -2951,8 +2951,8 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     entry point dispatches to its own binaries, and its help lacks click's
     marker, so the click bridge does not apply even with both trusts),
     bandit 1.9.4, pip-audit
-    2.10.1, checkov 3.3.20 (about 3.5 s cold, past the default 3 s probe
-    limit on first use), lynis 3.1.7 (usage after a banner, exit 64, now
+    2.10.1, checkov 3.3.20 (first use can exceed the default probe timeout;
+    configure a larger limit), lynis 3.1.7 (usage after a banner, exit 64, now
     accepted), clamav 1.5.4's clamscan, nikto 2.6.1, and snyk 1.1307.4.
     Discovery runs only completion and help, never a scan; help probes now
     get the same offline environment as handler probes, and every probe
@@ -4218,7 +4218,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     No crate is uploaded. No Docker, foreign runtime, or foreign
     cross-target check is run; provider/closure/app inventory work stays open.
 
-6. CONTROL PROBES, CACHES, AND LATENCY
+6. CONTROL PROBES, CACHES, AND TIMEOUTS
 
 [x] DONE: Centralize help/completion/plugin subprocesses with timeouts,
     process-tree cleanup, stdin disabled, output caps, and bounded concurrency.
