@@ -283,6 +283,55 @@ fn parent_provider_location_does_not_lend_filesystem_parameters() {
 }
 
 #[test]
+fn filesystem_session_drives_reach_metadata_and_parameter_callbacks() {
+    for (index, shell) in runtimes().into_iter().enumerate() {
+        let workspace = Workspace(
+            std::env::temp_dir().join(format!("notypo-core-drive-{}-{index}", std::process::id())),
+        );
+        let root = workspace.0.join("one's 三 project");
+        fs::create_dir_all(root.join("directory")).unwrap();
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let setup = workspace.0.join("setup.ps1");
+        let operations = workspace.0.join("operations");
+        fs::write(&setup, format!(
+            "function Get-CoreFixture {{ [CmdletBinding()] param([string]$Target) [IO.File]::AppendAllText({},'original'); throw 'fixture failure' }}\nRegister-ArgumentCompleter -CommandName Get-CoreFixture -ParameterName Target -ScriptBlock {{ param($command,$parameter,$word,$ast,$bound) if ((Get-PSDrive -Name Work).Root -eq {}) {{ [System.Management.Automation.CompletionResult]::new(\"'Work:/west one'\",'West','ParameterValue','Drive context') }} }}\n",
+            quote(operations.to_str().unwrap()), quote(root.to_str().unwrap())
+        )).unwrap();
+        let input = format!(
+            "Invoke-Expression ((& {} --alias corefix) -join \"BTn\")\n. {}\n$null = New-PSDrive -Name Work -PSProvider FileSystem -Root {}\nSet-Location Work:\nGet-ChildItem -Direcotry -LiteralPath 'Work:/'\ncorefix --json\nGet-CoreFixture -Target 'Work:/wesst one'\ncorefix --json\n[Console]::Out.WriteLine('drives-context-left:' + [bool]$env:NOTYPO_POWERSHELL_DRIVES)\nexit\n",
+            quote(env!("CARGO_BIN_EXE_notypo")), quote(setup.to_str().unwrap()), quote(root.to_str().unwrap())
+        ).replace("BT", &char::from(96).to_string());
+        let (output, errors) = run(&shell, &workspace.0, &input);
+        let detail = format!(
+            "{}\n{}\n{}",
+            shell.display(),
+            String::from_utf8_lossy(&output),
+            String::from_utf8_lossy(&errors)
+        );
+        let reports = reports(&output);
+        assert_eq!(reports.len(), 2, "{detail}");
+        assert_eq!(
+            reports[0]["candidates"][0]["command"],
+            "Get-ChildItem -Directory -LiteralPath 'Work:/'",
+            "{detail}"
+        );
+        assert_eq!(
+            reports[1]["candidates"][0]["command"], "Get-CoreFixture -Target 'Work:/west one'",
+            "{detail}"
+        );
+        assert_eq!(
+            fs::read_to_string(&operations).unwrap(),
+            "original",
+            "{detail}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("drives-context-left:False"),
+            "{detail}"
+        );
+    }
+}
+
+#[test]
 fn parameter_callbacks_restore_primitive_closure_and_private_module_state() {
     for (index, shell) in runtimes().into_iter().enumerate() {
         for kind in ["closure", "module"] {

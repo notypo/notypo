@@ -14,7 +14,13 @@ $env:NOTYPO_POWERSHELL_COMPLETIONS = try {
     $seen = @{}
     $registrations = @(foreach ($name in $keys) {
         $block = $null
-        if (-not $table -or $seen.ContainsKey($name) -or -not $table.TryGetValue($name, [ref]$block) -or -not $block) { continue }
+        if (-not $table -or $seen.ContainsKey($name)) { continue }
+        if (-not $table.TryGetValue($name, [ref]$block)) {
+            # PowerShell 7.6's NativeFallback registration uses this table key.
+            # Older shells have no entry and simply contribute no fallback.
+            $null = $table.TryGetValue('___ps::<native_fallback_key>@@___', [ref]$block)
+        }
+        if (-not $block) { continue }
         $seen[$name] = $true
         $saved = __notypo_capture $block
         @{ name = $name; body = $saved.body; portable = $saved.portable; definitions = $saved.definitions; capture = $saved.capture }

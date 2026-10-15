@@ -27,6 +27,8 @@ pub const POWERSHELL_COMPLETERS: &str = concat!(
     include_str!("shells/powershell_state.ps1"),
     include_str!("shells/powershell_completers.ps1")
 );
+const POWERSHELL_NAMES: &str = include_str!("shells/powershell_names.ps1");
+const POWERSHELL_DRIVES: &str = include_str!("shells/powershell_drives.ps1");
 const POWERSHELL_NATIVE_COMPLETERS: &str = include_str!("shells/powershell_completers.ps1");
 
 /// Session parameter callbacks and command definitions, without executing
@@ -705,6 +707,8 @@ impl Shell {
                  $history = $notypo_event.CommandLine;\n    \
                  if (-not [string]::IsNullOrWhiteSpace($history)) {{\n        \
                  $env:NOTYPO_POWERSHELL_LOCATION = [string]$ExecutionContext.SessionState.Path.CurrentLocation;\n        \
+                 {POWERSHELL_DRIVES}\n        \
+                 {POWERSHELL_NAMES}\n        \
                  $notypo_errors = @($global:Error | Where-Object {{ $_.InvocationInfo -and $_.InvocationInfo.HistoryId -eq $notypo_event.Id }});\n        \
                  [array]::Reverse($notypo_errors);\n        \
                  $notypo_failures = @($notypo_errors | Where-Object {{ $_.FullyQualifiedErrorId -notlike 'NativeCommandError*' }});\n        \
@@ -729,7 +733,7 @@ impl Shell {
                  $notypo_report = $false;\n        \
                  foreach ($notypo_argument in $args) {{ if ($notypo_argument -eq '--') {{ break }}; if ($notypo_argument -in @('--json', '--explain')) {{ $notypo_report = $true }} }};\n        \
                  $fuck = $(& {exe} $args);\n        \
-                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_POWERSHELL_COMPLETIONS, Env:NOTYPO_POWERSHELL_PARAMETERS, Env:NOTYPO_POWERSHELL_WRAPPERS, Env:NOTYPO_POWERSHELL_LOCATION, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
+                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_POWERSHELL_COMPLETIONS, Env:NOTYPO_POWERSHELL_PARAMETERS, Env:NOTYPO_POWERSHELL_WRAPPERS, Env:NOTYPO_POWERSHELL_LOCATION, Env:NOTYPO_POWERSHELL_DRIVES, Env:NOTYPO_POWERSHELL_NAMES, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
                  if ($notypo_report) {{ $fuck }} elseif (-not [string]::IsNullOrWhiteSpace($fuck)) {{\n            \
                  Microsoft.PowerShell.Utility\\Invoke-Expression -Command $fuck;\n        }}\n    }}\n    [Console]::ResetColor() \n}}\n"
             ),

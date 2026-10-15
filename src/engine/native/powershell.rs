@@ -32,10 +32,13 @@ use std::rc::Rc;
 /// Passed with `-Command`, so it holds no double quotes: Windows argument
 /// quoting can't then change it. Output is one tab-separated record per
 /// line; a record with a control character in any field is left out.
-const SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+const SCRIPT: &str = concat!(
+    r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
-if ($env:NOTYPO_PS_LOCATION) { Microsoft.PowerShell.Management\Set-Location -LiteralPath $env:NOTYPO_PS_LOCATION }
+"#,
+    include_str!("powershell_location.ps1"),
+    r#"
 $tab = [string][char]9
 function __notypo_emit([string[]] $Fields) {
     foreach ($field in $Fields) { if ($field -match '[\x00-\x1f\x7f]') { return } }
@@ -69,6 +72,14 @@ for ($hop = 0; $hop -lt 4; $hop++) {
         Microsoft.PowerShell.Core\Where-Object { $_.Name -eq $name } |
         Microsoft.PowerShell.Utility\Sort-Object { $order.IndexOf([string]$_.CommandType) } |
         Microsoft.PowerShell.Utility\Select-Object -First 1
+    if (-not $command) {
+        # An updated module search path may not yet be in Get-Command's index.
+        # ListAvailable reads exports without importing the module's code.
+        foreach ($available in (Microsoft.PowerShell.Core\Get-Module -ListAvailable)) {
+            $exported = $available.ExportedCommands[$name]
+            if ($exported -and [string]$exported.CommandType -in $order) { $command = $exported; break }
+        }
+    }
     if (-not $command -or [string]$command.CommandType -ne 'Alias') { break }
     $name = $command.Definition
     if ($name -notmatch '^[A-Za-z0-9_.-]+$') { $command = $null; break }
@@ -151,7 +162,8 @@ foreach ($parameter in $parameters) {
     }
     if ($callbacks -and ($callbacks.ContainsKey($info.Name + ':' + $parameter.Name) -or $callbacks.ContainsKey($parameter.Name))) { __notypo_emit 'completer', $parameter.Name }
 }
-"#;
+"#
+);
 
 /// The PowerShell to ask: the one the parent session runs in, when its
 /// function names an absolute PowerShell executable, else `pwsh` (or
@@ -417,12 +429,18 @@ pub(super) fn environment(query: &[(&str, &str)]) -> Vec<(OsString, Option<OsStr
             "NOTYPO_PS_MODULE",
             "NOTYPO_PS_ARGUMENTS",
             "NOTYPO_PS_LOCATION",
+            "NOTYPO_PS_DRIVES",
+            "NOTYPO_PS_PREFIX",
         ]
         .map(|k| (OsString::from(k), None)),
     );
     env.push((
         "NOTYPO_PS_LOCATION".into(),
         std::env::var_os("NOTYPO_POWERSHELL_LOCATION"),
+    ));
+    env.push((
+        "NOTYPO_PS_DRIVES".into(),
+        std::env::var_os("NOTYPO_POWERSHELL_DRIVES"),
     ));
     env.extend(query.iter().map(|(k, v)| set(k, v)));
     env
@@ -448,14 +466,27 @@ fn run(
 /// The names of the cmdlets, functions, and aliases PowerShell can run
 /// without user configuration, read without importing any module.
 pub fn commands(shell: &Path, budget: &mut Budget) -> Result<Vec<String>, CompletionError> {
+    if let Ok(snapshot) = std::env::var("NOTYPO_POWERSHELL_NAMES")
+        && !snapshot.is_empty()
+    {
+        return command_snapshot(&snapshot, budget.max_candidates);
+    }
     let text = run(shell, &[("NOTYPO_PS_QUERY", "list")], budget)?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let mut names = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for line in text.lines() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         match line.split('\t').collect::<Vec<_>>().as_slice() {
             [] | [""] => {}
-            ["command", name] if is_command_name(name) => names.push((*name).to_owned()),
+            ["command", name] if is_command_name(name) => {
+                if seen.insert(name.to_ascii_lowercase()) {
+                    names.push((*name).to_owned());
+                }
+                if names.len() > budget.max_candidates {
+                    return Err(super::over_limit());
+                }
+            }
             // Script names (`cd..`) and other odd names aren't offered.
             ["command", _] => {}
             _ => {
@@ -463,6 +494,33 @@ pub fn commands(shell: &Path, budget: &mut Budget) -> Result<Vec<String>, Comple
                     "unexpected PowerShell record `{line}`"
                 )));
             }
+        }
+    }
+    Ok(names)
+}
+
+fn command_snapshot(text: &str, limit: usize) -> Result<Vec<String>, CompletionError> {
+    let invalid = || CompletionError::Failed("invalid PowerShell command-name snapshot".into());
+    if text.len() > 64 * 1024 {
+        return Err(invalid());
+    }
+    let root: serde_json::Value = serde_json::from_str(text).map_err(|_| invalid())?;
+    if root["version"] != 1 || root.as_object().is_none_or(|root| root.len() != 2) {
+        return Err(invalid());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for entry in root["names"].as_array().ok_or_else(invalid)? {
+        let name = entry
+            .as_str()
+            .filter(|name| is_command_name(name))
+            .ok_or_else(invalid)?;
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(invalid());
+        }
+        names.push(name.into());
+        if names.len() > limit {
+            return Err(super::over_limit());
         }
     }
     Ok(names)
@@ -1270,6 +1328,25 @@ pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn parent_command_names_are_validated_and_bounded() {
+        let snapshot = r#"{"version":1,"names":["Get-ChildItem","gci"]}"#;
+        assert_eq!(
+            command_snapshot(snapshot, 2).unwrap(),
+            ["Get-ChildItem", "gci"]
+        );
+        assert!(command_snapshot(snapshot, 1).is_err());
+        for snapshot in [
+            r#"{"version":1,"names":["gci","GCI"]}"#,
+            r#"{"version":1,"names":["bad name"]}"#,
+            r#"{"version":1,"names":null}"#,
+            r#"{"version":2,"names":[]}"#,
+            r#"{"version":1,"names":[],"extra":1}"#,
+        ] {
+            assert!(command_snapshot(snapshot, 10).is_err(), "{snapshot}");
+        }
+    }
+
     struct FixtureDirectory(PathBuf);
 
     impl FixtureDirectory {
@@ -1484,6 +1561,35 @@ pub(crate) mod tests {
             malformed.is_err(),
             "an unavailable provider must not fall through to filesystem metadata"
         );
+    }
+
+    #[test]
+    fn malformed_drive_context_never_falls_through_to_default_metadata() {
+        let Some(shell) = pwsh() else { return };
+        let root = std::env::temp_dir().to_string_lossy().into_owned();
+        let entry = serde_json::json!({"name":"NotypoDrive","root":root});
+        for snapshot in [
+            serde_json::json!({"version":1,"wrong":[]}),
+            serde_json::json!({"version":1,"drives":null}),
+            serde_json::json!({"version":2,"drives":[]}),
+            serde_json::json!({"version":1,"drives":[{"name":"Bad*Drive","root":root}]}),
+            serde_json::json!({"version":1,"drives":[{"name":"Drive","root":"relative/path"}]}),
+            serde_json::json!({"version":1,"drives":[entry.clone(),entry]}),
+        ] {
+            assert!(
+                run(
+                    &shell,
+                    &[
+                        ("NOTYPO_PS_QUERY", "describe"),
+                        ("NOTYPO_PS_NAME", "Get-ChildItem"),
+                        ("NOTYPO_PS_DRIVES", &snapshot.to_string()),
+                    ],
+                    &mut budget()
+                )
+                .is_err(),
+                "{snapshot}"
+            );
+        }
     }
 
     /// Get-ChildItem's parameters as PowerShell 7.6 lists them in a
@@ -1882,7 +1988,7 @@ pub(crate) mod tests {
             // PowerShell reconstructs PSModulePath during Windows startup.
             // Add this isolated fixture to the actual child's search path.
             let script = format!(
-                "$env:PSModulePath = $env:NOTYPO_TEST_MODULE_ROOT + [IO.Path]::PathSeparator + $env:PSModulePath; {SCRIPT}"
+                "$env:PSModulePath = $env:NOTYPO_TEST_MODULE_ROOT + [IO.Path]::PathSeparator + $env:PSModulePath; & {{ {SCRIPT} }}; [Console]::Error.WriteLine('fixture available modules: ' + @(Microsoft.PowerShell.Core\\Get-Module -ListAvailable -Name FakeTool).Count)"
             );
             let output = std::process::Command::new(&pwsh)
                 .args([
@@ -1909,7 +2015,14 @@ pub(crate) mod tests {
                 "{}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            parse(&String::from_utf8(output.stdout).unwrap()).unwrap()
+            let answer = parse(&String::from_utf8(output.stdout).unwrap()).unwrap();
+            assert_ne!(
+                answer,
+                Answer::Missing,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            answer
         };
         assert_eq!(
             ask(&[]),

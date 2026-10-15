@@ -91,7 +91,7 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     bounded too. Probes use the failure cwd without changing the parent cwd.
     Persistent metadata includes the raw workspace path; captured errors
     refresh cached words that an app no longer accepts.
-    Last verified full checkpoint: 481 local tests pass with PowerShell 7.6.7,
+    Last verified full checkpoint: 485 local tests pass with PowerShell 7.6.7,
     plus host Clippy. Generated aliases print --json reports as data, respect
     the -- delimiter, and do not execute or add reports to shell history.
     Portable PowerShell tests cover dynamic names/enum values, suffix context,
@@ -107,8 +107,17 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     rustup, mdbook, elan and dua generated-completer checks pass. Host and
     Windows/Linux/FreeBSD Clippy pass; platform fixes await hosted runtime
     verification. No benchmark directories or new app installations.
-    Remaining core work: supported-protocol upgrade records, remaining
-    session context, platform/package validation and the final release audit.
+    Further core progress (2026-10-15): bounded local filesystem drive
+    definitions are restored in every PowerShell metadata/binder/callback
+    probe, with credentials and remote roots excluded. A real fixture uses
+    spaces, Unicode and apostrophes in the drive root, preserves named value
+    completion and never replays its operation. Malformed/duplicate drive
+    data fails closed. Parent-session command names avoid a redundant cold
+    discovery shell; module export discovery has a read-only fallback.
+    PowerShell 7.6 NativeFallback registrations retain captured state, with
+    command-specific registrations taking precedence (real runtime fixture).
+    Remaining core work: supported-protocol upgrade records, hosted platform
+    verification, package validation and the final release audit.
 
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.
@@ -235,7 +244,7 @@ source, and a provider can return structured edits with recorded provenance.
 
 2. CAPTURE FAILURE CONTEXT WITHOUT REPLAYING THE COMMAND
 
-[ ] NOT DONE: Extend shell integration to preserve the preceding exit status
+[x] DONE: Extend shell integration to preserve the preceding exit status
     before alias setup changes it, and pass shell/cwd/session context to Rust.
     PARTIAL: Bash, zsh, and fish capture exit and pipeline statuses first
     (tested in real shells). tcsh captures $status first (it has no pipeline
@@ -570,9 +579,14 @@ and ls --colro=auto the option name while preserving its value.
     PATH index, builtins, aliases, supplied Bash/zsh/fish function names, and
     argument context (a program whose completer accepts the next word ranks
     first); tests/cli.rs exercises function discovery and correction.
-[ ] NOT DONE: Shell completion adapters: collect bounded results from native
+[x] DONE: Shell completion adapters: collect bounded results from native
     completion facilities for bash/zsh/fish/PowerShell. Completion functions
     can execute code, so invocation must obey the shared probe trust policy.
+    Closed for supported protocol forms (2026-10-15): all four shell adapters,
+    session registrations, bounded primitive PowerShell state and rich literal
+    Zsh results are implemented. Live objects and insertion code that is not
+    one literal word report unsupported. Foreign runtime validation remains
+    the separate section 10 gate. Older PARTIAL records below are history.
     PARTIAL: Bash functions, Zsh autoload handlers in real ZLE widgets, and
     fish complete --do-complete (sourced scripts,
     opt-in via trusted_completers) are bridged with shared probe limits.
@@ -760,10 +774,14 @@ and ls --colro=auto the option name while preserving its value.
     Discovery prefers the parent shell's handler, then other installed shell
     protocols; a Bash-to-Zsh fallback is covered through the CLI. Missing app
     identity never gives an installed shell handler audited automatic trust.
-[ ] NOT DONE: Discover the active shell's registered handler or the app's
+[x] DONE: Discover the active shell's registered handler or the app's
     documented completion entry point automatically. Preserve full command
     context, target token, cursor position, cwd, dialect, and relevant options;
     correctly translate cursor units and quoting for each native protocol.
+    Closed for supported protocols (2026-10-15): session/file discovery,
+    literal prefix/suffix context, cursor units, PowerShell provider location
+    and local filesystem drives are covered. Opaque or unavailable contexts
+    abstain explicitly; unsupported app protocols remain future inventory work.
     PARTIAL: documented entry points (aws_completer, argcomplete, git helpers,
     cobra __complete, posener COMP_LINE) are discovered with per-protocol
     cursor units. Installed Bash/fish/Zsh handlers are located; fish and Zsh
@@ -825,10 +843,14 @@ and ls --colro=auto the option name while preserving its value.
     other files (bash-completion's own helpers are not loaded either), and
     PowerShell's Register-ArgumentCompleter (passed since 2026-10-05; see
     the shell completion adapters record).
-[ ] NOT DONE: Make app-native completion the primary command/argument provider.
+[x] DONE: Make app-native completion the primary command/argument provider.
     Normalize plain/rich results, replacement ranges, descriptions, enum values,
     and quoting hints. A new operation must work when the app exposes it even
     if notypo has never encountered that operation before.
+    Closed for supported formats (2026-10-15): descriptions, literal affixes,
+    quoted values with spaces and PowerShell replacement-range validation
+    feed the shared source-span edit layer. Other-source spans and executable
+    insertion code are refused rather than editing a different token.
     PARTIAL: primary for commands, options, and values; enum values are used.
     cobra and fish descriptions are kept (control and bidi characters
     removed, one line, capped), cached, and shown in --explain/--json and
@@ -1400,10 +1422,13 @@ command catalogs. They use the same app-native discovery/correction mechanism.
 
 SHARED IMPLEMENTATION AND COVERAGE TASKS
 
-[ ] NOT DONE: Implement reusable backends for installed shell handlers,
+[x] DONE: Implement reusable backends for installed shell handlers,
     app-generated completion scripts, completion subprocess protocols,
     Python completion protocols, and PowerShell completion/cmdlet metadata.
     Reuse a protocol bridge across apps instead of writing one rule per service.
+    Closed for core release protocols (2026-10-15): reusable shell, generated
+    script, Python, subprocess and PowerShell metadata/callback bridges exist.
+    The five additional 5B protocols remain explicitly future work.
     PARTIAL: completion subprocess protocols (aws_completer, git, cobra, posener),
     argcomplete, Bash/Zsh completion functions, and installed fish scripts are
     implemented; app-generated scripts and PowerShell remain pending.

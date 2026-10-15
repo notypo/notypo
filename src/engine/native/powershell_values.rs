@@ -124,10 +124,13 @@ impl Snapshot {
 
 // Fixed code, query data in the environment. Qualified cmdlets prevent a
 // restored function from replacing any of the probe's own commands.
-const SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+const SCRIPT: &str = concat!(
+    r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
-if ($env:NOTYPO_PS_LOCATION) { Microsoft.PowerShell.Management\Set-Location -LiteralPath $env:NOTYPO_PS_LOCATION }
+"#,
+    include_str!("powershell_location.ps1"),
+    r#"
 $factoryType = 'System.Management.Automation.ArgumentCompleterFactoryAttribute' -as [type]
 $hintsType = 'System.Management.Automation.ArgumentCompletionsAttribute' -as [type]
 if ($env:NOTYPO_PS_DEFINITIONS) { . ([scriptblock]::Create($env:NOTYPO_PS_DEFINITIONS)) }
@@ -219,7 +222,8 @@ foreach ($match in $result.CompletionMatches) {
     if (@($fields | Microsoft.PowerShell.Core\Where-Object { $_ -match '[\x00-\x1f\x7f]' }).Count) { continue }
     [Console]::Out.Write(($fields -join [char]9) + [char]10)
 }
-"#;
+"#
+);
 
 fn quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -303,10 +307,13 @@ fn line_with_literals(
 /// Ask PowerShell which parameter owns a literal positional slot. Static
 /// binding inspects the AST, including named arguments after the slot; it
 /// does not invoke the command, its validators, or its completers.
-const BIND_SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+const BIND_SCRIPT: &str = concat!(
+    r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
-if ($env:NOTYPO_PS_LOCATION) { Microsoft.PowerShell.Management\Set-Location -LiteralPath $env:NOTYPO_PS_LOCATION }
+"#,
+    include_str!("powershell_location.ps1"),
+    r#"
 if ($env:NOTYPO_PS_DEFINITIONS) { . ([scriptblock]::Create($env:NOTYPO_PS_DEFINITIONS)) }
 $lookup = @{ Name = [WildcardPattern]::Escape($env:NOTYPO_PS_NAME); CommandType = @('Function','Filter','Cmdlet'); ErrorAction = 'Stop' }
 if ($env:NOTYPO_PS_MODULE) { $lookup.Module = $env:NOTYPO_PS_MODULE }
@@ -337,7 +344,8 @@ $names = @(foreach ($entry in $result.BoundParameters.GetEnumerator()) {
 })
 if ($names.Count -ne 1) { [Console]::Out.WriteLine('unbound'); return }
 [Console]::Out.WriteLine('bound' + [char]9 + $names[0])
-"#;
+"#
+);
 
 pub(super) fn bind_positional(
     shell: &Path,

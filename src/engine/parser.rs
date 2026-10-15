@@ -2937,10 +2937,25 @@ mod tests {
         for (src, ..) in FISH_COMPOUNDS {
             assert_ne!(shell_accepts("fish", src), Some(false), "fish: {src:?}");
         }
+        let fish_brace_groups = std::process::Command::new("fish")
+            .arg("--version")
+            .output()
+            .ok()
+            .and_then(|output| {
+                let text = String::from_utf8_lossy(&output.stdout);
+                let mut parts = text
+                    .split(|c: char| !c.is_ascii_digit())
+                    .filter(|part| !part.is_empty());
+                Some((
+                    parts.next()?.parse::<u32>().ok()?,
+                    parts.next()?.parse::<u32>().ok()?,
+                ))
+            })
+            .is_some_and(|version| version >= (4, 1));
         for src in FISH_REJECTED.0 {
-            // Fish 3 treats braces as ordinary words. Fish 4 introduced
+            // Older fish treats braces as ordinary words. Fish 4.1 introduced
             // brace groups; our parser deliberately refuses malformed groups.
-            if src.contains(['{', '}']) && shell_accepts("fish", "{}") == Some(false) {
+            if src.contains(['{', '}']) && !fish_brace_groups {
                 continue;
             }
             assert_ne!(shell_accepts("fish", src), Some(true), "fish: {src:?}");
@@ -3144,7 +3159,7 @@ mod tests {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let printed: Vec<&str> = stdout
                 .lines()
-                .map(|line| line.trim_start_matches(['>', '%', ' ', '\t']))
+                .map(|line| line.trim_start_matches(['>', '%', '#', ' ', '\t']))
                 .filter_map(|l| l.strip_prefix('[')?.strip_suffix(']'))
                 .collect();
             let expected: Vec<&str> = values.iter().chain(&values).copied().collect();

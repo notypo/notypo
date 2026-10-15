@@ -38,9 +38,12 @@ const MEMORY_LIMIT: usize = 64 * 1024;
 /// the probe calls cmdlets by module-qualified name and asks
 /// `CommandCompletion` (what `TabExpansion2` calls) directly, so a session
 /// function can't stand in for the probe's own commands.
-const SCRIPT: &str = r#"$ErrorActionPreference = 'Stop'
+const SCRIPT: &str = concat!(
+    r#"$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-if ($env:NOTYPO_PS_LOCATION) { Microsoft.PowerShell.Management\Set-Location -LiteralPath $env:NOTYPO_PS_LOCATION }
+"#,
+    include_str!("powershell_location.ps1"),
+    r#"
 if ($env:NOTYPO_PS_DEFINITIONS) { . ([scriptblock]::Create($env:NOTYPO_PS_DEFINITIONS)) }
 try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { }
 $tab = [string][char]9
@@ -79,7 +82,8 @@ if ($global:NotypoAnswered -eq 0) { return }
 foreach ($match in $result.CompletionMatches) {
     __notypo_emit 'match', $match.CompletionText, ([string]$match.ResultType), ([string]$match.ToolTip -replace '[\x00-\x1f\x7f]', ' ')
 }
-"#;
+"#
+);
 
 /// What the session passed for one command name.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -617,6 +621,39 @@ mod tests {
         ));
         assert_eq!(budget.spawned(), 0);
         assert!(!marker.exists(), "snapshot export invoked an object's code");
+    }
+
+    #[test]
+    fn native_fallbacks_preserve_scope_and_specific_registrations_take_precedence() {
+        let Some(pwsh) = super::super::powershell::tests::pwsh() else {
+            return;
+        };
+        let dir = Workspace::new("ps-native-fallback");
+        let setup = dir.0.join("setup.ps1");
+        std::fs::write(&setup, "$supported = (Get-Command Register-ArgumentCompleter).Parameters.ContainsKey('NativeFallback'); if ($supported) { $callback = & { $choice = 'build'; { param($word,$ast,$cursor) $choice }.GetNewClosure() }; Register-ArgumentCompleter -NativeFallback -ScriptBlock $callback; Register-ArgumentCompleter -CommandName specific -ScriptBlock { 'deploy' } }").unwrap();
+        let script = dir.0.join("capture.ps1");
+        std::fs::write(&script, format!(". '{}'\nif (-not $supported) {{ [Console]::Out.Write('unavailable'); exit }}\n$history = 'tool biuld; specific deply'\n{}\n[Console]::Out.Write($env:NOTYPO_POWERSHELL_COMPLETIONS)", setup.to_string_lossy().replace('\'', "''"), crate::shells::POWERSHELL_COMPLETERS)).unwrap();
+        let output = std::process::Command::new(&pwsh)
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        if text == "unavailable" {
+            return;
+        }
+        for (name, expected) in [("tool", "build"), ("specific", "deploy")] {
+            let registration = memory_in(&text, name).unwrap_or_else(|| panic!("{text}"));
+            let mut budget = Budget::new(Duration::from_secs(20), Duration::from_secs(5), 8);
+            let answer =
+                query(&pwsh, &registration, name, &[], "", Vec::new(), &mut budget).unwrap();
+            assert_eq!(parse(&answer, name, 10).unwrap()[0].value, expected);
+        }
     }
 
     #[test]
