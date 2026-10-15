@@ -74,7 +74,10 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     verified in real PowerShell. When omitting a misspelled parameter makes
     Get-Command unable to bind its value, the native completion binder sees
     the full literal line and cursor. Those lists are explicitly partial,
-    with unknown arity retained. Captured closure/module data remains open.
+    with unknown arity retained. Named parameter and native program callbacks
+    now restore bounded primitive closure/module data and private helpers.
+    Live objects report unsupported without running their custom getters;
+    module initialization and the failed operation are not replayed.
     Bash -F/-C/-W registrations use native compgen filtering and affixes;
     failed callbacks discard partial answers. tcsh passes session aliases
     without launching startup files. PowerShell executes selected echo and
@@ -88,7 +91,7 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     bounded too. Probes use the failure cwd without changing the parent cwd.
     Persistent metadata includes the raw workspace path; captured errors
     refresh cached words that an app no longer accepts.
-    Last verified full checkpoint: 472 local tests pass with PowerShell 7.6.7,
+    Last verified full checkpoint: 481 local tests pass with PowerShell 7.6.7,
     plus host Clippy. Generated aliases print --json reports as data, respect
     the -- delimiter, and do not execute or add reports to shell history.
     Portable PowerShell tests cover dynamic names/enum values, suffix context,
@@ -96,9 +99,16 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     markers. Windows compilation/Clippy passes for this checkpoint.
     Windows/Linux/FreeBSD compilation checks passed an earlier checkpoint;
     foreign runtime checks, final package verification and rollout remain open.
-    Remaining core work: captured PowerShell module/closure state, richer
-    shell results, supported-protocol
-    upgrade records, platform/package validation and the final release audit.
+    Core progress (2026-10-15): Zsh preserves visible/hidden prefixes and
+    suffixes, native quoting, matching transformations, and descriptions.
+    Shell-shaped insertion code is accepted only as one literal word.
+    Cobra and Bash retain literal values containing spaces. An explicit
+    empty PowerShell target preserves its AST position before later words;
+    rustup, mdbook, elan and dua generated-completer checks pass. Host and
+    Windows/Linux/FreeBSD Clippy pass; platform fixes await hosted runtime
+    verification. No benchmark directories or new app installations.
+    Remaining core work: supported-protocol upgrade records, remaining
+    session context, platform/package validation and the final release audit.
 
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.

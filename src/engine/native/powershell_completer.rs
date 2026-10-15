@@ -49,15 +49,16 @@ function __notypo_emit([string[]] $Fields) {
     [Console]::Out.Write(($Fields -join $tab) + [char]10)
 }
 $global:NotypoCompleter = [scriptblock]::Create($env:NOTYPO_PS_COMPLETER)
+$global:NotypoPrefix = [string]$env:NOTYPO_PS_PREFIX
 $global:NotypoAnswered = $null
 $global:NotypoFailure = $null
 $registration = @{ CommandName = $env:NOTYPO_PS_NAME }
 if ($PSVersionTable.PSVersion.Major -ge 6) { $registration.Native = $true }
 Microsoft.PowerShell.Core\Register-ArgumentCompleter @registration -ScriptBlock {
     param($word, $ast, $cursor)
-    $ErrorActionPreference = 'Continue'
+    $ErrorActionPreference = 'Stop'
     try {
-        $results = @(& $global:NotypoCompleter $word $ast $cursor 3>$null 4>$null 5>$null 6>$null)
+        $results = @(& $global:NotypoCompleter $global:NotypoPrefix $ast $cursor 3>$null 4>$null 5>$null 6>$null)
         $global:NotypoAnswered = $results.Count
         $results
     } catch {
@@ -66,7 +67,7 @@ Microsoft.PowerShell.Core\Register-ArgumentCompleter @registration -ScriptBlock 
 }
 $line = $env:NOTYPO_PS_LINE
 $cursor = [int]$env:NOTYPO_PS_CURSOR
-foreach ($name in 'NOTYPO_PS_DEFINITIONS', 'NOTYPO_PS_COMPLETER', 'NOTYPO_PS_NAME', 'NOTYPO_PS_LINE', 'NOTYPO_PS_CURSOR') {
+foreach ($name in 'NOTYPO_PS_DEFINITIONS', 'NOTYPO_PS_COMPLETER', 'NOTYPO_PS_NAME', 'NOTYPO_PS_LINE', 'NOTYPO_PS_CURSOR', 'NOTYPO_PS_PREFIX') {
     [Environment]::SetEnvironmentVariable($name, $null)
 }
 $result = [System.Management.Automation.CommandCompletion]::CompleteInput($line, $cursor, $null)
@@ -88,6 +89,8 @@ pub struct Registration {
     /// `using namespace` lines, then the function definitions of the
     /// scripts that registered the session's completers.
     pub definitions: String,
+    /// Captured live objects cannot safely be moved into a probe process.
+    pub unsupported: Option<String>,
 }
 
 /// The session's completer for `name`, compared without regard to case as
@@ -99,6 +102,9 @@ pub(super) fn memory(name: &str) -> Option<Registration> {
 fn memory_in(text: &str, name: &str) -> Option<Registration> {
     if text.len() > MEMORY_LIMIT || text.contains('\0') {
         return None;
+    }
+    if text.trim_start().starts_with('{') {
+        return snapshot(text, name);
     }
     let lines: Vec<&str> = text.lines().collect();
     let functions = lines.iter().position(|line| *line == FUNCTIONS)?;
@@ -119,7 +125,65 @@ fn memory_in(text: &str, name: &str) -> Option<Registration> {
     Some(Registration {
         completer,
         definitions: definitions[1..].join("\n"),
+        unsupported: None,
     })
+}
+
+/// Validate the entire packet, including registrations for other commands.
+fn snapshot(text: &str, name: &str) -> Option<Registration> {
+    let root: serde_json::Value = serde_json::from_str(text).ok()?;
+    let fields = |value: &serde_json::Value, names: &[&str]| {
+        value.as_object().is_some_and(|object| {
+            object.len() == names.len() && names.iter().all(|name| object.contains_key(*name))
+        })
+    };
+    if !fields(&root, &["version", "registrations"]) || root["version"] != 2 {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut found = None;
+    for entry in root["registrations"].as_array()? {
+        if !fields(
+            entry,
+            &["name", "body", "definitions", "portable", "capture"],
+        ) {
+            return None;
+        }
+        let registered = entry["name"].as_str()?;
+        let body = entry["body"].as_str()?;
+        let definitions = entry["definitions"].as_str()?;
+        let portable = entry["portable"].as_bool()?;
+        if !super::powershell::is_command_name(registered)
+            || !seen.insert(registered.to_ascii_lowercase())
+            || body.trim().is_empty()
+            || body.contains('\0')
+            || definitions.contains('\0')
+        {
+            return None;
+        }
+        let capture = (!entry["capture"].is_null())
+            .then(|| super::powershell_state::CapturedState::parse(&entry["capture"]))
+            .transpose()
+            .ok()?;
+        let registration = match capture.filter(|_| portable) {
+            Some(capture) => Registration {
+                completer: capture.wrap_body(body).ok()?,
+                definitions: String::new(),
+                unsupported: None,
+            },
+            None => Registration {
+                completer: body.into(),
+                definitions: definitions.into(),
+                unsupported: (!portable).then(|| {
+                    "the PowerShell completer depends on unsupported captured state".into()
+                }),
+            },
+        };
+        if registered.eq_ignore_ascii_case(name) {
+            found = Some(registration);
+        }
+    }
+    found
 }
 
 /// The line Tab would complete: the command, its words, and the slot's
@@ -163,10 +227,21 @@ pub(super) fn query_at(
     mut env: Vec<(OsString, Option<OsString>)>,
     budget: &mut Budget,
 ) -> Result<String, CompletionError> {
+    if let Some(reason) = &registration.unsupported {
+        return Err(CompletionError::Unsupported(reason.clone()));
+    }
     let mut query_line = line(name, words, prefix);
+    // A literal placeholder keeps the target's AST position before a suffix.
+    // The callback receives the actual empty prefix through the wrapper.
+    let placeholder = prefix.is_empty() && !following.is_empty();
+    if placeholder {
+        query_line.push_str("''");
+    }
     let target_end = query_line.len();
     let target_start = target_end
-        - if prefix.is_empty() {
+        - if placeholder {
+            2
+        } else if prefix.is_empty() {
             0
         } else {
             parser::quote_word_with_dialect(prefix, Dialect::PowerShell).len()
@@ -184,6 +259,7 @@ pub(super) fn query_at(
         set("NOTYPO_PS_NAME", name),
         set("NOTYPO_PS_LINE", &query_line),
         set("NOTYPO_PS_CURSOR", &cursor),
+        set("NOTYPO_PS_PREFIX", prefix),
     ]);
     let args = [
         "-NoProfile",
@@ -352,6 +428,22 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    struct Workspace(std::path::PathBuf);
+
+    impl Workspace {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("notypo-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for Workspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn session_completers_are_found_by_name_without_regard_to_case() {
         let text = "#notypo-command rustup\nusing namespace System.Management.Automation\n\
@@ -382,6 +474,149 @@ mod tests {
         );
         let huge = format!("{text}\n{}", "#".repeat(MEMORY_LIMIT));
         assert_eq!(memory_in(&huge, "tool"), None);
+    }
+
+    #[test]
+    fn versioned_snapshots_validate_every_registration_before_use() {
+        let entry = serde_json::json!({
+            "name":"tool", "body":"param($word) 'build'", "definitions":"",
+            "portable":true, "capture":null
+        });
+        let packet = |entries| serde_json::json!({"version":2,"registrations":entries}).to_string();
+        assert_eq!(
+            memory_in(&packet(vec![entry.clone()]), "TOOL")
+                .unwrap()
+                .completer,
+            "param($word) 'build'"
+        );
+        let mut unsupported = entry.clone();
+        unsupported["portable"] = false.into();
+        assert!(
+            memory_in(&packet(vec![unsupported]), "tool")
+                .unwrap()
+                .unsupported
+                .is_some()
+        );
+        let mut invalid = entry.clone();
+        invalid["name"] = "other".into();
+        invalid["capture"] = serde_json::json!({"module":"","definitions":"","variables":[{
+            "name":"state","scope":"script","value":{"kind":"Object","value":"code"}
+        }]});
+        assert!(memory_in(&packet(vec![entry.clone(), invalid]), "tool").is_none());
+        assert!(memory_in(&packet(vec![entry.clone(), entry]), "tool").is_none());
+    }
+
+    #[test]
+    fn real_snapshots_restore_native_closures_and_private_helpers_without_reinitializing() {
+        let Some(pwsh) = super::super::powershell::tests::pwsh() else {
+            return;
+        };
+        let dir = Workspace::new("ps-native-capture");
+        let marker = dir.0.join("initialized");
+        for kind in ["closure", "module"] {
+            let setup = match kind {
+                "closure" => "$callback = & { $team = 'west'; { param($word,$ast,$cursor) ($team + '-one') }.GetNewClosure() }; Register-ArgumentCompleter -CommandName tool -ScriptBlock $callback".to_owned(),
+                _ => format!(
+                    "$null = New-Module -Name NativeFixture -ScriptBlock {{ [IO.File]::AppendAllText('{}','once'); $script:teams = [string[]]@('west-one','west-two'); function Get-Teams {{ $script:teams }}; Register-ArgumentCompleter -CommandName tool -ScriptBlock {{ param($word,$ast,$cursor) Get-Teams }} }}",
+                    marker.to_string_lossy().replace('\'', "''")
+                ),
+            };
+            let setup_path = dir.0.join("setup.ps1");
+            std::fs::write(&setup_path, setup).unwrap();
+            let source = format!(
+                ". '{}'\n$history = 'tool wesst-one'\n{}\n[Console]::Out.Write($env:NOTYPO_POWERSHELL_COMPLETIONS)",
+                setup_path.to_string_lossy().replace('\'', "''"),
+                crate::shells::POWERSHELL_COMPLETERS
+            );
+            let script = dir.0.join("capture.ps1");
+            std::fs::write(&script, source).unwrap();
+            let output = std::process::Command::new(&pwsh)
+                .args(["-NoProfile", "-NonInteractive", "-File"])
+                .arg(&script)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let text = String::from_utf8(output.stdout).unwrap();
+            let registration = memory_in(&text, "tool").unwrap_or_else(|| {
+                panic!(
+                    "{kind}: {text}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            assert!(registration.unsupported.is_none(), "{kind}: {text}");
+            let mut budget = Budget::new(Duration::from_secs(20), Duration::from_secs(5), 8);
+            let reply = query(
+                &pwsh,
+                &registration,
+                "tool",
+                &[],
+                "",
+                Vec::new(),
+                &mut budget,
+            )
+            .unwrap();
+            let items = parse(&reply, "tool", 10).unwrap();
+            assert_eq!(items[0].value, "west-one", "{kind}: {reply}");
+            if kind == "module" {
+                assert_eq!(items.len(), 2);
+                assert_eq!(std::fs::read_to_string(&marker).unwrap(), "once");
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_objects_are_not_inspected_or_run_during_snapshot_export() {
+        let Some(pwsh) = super::super::powershell::tests::pwsh() else {
+            return;
+        };
+        let dir = Workspace::new("ps-native-object");
+        let marker = dir.0.join("getter-ran");
+        let setup = format!(
+            "$callback = & {{ $state = [pscustomobject]@{{ Name='west' }}; $state | Add-Member -Force -MemberType ScriptMethod -Name GetType -Value {{ [IO.File]::WriteAllText('{}','method'); [string] }}; $state | Add-Member -MemberType ScriptProperty -Name Secret -Value {{ [IO.File]::WriteAllText('{}','getter'); 'west' }}; {{ param($word,$ast,$cursor) $state.Secret }}.GetNewClosure() }}; Register-ArgumentCompleter -CommandName tool -ScriptBlock $callback",
+            marker.to_string_lossy().replace('\'', "''"),
+            marker.to_string_lossy().replace('\'', "''")
+        );
+        let setup_path = dir.0.join("setup.ps1");
+        std::fs::write(&setup_path, setup).unwrap();
+        let source = format!(
+            ". '{}'\n$history = 'tool wesst-one'\n{}\n[Console]::Out.Write($env:NOTYPO_POWERSHELL_COMPLETIONS)",
+            setup_path.to_string_lossy().replace('\'', "''"),
+            crate::shells::POWERSHELL_COMPLETERS
+        );
+        let script = dir.0.join("capture.ps1");
+        std::fs::write(&script, source).unwrap();
+        let output = std::process::Command::new(&pwsh)
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(&script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        let registration = memory_in(&text, "tool")
+            .unwrap_or_else(|| panic!("{text}\n{}", String::from_utf8_lossy(&output.stderr)));
+        let mut budget = Budget::new(Duration::from_secs(20), Duration::from_secs(5), 8);
+        assert!(matches!(
+            query(
+                &pwsh,
+                &registration,
+                "tool",
+                &[],
+                "",
+                Vec::new(),
+                &mut budget
+            ),
+            Err(CompletionError::Unsupported(_))
+        ));
+        assert_eq!(budget.spawned(), 0);
+        assert!(!marker.exists(), "snapshot export invoked an object's code");
     }
 
     #[test]
@@ -483,8 +718,9 @@ mod tests {
             return;
         };
         let registration = Registration {
-            completer: "param($w, $ast, $cursor) if ($cursor -eq 10 -and $ast.CommandElements[-1].Value -eq '三 west') { 'build' }".into(),
+            completer: "param($w, $ast, $cursor) if ($w -eq '' -and $cursor -eq 12 -and $ast.CommandElements[2].Value -eq '' -and $ast.CommandElements[-1].Value -eq '三 west') { 'build' }".into(),
             definitions: String::new(),
+            unsupported: None,
         };
         let mut budget = Budget::new(Duration::from_secs(20), Duration::from_secs(5), 8);
         let text = query_at(
@@ -531,6 +767,7 @@ mod tests {
                  function Register-ArgumentCompleter {{ Set-Content -Path '{marker}' -Value register }}",
                 marker = marker.display()
             ),
+            unsupported: None,
         };
         let mut budget = Budget::new(Duration::from_secs(60), Duration::from_secs(30), 16);
         let ask = |words: &[&str], prefix: &str, budget: &mut Budget| {
@@ -555,15 +792,21 @@ mod tests {
         assert_eq!(nested[0].value, "--release");
         // Nothing listed for this path: PowerShell's file names don't count.
         assert!(ask(&["nothing"], "", &mut budget).unwrap().is_empty());
-        let broken = Registration {
-            completer: "param($w) throw 'broken'".into(),
-            definitions: String::new(),
-        };
-        let text = query(&pwsh, &broken, "tool", &[], "", Vec::new(), &mut budget).unwrap();
-        assert!(matches!(
-            parse(&text, "tool", 16),
-            Err(CompletionError::Failed(_))
-        ));
+        for body in [
+            "param($w) throw 'broken'",
+            "param($w) 'build'; Write-Error 'broken'",
+        ] {
+            let broken = Registration {
+                completer: body.into(),
+                definitions: String::new(),
+                unsupported: None,
+            };
+            let text = query(&pwsh, &broken, "tool", &[], "", Vec::new(), &mut budget).unwrap();
+            assert!(matches!(
+                parse(&text, "tool", 16),
+                Err(CompletionError::Failed(_))
+            ));
+        }
         assert!(!marker.exists(), "only definitions ran");
         std::fs::remove_dir_all(&dir).unwrap();
     }

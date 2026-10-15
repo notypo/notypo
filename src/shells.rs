@@ -20,58 +20,22 @@ pub enum Shell {
     Powershell,
 }
 
-/// PowerShell code for the integration function: the argument completers
-/// the session registered (`Register-ArgumentCompleter`) for the failed
-/// line's command names and the programs their aliases run. Each completer's
-/// text follows a `#notypo-command <name>` line, after its script's `using
-/// namespace` lines; then a `#notypo-functions` line, those namespaces, and
-/// the function definitions of the scripts that created the completers (the
-/// profile, a dot-sourced file, or `Invoke-Expression`'s text), which are
-/// passed rather than the scripts themselves. PowerShell keeps registrations
-/// in an internal table, read here by reflection; any failure passes nothing.
-/// Windows limits a variable to 32767 characters. Public for the opt-in
-/// installed-app checks, which run it against real generated scripts.
+/// Export native-program registrations with bounded captured primitive state.
+/// Public for checks against real generated scripts and shell sessions.
 #[doc(hidden)]
-pub const POWERSHELL_COMPLETERS: &str = r#"$env:NOTYPO_POWERSHELL_COMPLETIONS = try {
-            $notypo_keys = @(foreach ($notypo_ast in [System.Management.Automation.Language.Parser]::ParseInput($history, [ref]$null, [ref]$null).FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)) {
-                $notypo_name = $notypo_ast.GetCommandName();
-                if (-not $notypo_name) { continue }
-                $notypo_name;
-                $notypo_found = Get-Command -Name ([WildcardPattern]::Escape($notypo_name)) -ErrorAction Ignore | Select-Object -First 1;
-                if ($notypo_found -and $notypo_found.CommandType -eq 'Alias') { $notypo_found = $notypo_found.ResolvedCommand }
-                if ($notypo_found -and $notypo_found.CommandType -eq 'Application') { $notypo_found.Name; [System.IO.Path]::GetFileNameWithoutExtension($notypo_found.Name) }
-            });
-            $notypo_flags = [System.Reflection.BindingFlags]'NonPublic,Instance';
-            $notypo_context = $ExecutionContext.GetType().GetField('_context', $notypo_flags).GetValue($ExecutionContext);
-            $notypo_native = $notypo_context.GetType().GetProperty('NativeArgumentCompleters', $notypo_flags).GetValue($notypo_context);
-            $notypo_roots = [System.Collections.Generic.List[object]]::new();
-            $notypo_seen = @{};
-            $notypo_parts = @(foreach ($notypo_key in $notypo_keys) {
-                $notypo_block = $null;
-                if (-not $notypo_native -or $notypo_seen.ContainsKey($notypo_key) -or -not $notypo_native.TryGetValue($notypo_key, [ref]$notypo_block) -or -not $notypo_block) { continue }
-                $notypo_seen[$notypo_key] = 1;
-                $notypo_body = $notypo_block.ToString();
-                if ($notypo_body -match '(?m)^#notypo-') { continue }
-                $notypo_root = $notypo_block.Ast;
-                while ($notypo_root.Parent) { $notypo_root = $notypo_root.Parent }
-                if (-not $notypo_roots.Contains($notypo_root)) { $notypo_roots.Add($notypo_root) }
-                '#notypo-command ' + $notypo_key;
-                foreach ($notypo_using in $notypo_root.UsingStatements) { if ([string]$notypo_using.UsingStatementKind -eq 'Namespace') { $notypo_using.Extent.Text } }
-                $notypo_body
-            });
-            if ($notypo_parts.Count) {
-                $notypo_usings = @(foreach ($notypo_root in $notypo_roots) { foreach ($notypo_using in $notypo_root.UsingStatements) { if ([string]$notypo_using.UsingStatementKind -eq 'Namespace') { $notypo_using.Extent.Text } } }) | Select-Object -Unique;
-                $notypo_functions = @(foreach ($notypo_root in $notypo_roots) { foreach ($notypo_function in $notypo_root.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false)) { $notypo_function.Extent.Text } });
-                $notypo_text = (@($notypo_parts) + '#notypo-functions' + @($notypo_usings) + $notypo_functions) -join "`n";
-                $notypo_limit = if ([System.Environment]::OSVersion.Platform -eq 'Win32NT') { 32000 } else { 65536 };
-                if ($notypo_text.Length -le $notypo_limit -and -not $notypo_text.Contains([char]0)) { $notypo_text }
-            }
-        } catch { };"#;
+pub const POWERSHELL_COMPLETERS: &str = concat!(
+    include_str!("shells/powershell_state.ps1"),
+    include_str!("shells/powershell_completers.ps1")
+);
+const POWERSHELL_NATIVE_COMPLETERS: &str = include_str!("shells/powershell_completers.ps1");
 
 /// Session parameter callbacks and command definitions, without executing
 /// profile statements. Public for checks against real PowerShell sessions.
 #[doc(hidden)]
-pub const POWERSHELL_PARAMETER_COMPLETERS: &str = include_str!("shells/powershell_parameters.ps1");
+pub const POWERSHELL_PARAMETER_COMPLETERS: &str = concat!(
+    include_str!("shells/powershell_state.ps1"),
+    include_str!("shells/powershell_parameters.ps1")
+);
 
 /// bash code for the integration function: the definitions of the
 /// functions named in the previous command (and, one level down, in those
@@ -754,8 +718,8 @@ impl Shell {
                  $notypo_found = Get-Command -Name ([WildcardPattern]::Escape($_)) -ErrorAction Ignore | Select-Object -First 1; \
                  $notypo_runs = if ($notypo_found -and $notypo_found.CommandType -eq 'Alias') {{ $notypo_found.ResolvedCommand }} else {{ $notypo_found }}; \
                  \"$_`t$($notypo_found.CommandType)`t$($notypo_runs.CommandType)`t$(if ($notypo_runs.CommandType -eq 'Application') {{ $notypo_runs.Source }} else {{ $notypo_runs.Name }})\" }}) -join \"`n\";\n        \
-                 {POWERSHELL_COMPLETERS}\n        \
                  {POWERSHELL_PARAMETER_COMPLETERS}\n        \
+                 {POWERSHELL_NATIVE_COMPLETERS}\n        \
                  $env:NOTYPO_CURRENT_COMMAND = $history;\n        \
                  $env:NOTYPO_POWERSHELL = (Get-Process -Id $PID).Path;\n        \
                  $env:TF_SHELL = 'powershell';\n        \

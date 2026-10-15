@@ -7971,7 +7971,15 @@ fn installed_powershell_session_completers_repair_typos() {
             .output()
             .unwrap();
         let completions = String::from_utf8(session.stdout).unwrap();
-        if !completions.contains(&format!("#notypo-command {app}")) {
+        if !serde_json::from_str::<serde_json::Value>(&completions).is_ok_and(|snapshot| {
+            snapshot["registrations"]
+                .as_array()
+                .is_some_and(|registrations| {
+                    registrations
+                        .iter()
+                        .any(|registration| registration["name"] == app)
+                })
+        }) {
             failures.push(format!("{app}: the session passed no completer"));
             continue;
         }

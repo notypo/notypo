@@ -242,7 +242,9 @@ pub fn untrusted_project(program: &str, cwd: &Path, trusted: &[String]) -> Optio
         let path = cwd.join(program);
         let inside = match (std::fs::canonicalize(&path), std::fs::canonicalize(cwd)) {
             (Ok(path), Ok(cwd)) => path.starts_with(cwd),
-            _ => Path::new(program).is_relative(),
+            // A Windows root-relative path has no drive prefix, but is
+            // still outside this project's directory.
+            _ => !Path::new(program).has_root(),
         };
         inside.then(|| format!("{program} is a program from this directory"))
     } else {

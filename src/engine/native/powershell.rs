@@ -945,6 +945,20 @@ impl super::NativeCompletionBackend for Command {
         }
     }
 
+    fn static_option(&self, typed: &str, budget: &mut Budget) -> Option<CompletionItem> {
+        let description = self.describe(budget).ok()?;
+        let name = typed.strip_prefix('-')?;
+        let parameter = description.parameters.iter().find(|parameter| {
+            !parameter.dynamic
+                && (parameter.name.eq_ignore_ascii_case(name)
+                    || parameter
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(name)))
+        })?;
+        Some(Self::option(parameter))
+    }
+
     fn location(&self) -> String {
         match self.known() {
             Some(d) if !d.module.is_empty() => {
@@ -1864,22 +1878,19 @@ pub(crate) mod tests {
              GUID = '1b0b5c3e-4c39-4e33-9f55-0f4c1c7d2a11'; FunctionsToExport = @('Invoke-Fake') }\n",
         )
         .unwrap();
-        let path = std::env::join_paths(
-            std::iter::once(dir.clone()).chain(
-                std::env::var_os("PSModulePath")
-                    .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
-                    .unwrap_or_default(),
-            ),
-        )
-        .unwrap();
         let ask = |trusted: &[String]| {
-            let text = std::process::Command::new(&pwsh)
+            // PowerShell reconstructs PSModulePath during Windows startup.
+            // Add this isolated fixture to the actual child's search path.
+            let script = format!(
+                "$env:PSModulePath = $env:NOTYPO_TEST_MODULE_ROOT + [IO.Path]::PathSeparator + $env:PSModulePath; {SCRIPT}"
+            );
+            let output = std::process::Command::new(&pwsh)
                 .args([
                     "-NoProfile",
                     "-NonInteractive",
                     "-NoLogo",
                     "-Command",
-                    SCRIPT,
+                    &script,
                 ])
                 .envs(
                     environment(&[
@@ -1890,11 +1901,15 @@ pub(crate) mod tests {
                     .into_iter()
                     .filter_map(|(k, v)| Some((k, v?))),
                 )
-                .env("PSModulePath", &path)
+                .env("NOTYPO_TEST_MODULE_ROOT", &dir)
                 .output()
-                .unwrap()
-                .stdout;
-            parse(&String::from_utf8(text).unwrap()).unwrap()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse(&String::from_utf8(output.stdout).unwrap()).unwrap()
         };
         assert_eq!(
             ask(&[]),

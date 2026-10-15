@@ -1853,6 +1853,16 @@ impl<'a> Run<'a> {
         let Some(native) = self.native.as_mut() else {
             return Check::Unknown;
         };
+        if role == TokenRole::OptionName
+            && let Some(option) = native
+                .backend(&state.program, state.path.as_ref(), &mut self.budget)
+                .and_then(|backend| backend.static_option(typed, &mut self.budget))
+        {
+            return Check::Valid {
+                takes_value: option.takes_value,
+                confirmed: true,
+            };
+        }
         let following_literals: Vec<usize> = following
             .iter()
             .enumerate()

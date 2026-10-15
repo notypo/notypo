@@ -2938,6 +2938,11 @@ mod tests {
             assert_ne!(shell_accepts("fish", src), Some(false), "fish: {src:?}");
         }
         for src in FISH_REJECTED.0 {
+            // Fish 3 treats braces as ordinary words. Fish 4 introduced
+            // brace groups; our parser deliberately refuses malformed groups.
+            if src.contains(['{', '}']) && shell_accepts("fish", "{}") == Some(false) {
+                continue;
+            }
             assert_ne!(shell_accepts("fish", src), Some(true), "fish: {src:?}");
         }
     }
@@ -3139,20 +3144,15 @@ mod tests {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let printed: Vec<&str> = stdout
                 .lines()
-                .map(|line| {
-                    let line = line.trim_start();
-                    line.strip_prefix('>')
-                        .or_else(|| line.strip_prefix('%'))
-                        .unwrap_or(line)
-                        .trim_start()
-                })
+                .map(|line| line.trim_start_matches(['>', '%', ' ', '\t']))
                 .filter_map(|l| l.strip_prefix('[')?.strip_suffix(']'))
                 .collect();
             let expected: Vec<&str> = values.iter().chain(&values).copied().collect();
             assert_eq!(
                 printed,
                 expected,
-                "{}",
+                "{}\n{}",
+                stdout,
                 String::from_utf8_lossy(&output.stderr)
             );
         }

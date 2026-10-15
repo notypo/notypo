@@ -48,35 +48,46 @@ _notypo_handler() {
 compdef _notypo_handler "$4" || exit 3
 compadd() {
     if (( ${notypo_collect:-0} )); then
-        local -a notypo_added=()
+        local -a notypo_added=() notypo_display=() notypo_raw=()
         local -A notypo_flags=()
-        local notypo_simple=1 notypo_flag
+        local notypo_simple=1 notypo_flag notypo_spec notypo_value notypo_suffix notypo_hidden_prefix notypo_hidden_suffix
+        local -i notypo_index=0
         zparseopts -E -A notypo_flags a k q Q f e n U l 1 2 C F: P: S: p: s: i: I: W: d: J: X: x: V: o:: r: R: D: O: A: E: M: || notypo_simple=0
-        # Affixes need a richer replacement protocol.
-        # Internal filtering calls must run once, since -D mutates arrays.
-        for notypo_flag in -P -p -s -i -I -W -D -O -A; do
-            [[ -n ${notypo_flags[$notypo_flag]-} ]] && notypo_simple=0
+        # Internal filtering calls mutate caller arrays and add no matches.
+        for notypo_flag in -D -O -A -C; do
+            (( ${+notypo_flags[$notypo_flag]} )) && notypo_simple=0
         done
-        [[ -n $IPREFIX || -n $ISUFFIX ]] && notypo_simple=0
-        # _arguments adds an option that takes a value with an `=` suffix
-        # (attached-only values too, so arity stays unknown): option names
-        # (`-x`, or dig's `+timeout`) are kept as names. Other words with
-        # that suffix (ssh's `-o StrictHostKeyChecking=`) keep the `=`, so
-        # their typed value continues them.
-        local notypo_valued=0
-        if [[ -n ${notypo_flags[-S]-} && ${notypo_flags[-S]} != ' ' ]]; then
-            [[ ${notypo_flags[-S]} == '=' ]] && notypo_valued=1 || notypo_simple=0
-        fi
         if (( notypo_simple )); then
-            builtin compadd -O notypo_added "$@"
-            if (( notypo_valued )); then
-                for notypo_flag in "${notypo_added[@]}"; do
-                    [[ $notypo_flag == [-+]?* ]] && notypo_matches+=( "$notypo_flag" ) ||
-                        notypo_matches+=( "$notypo_flag=" )
-                done
-            else
-                notypo_matches+=( "${notypo_added[@]}" )
+            notypo_spec=${notypo_flags[-d]-}
+            if [[ $notypo_spec =~ '^[a-zA-Z_][a-zA-Z0-9_]*$' ]]; then
+                notypo_display=( "${(@P)notypo_spec}" )
+            elif [[ $notypo_spec == \(*\) ]]; then
+                notypo_display=( ${(Q)${(z)notypo_spec[2,-2]}} )
             fi
+            # -D retains the display entry corresponding to each match;
+            # -A includes transformations from native matching controls.
+            (( ${#notypo_display} )) && builtin compadd -D notypo_display "$@"
+            builtin compadd -A notypo_added "$@"
+            builtin compadd -O notypo_raw "$@"
+            for notypo_value in "${notypo_added[@]}"; do
+                (( ++notypo_index ))
+                notypo_suffix=${notypo_flags[-S]-}
+                [[ $notypo_suffix == ' ' ]] && notypo_suffix=''
+                notypo_hidden_prefix=${notypo_flags[-p]-}
+                notypo_hidden_suffix=${notypo_flags[-s]-}
+                notypo_value="${(q)notypo_hidden_prefix}${notypo_value}${(q)notypo_hidden_suffix}"
+                # Equals marks an option name, while non-option keys retain it.
+                [[ $notypo_suffix == '=' && ${notypo_flags[-P]-}${notypo_hidden_prefix}${notypo_raw[notypo_index]}${notypo_hidden_suffix} == [-+]?* ]] && notypo_suffix=''
+                # -A already quotes the body as Zsh would insert it.
+                # Visible affixes are shell text; Rust accepts one literal word.
+                notypo_value="${notypo_flags[-P]-}${notypo_value}${notypo_suffix}${ISUFFIX}${notypo_flags[-I]-}"
+                if (( ${+notypo_flags[-U]} )); then
+                    notypo_value="${notypo_flags[-i]-}${notypo_value}"
+                else
+                    notypo_value="${IPREFIX}${notypo_flags[-i]-}${notypo_value}"
+                fi
+                notypo_matches+=( "$notypo_value" "${notypo_display[notypo_index]-}" "${notypo_raw[notypo_index]-}" )
+            done
         fi
     fi
     builtin compadd "$@"
@@ -100,6 +111,7 @@ typeset -gi notypo_cursor=$6
 vared notypo_buffer || exit 4
 (( notypo_called )) || exit 5
 (( notypo_status <= 1 )) || exit 6
+printf '#notypo-zsh-v2\0' >&8
 if (( ${#notypo_matches} )); then
     printf '%s\0' "${notypo_matches[@]}" >&8
 fi
@@ -298,8 +310,41 @@ pub(super) fn complete_at(
     }
     let text = String::from_utf8(output.data)
         .map_err(|_| CompletionError::Failed("completion output is not valid UTF-8".into()))?;
+    parse(&text, prefix, budget.max_candidates)
+}
+
+fn parse(text: &str, prefix: &str, limit: usize) -> Result<Vec<CompletionItem>, CompletionError> {
+    let Some(records) = text.strip_prefix("#notypo-zsh-v2\0") else {
+        return Err(CompletionError::Failed(
+            "unexpected Zsh completion response".into(),
+        ));
+    };
+    if !records.is_empty() && !records.ends_with('\0') {
+        return Err(CompletionError::Failed(
+            "incomplete Zsh completion response".into(),
+        ));
+    }
+    let fields: Vec<&str> = records.split_terminator('\0').collect();
+    let (records, trailing) = fields.as_chunks::<3>();
+    if !trailing.is_empty() {
+        return Err(CompletionError::Failed(
+            "incomplete Zsh completion record".into(),
+        ));
+    }
     let mut items: Vec<CompletionItem> = Vec::new();
-    for value in text.split('\0') {
+    for [insertion, description, _raw] in records {
+        let source = format!("__notypo {insertion}");
+        let parsed = parser::parse_with_dialect(&source, Dialect::Posix);
+        if !parsed.is_fully_supported() || parsed.commands.len() != 1 {
+            continue;
+        }
+        let command = &parsed.commands[0];
+        if command.words.len() != 2 || !command.redirections.is_empty() {
+            continue;
+        }
+        let Some(value) = command.words[1].literal() else {
+            continue;
+        };
         if value.is_empty()
             || value.contains(char::is_control)
             || !value.starts_with(prefix)
@@ -310,9 +355,9 @@ pub(super) fn complete_at(
         items.push(CompletionItem {
             value: value.to_owned(),
             takes_value: None,
-            description: None,
+            description: super::clean_description(description).filter(|text| text != value),
         });
-        if items.len() > budget.max_candidates {
+        if items.len() > limit {
             return Err(super::over_limit());
         }
     }
@@ -391,6 +436,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(values(items), ["build", "deploy"]);
+    }
+
+    #[test]
+    fn rich_affixes_descriptions_arrays_and_quoting_survive_real_zle() {
+        let Some(zsh) = crate::utils::which("zsh") else {
+            return;
+        };
+        let dir = Dir::new("zsh-rich");
+        let script = dir.script("_tool", "#compdef tool\nlocal -a choices=('build' 'two words') descriptions=('Compile it' 'A spaced value')\ncompadd -d descriptions -a choices\ncompadd -P pre- -p hidden- -s -inside -S -post -i ignored- -I -tail -- body\ncompadd -Q -- \"'quoted value'\"\ncompadd -P '$(' -S ')' -- 'touch marker'\n");
+        let items = complete(
+            &zsh,
+            &Source::File(&script),
+            "tool",
+            &[],
+            "",
+            Vec::new(),
+            &mut budget(),
+        )
+        .unwrap();
+        let actual: Vec<_> = items
+            .iter()
+            .map(|item| (item.value.as_str(), item.description.as_deref()))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                ("build", Some("Compile it")),
+                ("two words", Some("A spaced value")),
+                ("ignored-pre-hidden-body-inside-post-tail", None),
+                ("quoted value", None),
+            ]
+        );
+        assert!(!dir.0.join("marker").exists());
+    }
+
+    #[test]
+    fn rich_records_reject_incomplete_packets_and_preserve_native_filtering() {
+        for response in ["", "#notypo-zsh-v2\0'build'", "#notypo-zsh-v2\0'build'\0"] {
+            assert!(parse(response, "", 10).is_err(), "{response:?}");
+        }
+        assert!(parse("#notypo-zsh-v2\0'one'\0\0one\0'two'\0\0two\0", "", 1).is_err());
+        let Some(zsh) = crate::utils::which("zsh") else {
+            return;
+        };
+        let dir = Dir::new("zsh-rich-filter");
+        let script = dir.script("_tool", "#compdef tool\nlocal -a choices=('build' 'deploy') descriptions=('Compile it' 'Ship it')\ncompadd -d descriptions -a choices\n");
+        let items = complete(
+            &zsh,
+            &Source::File(&script),
+            "tool",
+            &[],
+            "de",
+            Vec::new(),
+            &mut budget(),
+        )
+        .unwrap();
+        assert_eq!(items[0].value, "deploy");
+        assert_eq!(items[0].description.as_deref(), Some("Ship it"));
     }
 
     #[test]
@@ -638,19 +741,17 @@ mod tests {
             return;
         };
         let dir = Dir::new("zsh-affixes");
-        for (body, prefix) in [
-            ("compadd -P pre -S / -- fix", ""),
-            ("IPREFIX=pre; PREFIX=''; compadd -- fix", "pre"),
-            ("compadd -p pre -s / -- fix", "pre"),
+        for (body, prefix, expected) in [
+            ("compadd -P pre -S / -- fix", "", "prefix/"),
+            ("IPREFIX=pre; PREFIX=''; compadd -- fix", "pre", "prefix"),
+            ("compadd -p pre -s / -- fix", "pre", "prefix/"),
         ] {
             let script = dir.script("_tool", &format!("#compdef tool\n{body}\n"));
             let backend =
                 Backend::new(Flavor::ZshFunction, "tool", zsh.clone()).with_helper(script);
-            assert!(
-                backend
-                    .complete(&[], prefix, &mut budget())
-                    .unwrap()
-                    .is_empty(),
+            assert_eq!(
+                values(backend.complete(&[], prefix, &mut budget()).unwrap()),
+                [expected],
                 "{body}"
             );
         }

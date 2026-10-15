@@ -35,7 +35,17 @@ fn runtimes() -> Vec<PathBuf> {
 }
 
 fn run(shell: &Path, dir: &Path, input: &str) -> (Vec<u8>, Vec<u8>) {
-    let mut child = Command::new(shell)
+    let mut process = Command::new(shell);
+    // Windows PowerShell cannot load PowerShell 7's standard modules.
+    // Let 5.1 construct its own defaults when the fixture launches it.
+    if shell
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("powershell"))
+    {
+        process.env_remove("PSModulePath");
+    }
+    let mut child = process
         .current_dir(dir)
         .env("XDG_CONFIG_HOME", dir)
         .env("XDG_CACHE_HOME", dir)
@@ -269,5 +279,118 @@ fn parent_provider_location_does_not_lend_filesystem_parameters() {
             String::from_utf8_lossy(&output).contains("provider-context-left:False"),
             "{detail}"
         );
+    }
+}
+
+#[test]
+fn parameter_callbacks_restore_primitive_closure_and_private_module_state() {
+    for (index, shell) in runtimes().into_iter().enumerate() {
+        for kind in ["closure", "module"] {
+            let workspace = Workspace(std::env::temp_dir().join(format!(
+                "notypo-core-capture-{}-{index}-{kind}",
+                std::process::id()
+            )));
+            fs::create_dir(&workspace.0).unwrap();
+            let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+            let operations = workspace.0.join("operations");
+            let imports = workspace.0.join("imports");
+            let setup = workspace.0.join("setup.ps1");
+            let registration = if kind == "closure" {
+                "$callback = & { $team = 'west'; { param($commandName,$parameterName,$word,$ast,$bound) [System.Management.Automation.CompletionResult]::new(($team + '-one'),($team + '-one'),'ParameterValue','Captured team') }.GetNewClosure() }; Register-ArgumentCompleter -CommandName Get-CoreFixture -ParameterName Target -ScriptBlock $callback".to_owned()
+            } else {
+                format!(
+                    "$null = New-Module -Name CapturedFixture -ScriptBlock {{ [IO.File]::AppendAllText({},'once'); $script:teams = [string[]]@('west-one','west-two'); function Get-TeamValues {{ $script:teams }}; Register-ArgumentCompleter -CommandName Get-CoreFixture -ParameterName Target -ScriptBlock {{ param($commandName,$parameterName,$word,$ast,$bound) foreach ($team in (Get-TeamValues)) {{ [System.Management.Automation.CompletionResult]::new($team,$team,'ParameterValue','Private module team') }} }} }}",
+                    quote(imports.to_str().unwrap())
+                )
+            };
+            fs::write(&setup, format!(
+                "function Get-CoreFixture {{ [CmdletBinding()] param([string]$Target) [IO.File]::AppendAllText({},'original'); throw 'fixture failure' }}\n{registration}\n",
+                quote(operations.to_str().unwrap())
+            )).unwrap();
+            let input = format!(
+                "$env:TF_SHELL = 'powershell'\nInvoke-Expression ((& {} --alias corefix) -join \"BTn\")\n. {}\nGet-CoreFixture -Target wesst-one\ncorefix --json\nexit\n",
+                quote(env!("CARGO_BIN_EXE_notypo")), quote(setup.to_str().unwrap())
+            ).replace("BT", &char::from(96).to_string());
+            let (output, errors) = run(&shell, &workspace.0, &input);
+            let detail = format!(
+                "{kind}: {}\n{}\n{}",
+                shell.display(),
+                String::from_utf8_lossy(&output),
+                String::from_utf8_lossy(&errors)
+            );
+            let reports = reports(&output);
+            assert_eq!(reports.len(), 1, "{detail}");
+            assert_eq!(
+                reports[0]["candidates"][0]["command"].as_str(),
+                Some("Get-CoreFixture -Target west-one"),
+                "{detail}"
+            );
+            assert_eq!(
+                reports[0]["candidates"][0]["safety"]["decision"], "confirm",
+                "{detail}"
+            );
+            assert_eq!(
+                fs::read_to_string(&operations).unwrap(),
+                "original",
+                "discovery replayed the operation: {detail}"
+            );
+            if kind == "module" {
+                assert_eq!(
+                    fs::read_to_string(&imports).unwrap(),
+                    "once",
+                    "module initialization was replayed: {detail}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn native_callbacks_restore_session_state_through_the_generated_alias() {
+    for (index, shell) in runtimes().into_iter().enumerate() {
+        for kind in ["closure", "module"] {
+            let workspace = Workspace(std::env::temp_dir().join(format!(
+                "notypo-core-native-capture-{}-{index}-{kind}",
+                std::process::id()
+            )));
+            fs::create_dir(&workspace.0).unwrap();
+            let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+            let imports = workspace.0.join("imports");
+            let setup = workspace.0.join("setup.ps1");
+            let registration = if kind == "closure" {
+                "$callback = & { $choice = '--help'; { param($word,$ast,$cursor) $choice }.GetNewClosure() }; Register-ArgumentCompleter -CommandName notypo -ScriptBlock $callback".to_owned()
+            } else {
+                format!(
+                    "$null = New-Module -Name NativeFixture -ScriptBlock {{ [IO.File]::AppendAllText({},'once'); $script:choices = [string[]]@('--help','--version'); function Get-Choices {{ $script:choices }}; Register-ArgumentCompleter -CommandName notypo -ScriptBlock {{ param($word,$ast,$cursor) Get-Choices }} }}",
+                    quote(imports.to_str().unwrap())
+                )
+            };
+            fs::write(&setup, registration).unwrap();
+            let binary = Path::new(env!("CARGO_BIN_EXE_notypo"));
+            let input = format!(
+                "$env:PATH = {} + [IO.Path]::PathSeparator + $env:PATH\n$env:NOTYPO_TRUSTED_COMPLETERS = '[\"notypo\"]'\nInvoke-Expression ((& {} --alias corefix) -join \"BTn\")\n. {}\nnotypo --hepl\ncorefix --json\n[Console]::Out.WriteLine('native-snapshot-left:' + [bool]$env:NOTYPO_POWERSHELL_COMPLETIONS)\nexit\n",
+                quote(binary.parent().unwrap().to_str().unwrap()), quote(binary.to_str().unwrap()), quote(setup.to_str().unwrap())
+            ).replace("BT", &char::from(96).to_string());
+            let (output, errors) = run(&shell, &workspace.0, &input);
+            let detail = format!(
+                "{kind}: {}\n{}\n{}",
+                shell.display(),
+                String::from_utf8_lossy(&output),
+                String::from_utf8_lossy(&errors)
+            );
+            let reports = reports(&output);
+            assert_eq!(reports.len(), 1, "{detail}");
+            assert_eq!(
+                reports[0]["candidates"][0]["command"], "notypo --help",
+                "{detail}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output).contains("native-snapshot-left:False"),
+                "{detail}"
+            );
+            if kind == "module" {
+                assert_eq!(fs::read_to_string(&imports).unwrap(), "once", "{detail}");
+            }
+        }
     }
 }

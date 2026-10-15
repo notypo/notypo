@@ -43,7 +43,8 @@ fn parse_snapshot(text: &str, name: &str) -> Result<Option<Snapshot>, Completion
         return Err(invalid());
     }
     let root: serde_json::Value = serde_json::from_str(text).map_err(|_| invalid())?;
-    if root["version"].as_u64() != Some(1) {
+    let version = root["version"].as_u64().ok_or_else(invalid)?;
+    if !matches!(version, 1 | 2) {
         return Err(invalid());
     }
     let mut found = None;
@@ -68,8 +69,15 @@ fn parse_snapshot(text: &str, name: &str) -> Result<Option<Snapshot>, Completion
         if snapshot.definitions.contains('\0') {
             return Err(invalid());
         }
+        if let Some(capture) = command.get("capture").filter(|capture| !capture.is_null()) {
+            if version != 2 || !snapshot.session {
+                return Err(invalid());
+            }
+            snapshot.definitions =
+                super::powershell_state::CapturedState::parse(capture)?.definitions()?;
+        }
         for entry in command["registrations"].as_array().ok_or_else(invalid)? {
-            let registration = Registration {
+            let mut registration = Registration {
                 parameter: entry["parameter"].as_str().ok_or_else(invalid)?.to_owned(),
                 specific: entry["specific"].as_bool().ok_or_else(invalid)?,
                 portable: entry["portable"].as_bool().ok_or_else(invalid)?,
@@ -84,6 +92,13 @@ fn parse_snapshot(text: &str, name: &str) -> Result<Option<Snapshot>, Completion
                 })
             {
                 return Err(invalid());
+            }
+            if let Some(capture) = entry.get("capture").filter(|capture| !capture.is_null()) {
+                if version != 2 {
+                    return Err(invalid());
+                }
+                registration.body = super::powershell_state::CapturedState::parse(capture)?
+                    .wrap_body(&registration.body)?;
             }
             snapshot.registrations.push(registration);
         }
@@ -584,7 +599,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        for broken in ["", "null", "{}", "{\"version\":2,\"commands\":[]}"] {
+        for broken in ["", "null", "{}", "{\"version\":3,\"commands\":[]}"] {
             assert!(parse_snapshot(broken, "Invoke-Fixture").is_err());
         }
         let mut broken = root.clone();

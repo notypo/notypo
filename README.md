@@ -55,6 +55,8 @@ The engine edits source spans and reparses each correction, preserving unchanged
 
 PowerShell supports literal commands in argument mode, parameter names and values, aliases, pipelines, and redirections. Expressions and statement syntax remain unsupported. Here-documents, Bash arithmetic and `[[ ... ]]`, and Zsh forms outside the POSIX subset are also reported as unsupported. Substitutions and expansions are never evaluated during parsing or discovery.
 
+PowerShell session completers can retain bounded primitive closure and module state, including arrays, dictionaries, and private helper functions. Live objects and oversized snapshots are unsupported. Zsh completion results retain descriptions and literal prefixes/suffixes; insertion text that requires evaluating shell code is rejected.
+
 ## License
 
 MIT or Apache-2.0. The original app was created by Vladimir Iakovlev; see [NOTICE](NOTICE).

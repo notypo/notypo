@@ -1,32 +1,6 @@
 # Snapshot parameter completers and session command definitions, never the
 # executable statements of the profile or dot-sourced script.
 $env:NOTYPO_POWERSHELL_PARAMETERS = try {
-    function __notypo_portable($block) {
-        if ($block.Module) { return $false }
-        $ast = $block.Ast
-        foreach ($variable in $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) {
-            $path = $variable.VariablePath.UserPath
-            if ($path -like 'env:*' -or $path -in @('args', '_', 'PSItem', 'null', 'true', 'false', 'this', 'input', 'ErrorActionPreference', 'PSBoundParameters')) { continue }
-            if ($path.Contains(':')) { return $false }
-            $scope = $variable.Parent
-            while ($scope -and $scope -isnot [System.Management.Automation.Language.ScriptBlockAst]) { $scope = $scope.Parent }
-            if (-not $scope) { return $false }
-            $locals = @(foreach ($declaration in $scope.FindAll({
-                $args[0] -is [System.Management.Automation.Language.ParameterAst] -or
-                $args[0] -is [System.Management.Automation.Language.AssignmentStatementAst] -or
-                $args[0] -is [System.Management.Automation.Language.ForEachStatementAst]
-            }, $true)) {
-                $owner = $declaration.Parent
-                while ($owner -and $owner -isnot [System.Management.Automation.Language.ScriptBlockAst]) { $owner = $owner.Parent }
-                if ($owner -ne $scope) { continue }
-                if ($declaration -is [System.Management.Automation.Language.ParameterAst]) { $declaration.Name.VariablePath.UserPath }
-                elseif ($declaration -is [System.Management.Automation.Language.ForEachStatementAst]) { $declaration.Variable.VariablePath.UserPath }
-                else { foreach ($left in $declaration.Left.FindAll({ $args[0] -is [System.Management.Automation.Language.VariableExpressionAst] }, $true)) { $left.VariablePath.UserPath } }
-            })
-            if ($path -notin $locals) { return $false }
-        }
-        return $true
-    }
     $flags = [System.Reflection.BindingFlags]'NonPublic,Instance'
     $context = $ExecutionContext.GetType().GetField('_context', $flags).GetValue($ExecutionContext)
     $table = $context.GetType().GetProperty('CustomArgumentCompleters', $flags).GetValue($context)
@@ -58,16 +32,17 @@ $env:NOTYPO_POWERSHELL_PARAMETERS = try {
             } elseif (-not $key.Contains(':')) { $parameter = $key }
             if (-not $parameter) { continue }
             $block = $table[$key]
-            $supported = __notypo_portable $block
+            $saved = __notypo_capture $block
+            $supported = $saved.portable
             $root = $block.Ast
             while ($root.Parent) { $root = $root.Parent }
-            if ($supported) {
+            if ($supported -and -not $saved.capture) {
                 if (-not $roots.Contains($root)) { $roots.Add($root) }
             }
             $namespaces = @(foreach ($using in $root.UsingStatements) {
                 if ([string]$using.UsingStatementKind -eq 'Namespace') { $using.Extent.Text }
             })
-            @{ parameter = $parameter; specific = $specific; body = (@($namespaces) + $block.ToString()) -join "`n"; portable = $supported }
+            @{ parameter = $parameter; specific = $specific; body = $saved.body; portable = $supported; capture = $saved.capture }
         } })
         $usings = @(foreach ($root in $roots) { foreach ($using in $root.UsingStatements) {
             if ([string]$using.UsingStatementKind -eq 'Namespace') { $using.Extent.Text }
@@ -80,16 +55,33 @@ $env:NOTYPO_POWERSHELL_PARAMETERS = try {
             # Only top-level definitions. Nested definitions remain inside
             # their containing function or type, with their lexical scope.
             if ($definition.Parent -isnot [System.Management.Automation.Language.NamedBlockAst]) { continue }
+            if ($session -and $definition -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($definition.Name -split ':')[-1] -eq $command.Name) {
+                # Binding needs the signature and dynamic parameters. The
+                # failed operation's begin/process/end bodies never run here.
+                $signature = if ($definition.Body.ParamBlock) { ($definition.Body.ParamBlock.Attributes.Extent.Text -join ' ') + ' ' + $definition.Body.ParamBlock.Extent.Text } else { '' }
+                $dynamic = if ($definition.Body.DynamicParamBlock) { $definition.Body.DynamicParamBlock.Extent.Text } else { '' }
+                'function ' + $command.Name + ' {' + $signature + ' ' + $dynamic + ' process {} }'
+                continue
+            }
             $definition.Extent.Text
         } })
         $text = (@($usings) + $definitions) -join "`n"
-        if ($text -and -not (__notypo_portable ([scriptblock]::Create($text)))) { $portable = $false }
+        $commandCapture = $null
+        if ($text) {
+            $values = @{}
+            $owner = if ($session) { $command.ScriptBlock } else { [scriptblock]::Create($text) }
+            if (-not (__notypo_portable ([scriptblock]::Create($text)) $values $owner)) { $portable = $false }
+            if ($session -and $values.Count) {
+                $commandCapture = @{ module = ''; definitions = $text; variables = @($values.Values) }
+            }
+            if (-not $session -and $values.Count) { $portable = $false }
+        }
         if ($session -or $registrations.Count) {
-            $commands.Add(@{ name = $command.Name; session = $session; portable = $portable; definitions = $text; registrations = @($registrations) })
+            $commands.Add(@{ name = $command.Name; session = $session; portable = $portable; definitions = $text; capture = $commandCapture; registrations = @($registrations) })
         }
     }
     if ($commands.Count) {
-        $text = Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject @{ version = 1; commands = @($commands.ToArray()) } -Depth 6 -Compress
+        $text = Microsoft.PowerShell.Utility\ConvertTo-Json -InputObject @{ version = 2; commands = @($commands.ToArray()) } -Depth 30 -Compress
         $limit = if ([Environment]::OSVersion.Platform -eq 'Win32NT') { 32000 } else { 65536 }
         if ($text.Length -le $limit -and -not $text.Contains([char]0)) { $text }
     }

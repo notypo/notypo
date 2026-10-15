@@ -148,9 +148,6 @@ impl Protocol {
     /// running this application with the completion flag, and a
     /// registration of yargs's function (or fish command) for the same name.
     pub(super) fn from_script(script: &str, name: &str, path: &Path) -> Option<Self> {
-        if cfg!(windows) {
-            return None;
-        }
         let lines: Vec<&str> = script.lines().map(str::trim).collect();
         if !lines.contains(&"# yargs command completion script") {
             return None;

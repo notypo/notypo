@@ -3323,7 +3323,7 @@ fn powershell_function_repairs_programs_cmdlets_and_parameters() {
         "$env:TF_SHELL = 'powershell'\n\
          Invoke-Expression ((& '{}' --alias) -join \"`n\")\n\
          Get-ChildItme -Name -Path one\n\
-         fuck -y\n\
+         fuck -y --debug\n\
          Get-ChildItem -Path two -Recrse -Name\n\
          fuck -y\n\
          git sttus\n\

@@ -38,6 +38,7 @@ mod oclif;
 mod pip;
 pub mod powershell;
 mod powershell_completer;
+mod powershell_state;
 mod powershell_values;
 mod rabbitmq;
 mod symfony;
@@ -261,6 +262,12 @@ pub trait NativeCompletionBackend: std::fmt::Debug {
         _budget: &mut Budget,
     ) -> Result<(), CompletionError> {
         Ok(())
+    }
+
+    /// Check a declared static parameter without evaluating dynamic context.
+    /// Implementations must accept only exact spellings or aliases.
+    fn static_option(&self, _typed: &str, _budget: &mut Budget) -> Option<CompletionItem> {
+        None
     }
     /// Shell callbacks must not receive made-up values for expansions that
     /// have not been evaluated by the user's shell.
@@ -2367,7 +2374,10 @@ impl NativeCompletionBackend for Backend {
             ),
             descriptions: matches!(
                 self.flavor,
-                Flavor::Cobra | Flavor::FishScript | Flavor::PowerShellCompleter
+                Flavor::Cobra
+                    | Flavor::FishScript
+                    | Flavor::ZshFunction
+                    | Flavor::PowerShellCompleter
             ) || self
                 .clap
                 .as_deref()
@@ -3330,9 +3340,11 @@ fn normalize<'a>(
             }
             _ => (entry, None),
         };
-        let entry = entry.trim();
+        // These formats delimit whole literal values independently of spaces.
+        let literal = matches!(flavor, Flavor::Cobra | Flavor::BashFunction);
+        let entry = if literal { entry } else { entry.trim() };
         if entry.is_empty()
-            || entry.contains(char::is_whitespace)
+            || !literal && entry.contains(char::is_whitespace)
             || entry.contains(char::is_control)
         {
             continue;
@@ -3924,6 +3936,34 @@ esac
         let long = clean_description(&"x".repeat(500)).unwrap();
         assert_eq!(long.chars().count(), 120);
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn literal_protocol_records_preserve_spaces_and_shell_shaped_data() {
+        let items = normalize(
+            [
+                "two words\tA spaced value",
+                " leading and trailing \tExact spacing",
+                "$(touch marker)\tLiteral data",
+            ]
+            .into_iter(),
+            Flavor::Cobra,
+            8,
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>(),
+            ["two words", " leading and trailing ", "$(touch marker)"]
+        );
+        assert_eq!(items[0].description.as_deref(), Some("A spaced value"));
+        assert_eq!(
+            normalize(["two words"].into_iter(), Flavor::BashFunction, 8)[0].value,
+            "two words"
+        );
+        // Protocols with ambiguous whitespace retain their existing boundary.
+        assert!(normalize(["two words"].into_iter(), Flavor::AwsCompleter, 8).is_empty());
     }
 
     #[test]

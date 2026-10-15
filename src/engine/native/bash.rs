@@ -507,7 +507,7 @@ complete -F _tool tool
             .into_iter()
             .map(|i| i.value)
             .collect();
-        assert_eq!(words, ["build", "deploy"], "words with spaces are dropped");
+        assert_eq!(words, ["build", "deploy", "with space"]);
         let options = backend.complete(&["build"], "--", &mut budget).unwrap();
         assert_eq!(options[1].value, "--target");
         assert_eq!(options[1].takes_value, Some(true));
