@@ -1,8 +1,9 @@
 use super::{one, output_contains};
+use crate::engine::legacy::stdout as run_stdout;
 use crate::types::{Command, Rule};
 use crate::utils::{
     capture, capture_all, closest_match, get_all_matched_commands, get_close_matches,
-    replace_argument, replace_command, run_stdout,
+    replace_argument, replace_command,
 };
 use std::path::Path;
 
@@ -442,8 +443,8 @@ fn branch_exists_fix(c: &Command) -> Vec<String> {
     fixes
 }
 
-fn branches() -> Vec<String> {
-    run_stdout("git", &["branch", "-a", "--no-color", "--no-column"])
+fn branches(c: &Command) -> Vec<String> {
+    run_stdout(c, "git", &["branch", "-a", "--no-color", "--no-column"])
         .unwrap_or_default()
         .lines()
         .filter(|line| !line.contains("->"))
@@ -461,7 +462,7 @@ fn checkout_fix(c: &Command) -> Vec<String> {
     let Some(file) = pathspec(c) else {
         return Vec::new();
     };
-    let mut fixes: Vec<_> = closest_match(file, &branches(), 0.6)
+    let mut fixes: Vec<_> = closest_match(file, &branches(c), 0.6)
         .into_iter()
         .map(|branch| replace_argument(&c.script, file, &branch))
         .collect();

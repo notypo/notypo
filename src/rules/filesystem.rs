@@ -144,8 +144,10 @@ pub(super) const RULES: &[Rule] = &[
         |c| {
             c.is_app(&["unzip"])
                 && !c.script.contains("-d")
-                && zip_file(c)
-                    .is_some_and(|file| archive_members("unzip", &["-Z1", &file]).len() > 1)
+                && zip_file(c).is_some_and(|file| {
+                    crate::engine::legacy::stdout(c, "unzip", &["-Z1", &file])
+                        .is_some_and(|members| members.lines().take(2).count() > 1)
+                })
         },
         |c| {
             zip_file(c).map_or_else(Vec::new, |file| {

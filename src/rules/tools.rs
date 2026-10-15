@@ -1,10 +1,11 @@
 use super::{one, output_contains, output_contains_lower};
+use crate::engine::legacy::stdout as run_stdout;
 use crate::types::{Command, Rule};
 use crate::utils::{
     self, capture, capture_all, get_all_matched_commands, get_close_matches, get_closest,
-    replace_argument, replace_command, run_output, run_stdout,
+    replace_argument, replace_command,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(super) const RULES: &[Rule] = &[
     Rule::new(
@@ -161,15 +162,15 @@ pub(super) const RULES: &[Rule] = &[
         },
         |c| {
             capture(regex!(r"Unknown command (.*)$"), c.output()).map_or_else(Vec::new, |broken| {
-                let commands = program_commands("gem", &[], || {
-                    run_stdout("gem", &["help", "commands"])
+                let commands: Vec<_> = {
+                    run_stdout(c, "gem", &["help", "commands"])
                         .unwrap_or_default()
                         .lines()
                         .filter(|line| line.starts_with("    "))
                         .filter_map(|line| line.trim().split(' ').next())
                         .map(str::to_owned)
                         .collect()
-                });
+                };
                 replace_command(c, broken, &commands)
             })
         },
@@ -183,8 +184,8 @@ pub(super) const RULES: &[Rule] = &[
         "go_unknown_command",
         |c| c.is_app_at_least(&["go"], 1) && c.output().contains("unknown command"),
         |c| {
-            let commands = program_commands("go", &[], || {
-                let (_, help) = run_output("go", &[]).unwrap_or_default();
+            let commands: Vec<_> = {
+                let help = crate::engine::legacy::combined(c, "go", &[]).unwrap_or_default();
                 help.lines()
                     .map(str::trim)
                     .skip_while(|line| *line != "The commands are:")
@@ -193,7 +194,7 @@ pub(super) const RULES: &[Rule] = &[
                     .filter_map(|line| line.split(' ').next())
                     .map(str::to_owned)
                     .collect()
-            });
+            };
             get_closest(c.part(1), &commands).map_or_else(Vec::new, |fix| {
                 one(replace_argument(&c.script, c.part(1), &fix))
             })
@@ -226,14 +227,17 @@ pub(super) const RULES: &[Rule] = &[
             capture(regex!(r"Task '(\w+)' is not in your gulpfile"), c.output()).map_or_else(
                 Vec::new,
                 |broken| {
-                    let commands =
-                        utils::cached("gulp-tasks", &[PathBuf::from("gulpfile.js")], || {
-                            run_stdout("gulp", &["--tasks-simple"])
-                                .unwrap_or_default()
-                                .lines()
-                                .map(str::to_owned)
-                                .collect()
-                        });
+                    // Listing tasks loads the gulpfile.
+                    if !crate::workspace::allows("gulp", &c.settings().trusted_workspaces) {
+                        return Vec::new();
+                    }
+                    let commands: Vec<_> = {
+                        run_stdout(c, "gulp", &["--tasks-simple"])
+                            .unwrap_or_default()
+                            .lines()
+                            .map(str::to_owned)
+                            .collect()
+                    };
                     replace_command(c, broken, &commands)
                 },
             )
@@ -408,21 +412,21 @@ pub(super) const RULES: &[Rule] = &[
         |c| c.is_app(&["react-native"]) && react_command(c).is_some(),
         |c| {
             react_command(c).map_or_else(Vec::new, |broken| {
-                let commands = utils::cached(
-                    "react-native-commands",
-                    &[PathBuf::from("package.json")],
-                    || {
-                        run_stdout("react-native", &["--help"])
-                            .unwrap_or_default()
-                            .lines()
-                            .map(str::trim)
-                            .skip_while(|line| !line.contains("Commands:"))
-                            .skip(1)
-                            .filter_map(|line| line.split_whitespace().next())
-                            .map(str::to_owned)
-                            .collect()
-                    },
-                );
+                // Its help loads the CLI installed in the project.
+                if !crate::workspace::allows("react-native", &c.settings().trusted_workspaces) {
+                    return Vec::new();
+                }
+                let commands: Vec<_> = {
+                    run_stdout(c, "react-native", &["--help"])
+                        .unwrap_or_default()
+                        .lines()
+                        .map(str::trim)
+                        .skip_while(|line| !line.contains("Commands:"))
+                        .skip(1)
+                        .filter_map(|line| line.split_whitespace().next())
+                        .map(str::to_owned)
+                        .collect()
+                };
                 replace_command(c, broken, &commands)
             })
         },
@@ -548,16 +552,6 @@ pub(super) const RULES: &[Rule] = &[
 
 const ENV_APPS: &[&str] = &["goenv", "nodenv", "pyenv", "rbenv"];
 
-fn program_commands(
-    program: &str,
-    extra_deps: &[PathBuf],
-    compute: impl FnOnce() -> Vec<String>,
-) -> Vec<String> {
-    let mut deps: Vec<_> = utils::which(program).into_iter().collect();
-    deps.extend_from_slice(extra_deps);
-    utils::cached(&format!("{program}-commands"), &deps, compute)
-}
-
 fn adb_fix(c: &Command) -> Vec<String> {
     const COMMANDS: &[&str] = &[
         "backup",
@@ -643,15 +637,14 @@ fn docker_fix(c: &Command) -> Vec<String> {
     ) else {
         return Vec::new();
     };
-    let commands = program_commands("docker", &[], || {
-        let (stdout, stderr) = run_output("docker", &[]).unwrap_or_default();
-        let help = if stdout.is_empty() { stderr } else { stdout };
+    let commands: Vec<_> = {
+        let help = crate::engine::legacy::combined(c, "docker", &[]).unwrap_or_default();
         listed_commands(&help, "Management Commands:")
             .into_iter()
             .chain(listed_commands(&help, "Commands:"))
             .map(str::to_owned)
             .collect()
-    });
+    };
     replace_command(c, broken, &commands)
 }
 
@@ -719,7 +712,11 @@ fn gradle_fix(c: &Command) -> Vec<String> {
     let Some(broken) = gradle_task(c) else {
         return Vec::new();
     };
-    let help = run_stdout(c.part(0), &["tasks"]).unwrap_or_default();
+    // `gradle tasks` runs the build scripts, and `./gradlew` is the project's.
+    if !crate::workspace::allows(c.part(0), &c.settings().trusted_workspaces) {
+        return Vec::new();
+    }
+    let help = run_stdout(c, c.part(0), &["tasks"]).unwrap_or_default();
     let mut listing = false;
     let mut tasks = Vec::new();
     for line in help.lines().map(str::trim) {
@@ -741,8 +738,12 @@ fn grunt_fix(c: &Command) -> Vec<String> {
     let Some(broken) = grunt_task(c).and_then(|task| task.split(':').next()) else {
         return Vec::new();
     };
-    let tasks = utils::cached("grunt-tasks", &[PathBuf::from("Gruntfile.js")], || {
-        let help = run_stdout("grunt", &["--help"]).unwrap_or_default();
+    // Its help loads the Gruntfile.
+    if !crate::workspace::allows("grunt", &c.settings().trusted_workspaces) {
+        return Vec::new();
+    }
+    let tasks = {
+        let help = run_stdout(c, "grunt", &["--help"]).unwrap_or_default();
         let mut listing = false;
         let mut tasks = Vec::new();
         for line in help.lines().map(str::trim) {
@@ -760,7 +761,7 @@ fn grunt_fix(c: &Command) -> Vec<String> {
             }
         }
         tasks
-    });
+    };
     get_closest(broken, &tasks).map_or_else(Vec::new, |fix| {
         one(c.script.replace(&format!(" {broken}"), &format!(" {fix}")))
     })
@@ -799,13 +800,13 @@ fn omnienv_fix(c: &Command) -> Vec<String> {
         .iter()
         .map(|fix| replace_argument(&c.script, broken, fix))
         .collect();
-    let commands = program_commands(c.part(0), &[], || {
-        run_stdout(c.part(0), &["commands"])
+    let commands: Vec<_> = {
+        run_stdout(c, c.part(0), &["commands"])
             .unwrap_or_default()
             .lines()
             .map(|line| line.trim().to_owned())
             .collect()
-    });
+    };
     fixes.extend(replace_command(c, broken, &commands));
     fixes
 }

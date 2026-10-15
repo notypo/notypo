@@ -261,29 +261,47 @@ pub fn open_command(arg: &str) -> String {
 
 /// Runs `program args`, returning its stdout as text (stderr discarded).
 pub fn run_stdout(program: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    let output = bounded_output(program, args, crate::engine::probe::Capture::Stdout)?;
+    String::from_utf8(output.data).ok()
 }
 
 /// Like [`run_stdout`] but returns stdout and stderr separately.
 pub fn run_output(program: &str, args: &[&str]) -> Option<(String, String)> {
-    let out = std::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
+    let output = bounded_output(program, args, crate::engine::probe::Capture::Separate)?;
     Some((
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
+        String::from_utf8(output.data).ok()?,
+        String::from_utf8(output.stderr).ok()?,
     ))
 }
 
-fn cache_dir() -> PathBuf {
+// For explicit utility calls outside correction discovery, such as shell
+// version reporting or a confirmed archive cleanup. Discovery rules use
+// engine::legacy instead, which also checks trust and shares the request budget.
+fn bounded_output(
+    program: &str,
+    args: &[&str],
+    capture: crate::engine::probe::Capture,
+) -> Option<crate::engine::probe::ProbeOutput> {
+    use crate::engine::probe::{self, Budget, Probe};
+    let path = which(program)?;
+    let output = probe::run(
+        &Probe {
+            program: &path,
+            args: args.iter().map(std::ffi::OsString::from).collect(),
+            env: Vec::new(),
+            capture,
+        },
+        &mut Budget::for_timeout(3.0),
+    )
+    .ok()?;
+    (!output.truncated).then_some(output)
+}
+
+pub(crate) fn cache_dir() -> PathBuf {
+    if cfg!(test) {
+        // Unit tests must never touch (or depend on) the user's cache.
+        return env::temp_dir().join(format!("notypo-unit-cache-{}", std::process::id()));
+    }
     match env::var("XDG_CACHE_HOME") {
         Ok(d) if !d.is_empty() => PathBuf::from(d).join("notypo"),
         _ => expand_user("~/.cache/notypo"),

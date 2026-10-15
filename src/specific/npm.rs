@@ -1,15 +1,16 @@
-use crate::utils::{run_stdout, which};
+use crate::engine::legacy;
+use crate::types::Command;
+use crate::utils::which;
 use regex::Regex;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
 
 pub fn npm_available() -> bool {
     which("npm").is_some()
 }
 
-/// Custom npm scripts (`npm run-script`), memoized.
-pub fn get_scripts() -> &'static [String] {
-    static SCRIPTS: OnceLock<Vec<String>> = OnceLock::new();
-    SCRIPTS.get_or_init(|| parse_scripts(&run_stdout("npm", &["run-script"]).unwrap_or_default()))
+/// Custom npm scripts, memoized only for this correction request.
+pub fn get_scripts(command: &Command) -> Vec<String> {
+    parse_scripts(&legacy::stdout(command, "npm", &["run-script"]).unwrap_or_default())
 }
 
 pub fn parse_scripts(output: &str) -> Vec<String> {

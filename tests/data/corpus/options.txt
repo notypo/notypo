@@ -1,0 +1,747 @@
+kubectl|get|--as
+kubectl|get|--as-group
+kubectl|get|--as-uid
+kubectl|get|--as-user-extra
+kubectl|get|--cache-dir
+kubectl|get|--certificate-authority
+kubectl|get|--client-certificate
+kubectl|get|--client-key
+kubectl|get|--cluster
+kubectl|get|--context
+kubectl|get|--disable-compression
+kubectl|get|--insecure-skip-tls-verify
+kubectl|get|--kubeconfig
+kubectl|get|--kuberc
+kubectl|get|--log-flush-frequency
+kubectl|get|--match-server-version
+kubectl|get|--namespace
+kubectl|get|--password
+kubectl|get|--profile
+kubectl|get|--profile-output
+kubectl|get|--proxy-url
+kubectl|get|--request-timeout
+kubectl|get|--server
+kubectl|get|--tls-server-name
+kubectl|get|--token
+kubectl|get|--user
+kubectl|get|--username
+kubectl|get|--v
+kubectl|get|--vmodule
+kubectl|get|--warnings-as-errors
+kubectl|get|--all-namespaces
+kubectl|get|--allow-missing-template-keys
+kubectl|get|--chunk-size
+kubectl|get|--field-selector
+kubectl|get|--filename
+kubectl|get|--help
+kubectl|get|--ignore-not-found
+kubectl|get|--kustomize
+kubectl|get|--label-columns
+kubectl|get|--no-headers
+kubectl|get|--output
+kubectl|get|--output-watch-events
+kubectl|get|--raw
+kubectl|get|--recursive
+kubectl|get|--selector
+kubectl|get|--server-print
+kubectl|get|--show-kind
+kubectl|get|--show-labels
+kubectl|get|--show-managed-fields
+kubectl|get|--sort-by
+kubectl|get|--subresource
+kubectl|get|--template
+kubectl|get|--watch
+kubectl|get|--watch-only
+kubectl|apply|--as
+kubectl|apply|--as-group
+kubectl|apply|--as-uid
+kubectl|apply|--as-user-extra
+kubectl|apply|--cache-dir
+kubectl|apply|--certificate-authority
+kubectl|apply|--client-certificate
+kubectl|apply|--client-key
+kubectl|apply|--cluster
+kubectl|apply|--context
+kubectl|apply|--disable-compression
+kubectl|apply|--insecure-skip-tls-verify
+kubectl|apply|--kubeconfig
+kubectl|apply|--kuberc
+kubectl|apply|--log-flush-frequency
+kubectl|apply|--match-server-version
+kubectl|apply|--namespace
+kubectl|apply|--password
+kubectl|apply|--profile
+kubectl|apply|--profile-output
+kubectl|apply|--proxy-url
+kubectl|apply|--request-timeout
+kubectl|apply|--server
+kubectl|apply|--tls-server-name
+kubectl|apply|--token
+kubectl|apply|--user
+kubectl|apply|--username
+kubectl|apply|--v
+kubectl|apply|--vmodule
+kubectl|apply|--warnings-as-errors
+kubectl|apply|--all
+kubectl|apply|--allow-missing-template-keys
+kubectl|apply|--cascade
+kubectl|apply|--dry-run
+kubectl|apply|--field-manager
+kubectl|apply|--filename
+kubectl|apply|--force
+kubectl|apply|--force-conflicts
+kubectl|apply|--grace-period
+kubectl|apply|--help
+kubectl|apply|--kustomize
+kubectl|apply|--openapi-patch
+kubectl|apply|--output
+kubectl|apply|--overwrite
+kubectl|apply|--prune
+kubectl|apply|--prune-allowlist
+kubectl|apply|--recursive
+kubectl|apply|--selector
+kubectl|apply|--server-side
+kubectl|apply|--show-managed-fields
+kubectl|apply|--subresource
+kubectl|apply|--template
+kubectl|apply|--timeout
+kubectl|apply|--validate
+kubectl|apply|--wait
+kubectl|logs|--as
+kubectl|logs|--as-group
+kubectl|logs|--as-uid
+kubectl|logs|--as-user-extra
+kubectl|logs|--cache-dir
+kubectl|logs|--certificate-authority
+kubectl|logs|--client-certificate
+kubectl|logs|--client-key
+kubectl|logs|--cluster
+kubectl|logs|--context
+kubectl|logs|--disable-compression
+kubectl|logs|--insecure-skip-tls-verify
+kubectl|logs|--kubeconfig
+kubectl|logs|--kuberc
+kubectl|logs|--log-flush-frequency
+kubectl|logs|--match-server-version
+kubectl|logs|--namespace
+kubectl|logs|--password
+kubectl|logs|--profile
+kubectl|logs|--profile-output
+kubectl|logs|--proxy-url
+kubectl|logs|--request-timeout
+kubectl|logs|--server
+kubectl|logs|--tls-server-name
+kubectl|logs|--token
+kubectl|logs|--user
+kubectl|logs|--username
+kubectl|logs|--v
+kubectl|logs|--vmodule
+kubectl|logs|--warnings-as-errors
+kubectl|logs|--all-containers
+kubectl|logs|--all-pods
+kubectl|logs|--container
+kubectl|logs|--follow
+kubectl|logs|--help
+kubectl|logs|--ignore-errors
+kubectl|logs|--insecure-skip-tls-verify-backend
+kubectl|logs|--limit-bytes
+kubectl|logs|--max-log-requests
+kubectl|logs|--pod-running-timeout
+kubectl|logs|--prefix
+kubectl|logs|--previous
+kubectl|logs|--selector
+kubectl|logs|--since
+kubectl|logs|--since-time
+kubectl|logs|--tail
+kubectl|logs|--timestamps
+docker|run|--add-host
+docker|run|--annotation
+docker|run|--attach
+docker|run|--blkio-weight
+docker|run|--blkio-weight-device
+docker|run|--cap-add
+docker|run|--cap-drop
+docker|run|--cgroup-parent
+docker|run|--cgroupns
+docker|run|--cidfile
+docker|run|--cpu-count
+docker|run|--cpu-percent
+docker|run|--cpu-period
+docker|run|--cpu-quota
+docker|run|--cpu-rt-period
+docker|run|--cpu-rt-runtime
+docker|run|--cpu-shares
+docker|run|--cpus
+docker|run|--cpuset-cpus
+docker|run|--cpuset-mems
+docker|run|--detach
+docker|run|--detach-keys
+docker|run|--device
+docker|run|--device-cgroup-rule
+docker|run|--device-read-bps
+docker|run|--device-read-iops
+docker|run|--device-write-bps
+docker|run|--device-write-iops
+docker|run|--dns
+docker|run|--dns-option
+docker|run|--dns-search
+docker|run|--domainname
+docker|run|--entrypoint
+docker|run|--env
+docker|run|--env-file
+docker|run|--expose
+docker|run|--gpus
+docker|run|--group-add
+docker|run|--health-cmd
+docker|run|--health-interval
+docker|run|--health-retries
+docker|run|--health-start-interval
+docker|run|--health-start-period
+docker|run|--health-timeout
+docker|run|--help
+docker|run|--hostname
+docker|run|--init
+docker|run|--interactive
+docker|run|--io-maxbandwidth
+docker|run|--io-maxiops
+docker|run|--ip
+docker|run|--ip6
+docker|run|--ipc
+docker|run|--isolation
+docker|run|--label
+docker|run|--label-file
+docker|run|--link
+docker|run|--link-local-ip
+docker|run|--log-driver
+docker|run|--log-opt
+docker|run|--mac-address
+docker|run|--memory
+docker|run|--memory-reservation
+docker|run|--memory-swap
+docker|run|--memory-swappiness
+docker|run|--mount
+docker|run|--name
+docker|run|--network
+docker|run|--network-alias
+docker|run|--no-healthcheck
+docker|run|--oom-kill-disable
+docker|run|--oom-score-adj
+docker|run|--pid
+docker|run|--pids-limit
+docker|run|--platform
+docker|run|--privileged
+docker|run|--publish
+docker|run|--publish-all
+docker|run|--pull
+docker|run|--quiet
+docker|run|--read-only
+docker|run|--restart
+docker|run|--rm
+docker|run|--runtime
+docker|run|--security-opt
+docker|run|--shm-size
+docker|run|--sig-proxy
+docker|run|--stop-signal
+docker|run|--stop-timeout
+docker|run|--storage-opt
+docker|run|--sysctl
+docker|run|--tmpfs
+docker|run|--tty
+docker|run|--ulimit
+docker|run|--umask
+docker|run|--use-api-socket
+docker|run|--user
+docker|run|--userns
+docker|run|--uts
+docker|run|--volume
+docker|run|--volume-driver
+docker|run|--volumes-from
+docker|run|--workdir
+docker|build|--add-host
+docker|build|--build-arg
+docker|build|--cache-from
+docker|build|--cgroup-parent
+docker|build|--compress
+docker|build|--cpu-period
+docker|build|--cpu-quota
+docker|build|--cpu-shares
+docker|build|--cpuset-cpus
+docker|build|--cpuset-mems
+docker|build|--file
+docker|build|--force-rm
+docker|build|--iidfile
+docker|build|--isolation
+docker|build|--label
+docker|build|--memory
+docker|build|--memory-swap
+docker|build|--network
+docker|build|--no-cache
+docker|build|--platform
+docker|build|--pull
+docker|build|--quiet
+docker|build|--rm
+docker|build|--security-opt
+docker|build|--shm-size
+docker|build|--squash
+docker|build|--tag
+docker|build|--target
+docker|build|--ulimit
+docker|ps|--all
+docker|ps|--filter
+docker|ps|--format
+docker|ps|--last
+docker|ps|--latest
+docker|ps|--no-trunc
+docker|ps|--quiet
+docker|ps|--size
+helm|install|--burst-limit
+helm|install|--color
+helm|install|--colour
+helm|install|--content-cache
+helm|install|--debug
+helm|install|--kube-apiserver
+helm|install|--kube-as-group
+helm|install|--kube-as-user
+helm|install|--kube-ca-file
+helm|install|--kube-context
+helm|install|--kube-insecure-skip-tls-verify
+helm|install|--kube-tls-server-name
+helm|install|--kube-token
+helm|install|--kubeconfig
+helm|install|--namespace
+helm|install|--qps
+helm|install|--registry-config
+helm|install|--repository-cache
+helm|install|--repository-config
+helm|install|--ca-file
+helm|install|--cert-file
+helm|install|--create-namespace
+helm|install|--dependency-update
+helm|install|--description
+helm|install|--devel
+helm|install|--disable-openapi-validation
+helm|install|--dry-run
+helm|install|--enable-dns
+helm|install|--force-conflicts
+helm|install|--force-replace
+helm|install|--generate-name
+helm|install|--help
+helm|install|--hide-notes
+helm|install|--hide-secret
+helm|install|--insecure-skip-tls-verify
+helm|install|--key-file
+helm|install|--keyring
+helm|install|--labels
+helm|install|--name-template
+helm|install|--no-hooks
+helm|install|--output
+helm|install|--pass-credentials
+helm|install|--password
+helm|install|--plain-http
+helm|install|--post-renderer
+helm|install|--post-renderer-args
+helm|install|--render-subchart-notes
+helm|install|--replace
+helm|install|--repo
+helm|install|--rollback-on-failure
+helm|install|--server-side
+helm|install|--set
+helm|install|--set-file
+helm|install|--set-json
+helm|install|--set-literal
+helm|install|--set-string
+helm|install|--skip-crds
+helm|install|--skip-schema-validation
+helm|install|--take-ownership
+helm|install|--timeout
+helm|install|--username
+helm|install|--values
+helm|install|--verify
+helm|install|--version
+helm|install|--wait
+helm|install|--wait-for-jobs
+helm|upgrade|--burst-limit
+helm|upgrade|--color
+helm|upgrade|--colour
+helm|upgrade|--content-cache
+helm|upgrade|--debug
+helm|upgrade|--kube-apiserver
+helm|upgrade|--kube-as-group
+helm|upgrade|--kube-as-user
+helm|upgrade|--kube-ca-file
+helm|upgrade|--kube-context
+helm|upgrade|--kube-insecure-skip-tls-verify
+helm|upgrade|--kube-tls-server-name
+helm|upgrade|--kube-token
+helm|upgrade|--kubeconfig
+helm|upgrade|--namespace
+helm|upgrade|--qps
+helm|upgrade|--registry-config
+helm|upgrade|--repository-cache
+helm|upgrade|--repository-config
+helm|upgrade|--ca-file
+helm|upgrade|--cert-file
+helm|upgrade|--cleanup-on-fail
+helm|upgrade|--create-namespace
+helm|upgrade|--dependency-update
+helm|upgrade|--description
+helm|upgrade|--devel
+helm|upgrade|--disable-openapi-validation
+helm|upgrade|--dry-run
+helm|upgrade|--enable-dns
+helm|upgrade|--force-conflicts
+helm|upgrade|--force-replace
+helm|upgrade|--help
+helm|upgrade|--hide-notes
+helm|upgrade|--hide-secret
+helm|upgrade|--history-max
+helm|upgrade|--insecure-skip-tls-verify
+helm|upgrade|--install
+helm|upgrade|--key-file
+helm|upgrade|--keyring
+helm|upgrade|--labels
+helm|upgrade|--no-hooks
+helm|upgrade|--output
+helm|upgrade|--pass-credentials
+helm|upgrade|--password
+helm|upgrade|--plain-http
+helm|upgrade|--post-renderer
+helm|upgrade|--post-renderer-args
+helm|upgrade|--render-subchart-notes
+helm|upgrade|--repo
+helm|upgrade|--reset-then-reuse-values
+helm|upgrade|--reset-values
+helm|upgrade|--reuse-values
+helm|upgrade|--rollback-on-failure
+helm|upgrade|--server-side
+helm|upgrade|--set
+helm|upgrade|--set-file
+helm|upgrade|--set-json
+helm|upgrade|--set-literal
+helm|upgrade|--set-string
+helm|upgrade|--skip-crds
+helm|upgrade|--skip-schema-validation
+helm|upgrade|--take-ownership
+helm|upgrade|--timeout
+helm|upgrade|--username
+helm|upgrade|--values
+helm|upgrade|--verify
+helm|upgrade|--version
+helm|upgrade|--wait
+helm|upgrade|--wait-for-jobs
+helm|list|--burst-limit
+helm|list|--color
+helm|list|--colour
+helm|list|--content-cache
+helm|list|--debug
+helm|list|--kube-apiserver
+helm|list|--kube-as-group
+helm|list|--kube-as-user
+helm|list|--kube-ca-file
+helm|list|--kube-context
+helm|list|--kube-insecure-skip-tls-verify
+helm|list|--kube-tls-server-name
+helm|list|--kube-token
+helm|list|--kubeconfig
+helm|list|--namespace
+helm|list|--qps
+helm|list|--registry-config
+helm|list|--repository-cache
+helm|list|--repository-config
+helm|list|--all-namespaces
+helm|list|--date
+helm|list|--deployed
+helm|list|--failed
+helm|list|--filter
+helm|list|--help
+helm|list|--max
+helm|list|--no-headers
+helm|list|--offset
+helm|list|--output
+helm|list|--pending
+helm|list|--reverse
+helm|list|--selector
+helm|list|--short
+helm|list|--superseded
+helm|list|--time-format
+helm|list|--uninstalled
+helm|list|--uninstalling
+git|commit|--ahead-behind
+git|commit|--all
+git|commit|--amend
+git|commit|--author
+git|commit|--branch
+git|commit|--cleanup
+git|commit|--date
+git|commit|--dry-run
+git|commit|--edit
+git|commit|--file
+git|commit|--fixup
+git|commit|--gpg-sign
+git|commit|--include
+git|commit|--inter-hunk-context
+git|commit|--interactive
+git|commit|--long
+git|commit|--message
+git|commit|--no-ahead-behind
+git|commit|--no-all
+git|commit|--no-amend
+git|commit|--no-author
+git|commit|--no-branch
+git|commit|--no-cleanup
+git|commit|--no-date
+git|commit|--no-dry-run
+git|commit|--no-edit
+git|commit|--no-file
+git|commit|--no-fixup
+git|commit|--no-gpg-sign
+git|commit|--no-include
+git|commit|--no-interactive
+git|commit|--no-long
+git|commit|--no-message
+git|commit|--no-null
+git|commit|--no-only
+git|commit|--no-patch
+git|commit|--no-pathspec-file-nul
+git|commit|--no-pathspec-from-file
+git|commit|--no-porcelain
+git|commit|--no-post-rewrite
+git|commit|--no-quiet
+git|commit|--no-reedit-message
+git|commit|--no-reset-author
+git|commit|--no-reuse-message
+git|commit|--no-short
+git|commit|--no-signoff
+git|commit|--no-squash
+git|commit|--no-status
+git|commit|--no-template
+git|commit|--no-trailer
+git|commit|--no-untracked-files
+git|commit|--no-verbose
+git|commit|--no-verify
+git|commit|--null
+git|commit|--only
+git|commit|--patch
+git|commit|--pathspec-file-nul
+git|commit|--pathspec-from-file
+git|commit|--porcelain
+git|commit|--post-rewrite
+git|commit|--quiet
+git|commit|--reedit-message
+git|commit|--reset-author
+git|commit|--reuse-message
+git|commit|--short
+git|commit|--signoff
+git|commit|--squash
+git|commit|--status
+git|commit|--template
+git|commit|--trailer
+git|commit|--unified
+git|commit|--untracked-files
+git|commit|--verbose
+git|commit|--verify
+git|push|--all
+git|push|--atomic
+git|push|--delete
+git|push|--dry-run
+git|push|--exec
+git|push|--follow-tags
+git|push|--force
+git|push|--force-if-includes
+git|push|--force-with-lease
+git|push|--ipv4
+git|push|--ipv6
+git|push|--mirror
+git|push|--no-all
+git|push|--no-atomic
+git|push|--no-branches
+git|push|--no-delete
+git|push|--no-dry-run
+git|push|--no-exec
+git|push|--no-follow-tags
+git|push|--no-force
+git|push|--no-force-if-includes
+git|push|--no-force-with-lease
+git|push|--no-mirror
+git|push|--no-porcelain
+git|push|--no-progress
+git|push|--no-prune
+git|push|--no-push-option
+git|push|--no-quiet
+git|push|--no-receive-pack
+git|push|--no-recurse-submodules
+git|push|--no-repo
+git|push|--no-set-upstream
+git|push|--no-signed
+git|push|--no-tags
+git|push|--no-verbose
+git|push|--no-verify
+git|push|--porcelain
+git|push|--progress
+git|push|--prune
+git|push|--push-option
+git|push|--quiet
+git|push|--receive-pack
+git|push|--recurse-submodules
+git|push|--repo
+git|push|--set-upstream
+git|push|--signed
+git|push|--tags
+git|push|--verbose
+git|push|--verify
+git|checkout|--auto-advance
+git|checkout|--conflict
+git|checkout|--detach
+git|checkout|--guess
+git|checkout|--ignore-other-worktrees
+git|checkout|--ignore-skip-worktree-bits
+git|checkout|--inter-hunk-context
+git|checkout|--merge
+git|checkout|--no-auto-advance
+git|checkout|--no-conflict
+git|checkout|--no-detach
+git|checkout|--no-guess
+git|checkout|--no-ignore-other-worktrees
+git|checkout|--no-ignore-skip-worktree-bits
+git|checkout|--no-merge
+git|checkout|--no-orphan
+git|checkout|--no-overlay
+git|checkout|--no-patch
+git|checkout|--no-pathspec-file-nul
+git|checkout|--no-pathspec-from-file
+git|checkout|--no-progress
+git|checkout|--no-quiet
+git|checkout|--no-recurse-submodules
+git|checkout|--no-track
+git|checkout|--orphan
+git|checkout|--ours
+git|checkout|--overlay
+git|checkout|--patch
+git|checkout|--pathspec-file-nul
+git|checkout|--pathspec-from-file
+git|checkout|--progress
+git|checkout|--quiet
+git|checkout|--recurse-submodules
+git|checkout|--theirs
+git|checkout|--track
+git|checkout|--unified
+aws|ec2 describe-instances|--instance-ids
+aws|ec2 describe-instances|--include-managed-resources
+aws|ec2 describe-instances|--no-include-managed-resources
+aws|ec2 describe-instances|--dry-run
+aws|ec2 describe-instances|--no-dry-run
+aws|ec2 describe-instances|--filters
+aws|ec2 describe-instances|--next-token
+aws|ec2 describe-instances|--max-results
+aws|ec2 describe-instances|--cli-input-json
+aws|ec2 describe-instances|--cli-input-yaml
+aws|ec2 describe-instances|--starting-token
+aws|ec2 describe-instances|--page-size
+aws|ec2 describe-instances|--max-items
+aws|ec2 describe-instances|--generate-cli-skeleton
+aws|ec2 describe-instances|--debug
+aws|ec2 describe-instances|--endpoint-url
+aws|ec2 describe-instances|--no-verify-ssl
+aws|ec2 describe-instances|--no-paginate
+aws|ec2 describe-instances|--output
+aws|ec2 describe-instances|--query
+aws|ec2 describe-instances|--profile
+aws|ec2 describe-instances|--region
+aws|ec2 describe-instances|--version
+aws|ec2 describe-instances|--color
+aws|ec2 describe-instances|--no-sign-request
+aws|ec2 describe-instances|--ca-bundle
+aws|ec2 describe-instances|--cli-read-timeout
+aws|ec2 describe-instances|--cli-connect-timeout
+aws|ec2 describe-instances|--cli-binary-format
+aws|ec2 describe-instances|--no-cli-pager
+aws|ec2 describe-instances|--cli-auto-prompt
+aws|ec2 describe-instances|--no-cli-auto-prompt
+aws|ec2 describe-instances|--cli-error-format
+aws|s3 cp|--dryrun
+aws|s3 cp|--quiet
+aws|s3 cp|--include
+aws|s3 cp|--exclude
+aws|s3 cp|--acl
+aws|s3 cp|--follow-symlinks
+aws|s3 cp|--no-follow-symlinks
+aws|s3 cp|--no-guess-mime-type
+aws|s3 cp|--sse
+aws|s3 cp|--sse-c
+aws|s3 cp|--sse-c-key
+aws|s3 cp|--sse-kms-key-id
+aws|s3 cp|--sse-c-copy-source
+aws|s3 cp|--sse-c-copy-source-key
+aws|s3 cp|--storage-class
+aws|s3 cp|--grants
+aws|s3 cp|--website-redirect
+aws|s3 cp|--content-type
+aws|s3 cp|--cache-control
+aws|s3 cp|--content-disposition
+aws|s3 cp|--content-encoding
+aws|s3 cp|--content-language
+aws|s3 cp|--expires
+aws|s3 cp|--source-region
+aws|s3 cp|--only-show-errors
+aws|s3 cp|--no-progress
+aws|s3 cp|--progress-frequency
+aws|s3 cp|--progress-multiline
+aws|s3 cp|--page-size
+aws|s3 cp|--ignore-glacier-warnings
+aws|s3 cp|--force-glacier-transfer
+aws|s3 cp|--request-payer
+aws|s3 cp|--checksum-mode
+aws|s3 cp|--checksum-algorithm
+aws|s3 cp|--metadata
+aws|s3 cp|--copy-props
+aws|s3 cp|--metadata-directive
+aws|s3 cp|--expected-size
+aws|s3 cp|--recursive
+aws|s3 cp|--case-conflict
+aws|s3 cp|--no-overwrite
+aws|s3 cp|--debug
+aws|s3 cp|--endpoint-url
+aws|s3 cp|--no-verify-ssl
+aws|s3 cp|--no-paginate
+aws|s3 cp|--output
+aws|s3 cp|--query
+aws|s3 cp|--profile
+aws|s3 cp|--region
+aws|s3 cp|--version
+aws|s3 cp|--color
+aws|s3 cp|--no-sign-request
+aws|s3 cp|--ca-bundle
+aws|s3 cp|--cli-read-timeout
+aws|s3 cp|--cli-connect-timeout
+aws|s3 cp|--cli-binary-format
+aws|s3 cp|--no-cli-pager
+aws|s3 cp|--cli-auto-prompt
+aws|s3 cp|--no-cli-auto-prompt
+aws|s3 cp|--cli-error-format
+aws|lambda invoke|--function-name
+aws|lambda invoke|--invocation-type
+aws|lambda invoke|--log-type
+aws|lambda invoke|--client-context
+aws|lambda invoke|--durable-execution-name
+aws|lambda invoke|--payload
+aws|lambda invoke|--qualifier
+aws|lambda invoke|--tenant-id
+aws|lambda invoke|--debug
+aws|lambda invoke|--endpoint-url
+aws|lambda invoke|--no-verify-ssl
+aws|lambda invoke|--no-paginate
+aws|lambda invoke|--output
+aws|lambda invoke|--query
+aws|lambda invoke|--profile
+aws|lambda invoke|--region
+aws|lambda invoke|--version
+aws|lambda invoke|--color
+aws|lambda invoke|--no-sign-request
+aws|lambda invoke|--ca-bundle
+aws|lambda invoke|--cli-read-timeout
+aws|lambda invoke|--cli-connect-timeout
+aws|lambda invoke|--cli-binary-format
+aws|lambda invoke|--no-cli-pager
+aws|lambda invoke|--cli-auto-prompt
+aws|lambda invoke|--no-cli-auto-prompt
+aws|lambda invoke|--cli-error-format

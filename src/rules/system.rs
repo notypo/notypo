@@ -1,6 +1,7 @@
 use super::{one, output_contains};
+use crate::engine::legacy::stdout as run_stdout;
 use crate::types::{Command, Rule};
-use crate::utils::{self, capture, replace_command, run_stdout};
+use crate::utils::{self, capture, replace_command};
 use std::path::Path;
 use std::{env, fs};
 
@@ -8,12 +9,12 @@ pub(super) const RULES: &[Rule] = &[
     Rule::new("fix_file", |c| env::var_os("EDITOR").is_some() && file_location(c).is_some(), fix_file),
     Rule::new("ifconfig_device_not_found", |c| c.is_app(&["ifconfig"]) && c.output().contains("error fetching interface information: Device not found"), |c| {
         let interface = c.output().split(' ').next().unwrap_or_default().trim_end_matches(':');
-        let output = run_stdout("ifconfig", &["-a"]).unwrap_or_default();
+        let output = run_stdout(c, "ifconfig", &["-a"]).unwrap_or_default();
         let possible: Vec<_> = output.lines().filter(|line| !line.is_empty() && !line.starts_with(' ')).filter_map(|line| line.split(' ').next()).collect();
         replace_command(c, interface, &possible)
     }),
-    Rule::new("port_already_in_use", |c| used_port(c).and_then(pid_for_port).is_some(), |c| {
-        used_port(c).and_then(pid_for_port).map_or_else(Vec::new, |pid| one(c.shell().and_(&[&format!("kill {pid}"), &c.script])))
+    Rule::new("port_already_in_use", |c| used_port(c).and_then(|port| pid_for_port(c, port)).is_some(), |c| {
+        used_port(c).and_then(|port| pid_for_port(c, port)).map_or_else(Vec::new, |pid| one(c.shell().and_(&[&format!("kill {pid}"), &c.script])))
     }).enabled_by_default(|| utils::which("lsof").is_some()),
     Rule::new("ssh_known_hosts", |c| c.is_app(&["ssh", "scp"]) && (c.script.starts_with("ssh") || c.script.starts_with("scp"))
         && (output_contains(c, &["WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!", "WARNING: POSSIBLE DNS SPOOFING DETECTED!"])
@@ -80,9 +81,9 @@ fn used_port<'a>(c: &Command<'a>) -> Option<&'a str> {
     .find_map(|re| capture(re, c.output()))
 }
 
-fn pid_for_port(port: &str) -> Option<String> {
+fn pid_for_port(c: &Command, port: &str) -> Option<String> {
     // Only numeric pids reach the shell command.
-    let output = run_stdout("lsof", &["-i", &format!(":{port}")])?;
+    let output = run_stdout(c, "lsof", &["-i", &format!(":{port}")])?;
     output
         .lines()
         .nth(1)?

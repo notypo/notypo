@@ -1,9 +1,8 @@
 use super::{one, output_contains};
+use crate::engine::legacy::stdout as run_stdout;
 use crate::specific::{self, apt::apt_available, archlinux, brew, npm};
 use crate::types::{Command, Rule};
-use crate::utils::{
-    self, capture, capture_all, get_closest, replace_argument, replace_command, run_stdout,
-};
+use crate::utils::{self, capture, capture_all, get_closest, replace_argument, replace_command};
 use std::fs;
 use std::path::Path;
 
@@ -32,7 +31,7 @@ pub(super) const RULES: &[Rule] = &[
     Rule::new("brew_uninstall", |c| c.is_app_at_least(&["brew"], 2) && ["uninstall", "rm", "remove"].contains(&c.part(1)) && c.output().contains("brew uninstall --force"),
         |c| brew_insert(c, "uninstall", &["--force"])),
     Rule::new("brew_unknown_command", |c| c.script.contains("brew") && brew_unknown(c).is_some(),
-        |c| brew_unknown(c).map_or_else(Vec::new, |broken| replace_command(c, broken, &brew_commands()))).enabled_by_default(brew::brew_available),
+        |c| brew_unknown(c).map_or_else(Vec::new, |broken| replace_command(c, broken, &brew_commands(c)))).enabled_by_default(brew::brew_available),
     Rule::new("brew_update_formula", |c| c.is_app_at_least(&["brew"], 2) && c.script.contains("update") && c.output().contains("Error: This command updates brew itself") && c.output().contains("Use `brew upgrade"),
         |c| one(c.script.replace("update", "upgrade"))),
     Rule::new("cargo", |c| c.script == "cargo", |_| one("cargo build")),
@@ -44,25 +43,25 @@ pub(super) const RULES: &[Rule] = &[
     }).enabled_by_default(|| utils::which("choco").is_some() || utils::which("cinst").is_some()),
     sudo_rule!("dnf_no_such_command", |c| c.is_app(&["dnf"]) && c.output_lower().contains("no such command"), |c| {
         capture(regex!(r"No such command: (.*)\."), c.output()).map_or_else(Vec::new, |broken| {
-            let help = run_stdout("dnf", &["--help"]).unwrap_or_default();
+            let help = run_stdout(c, "dnf", &["--help"]).unwrap_or_default();
             replace_command(c, broken, &capture_all(regex!(r"(?m)^([a-z-]+) +"), &help))
         })
     }).enabled_by_default(specific::dnf_available),
     Rule::new("npm_missing_script", |c| c.is_app(&["npm"]) && c.script_parts().iter().any(|p| p.starts_with("ru")) && c.output().contains("npm ERR! missing script: "),
-        |c| capture(regex!(r".*missing script: (.*)\n"), c.output()).map_or_else(Vec::new, |broken| replace_command(c, broken, npm::get_scripts()))).enabled_by_default(npm::npm_available),
+        |c| capture(regex!(r".*missing script: (.*)\n"), c.output()).map_or_else(Vec::new, |broken| replace_command(c, broken, &npm::get_scripts(c)))).enabled_by_default(npm::npm_available),
     Rule::new("npm_run_script", |c| c.is_app_at_least(&["npm"], 1) && c.output().contains("Usage: npm <command>")
-        && !c.script_parts().iter().any(|p| p.starts_with("ru")) && npm::get_scripts().iter().any(|script| script == c.part(1)), |c| {
+        && !c.script_parts().iter().any(|p| p.starts_with("ru")) && npm::get_scripts(c).iter().any(|script| script == c.part(1)), |c| {
         let mut parts = c.script_parts().to_vec(); parts.insert(1, "run-script".into()); one(parts.join(" "))
     }).enabled_by_default(npm::npm_available),
     sudo_rule!("npm_wrong_command", |c| c.is_app(&["npm"]) && c.output().contains("where <command> is one of:") && npm_wrong(c).is_some(), npm_wrong_fix).enabled_by_default(npm::npm_available),
-    Rule::new("pacman", |c| c.output().contains("not found") && !archlinux::get_pkgfile(&c.script).is_empty(), |c| {
-        archlinux::archlinux_env().1.map_or_else(Vec::new, |pacman| archlinux::get_pkgfile(&c.script).into_iter()
+    Rule::new("pacman", |c| c.output().contains("not found") && !archlinux::get_pkgfile(c, &c.script).is_empty(), |c| {
+        archlinux::archlinux_env().1.map_or_else(Vec::new, |pacman| archlinux::get_pkgfile(c, &c.script).into_iter()
             .map(|package| c.shell().and_(&[&format!("{pacman} -S {package}"), &c.script])).collect())
     }).enabled_by_default(arch_enabled),
     sudo_rule!("pacman_invalid_option", |c| c.is_app(&["pacman"]) && c.output().starts_with("error: invalid option '-") && regex!(r" -[surqfdvt]").is_match(&c.script),
         |c| capture(regex!(r" -[dfqrstuv]"), &c.script).map_or_else(Vec::new, |option| one(c.script.replace(option, &option.to_uppercase())))).enabled_by_default(arch_enabled),
     Rule::new("pacman_not_found", |c| (c.is_app(&["pacman", "yay", "pikaur", "yaourt"]) || c.part(0) == "sudo" && c.part(1) == "pacman") && c.output().contains("error: target not found:"),
-        |c| c.script_parts().last().map_or_else(Vec::new, |package| replace_command(c, package, &archlinux::get_pkgfile(package)))).enabled_by_default(arch_enabled),
+        |c| c.script_parts().last().map_or_else(Vec::new, |package| replace_command(c, package, &archlinux::get_pkgfile(c, package)))).enabled_by_default(arch_enabled),
     Rule::new("pip_install", |c| crate::specific::sudo::sudo_support_match(c, |c| c.is_app(&["pip"]) && c.script.contains("pip install") && c.output().contains("Permission denied")),
         |c| one(if !c.script.contains("--user") { c.script.replace(" install ", " install --user ") } else { format!("sudo {}", c.script.replace(" --user", "")) })),
     sudo_rule!("pip_unknown_command", |c| c.is_app(&["pip", "pip2", "pip3"]) && c.output().contains("unknown command") && c.output().contains("maybe you meant"), |c| {
@@ -118,7 +117,7 @@ fn apt_package(c: &Command) -> Option<String> {
         return None;
     }
     let pattern = format!(r"/bin/{}$", regex::escape(executable));
-    run_stdout("apt-file", &["search", "--regexp", &pattern])?
+    run_stdout(c, "apt-file", &["search", "--regexp", &pattern])?
         .lines()
         .find_map(|line| line.split_once(": ").map(|(package, _)| package.to_owned()))
 }
@@ -130,7 +129,7 @@ fn apt_operation_fix(c: &Command) -> Vec<String> {
     if broken == "uninstall" {
         return one(c.script.replace("uninstall", "remove"));
     }
-    let help = run_stdout(c.part(0), &["--help"]).unwrap_or_default();
+    let help = run_stdout(c, c.part(0), &["--help"]).unwrap_or_default();
     let mut listing = false;
     let mut operations = Vec::new();
     for line in help.lines().map(str::trim) {
@@ -161,7 +160,7 @@ fn brew_insert(c: &Command, subcommand: &str, flags: &[&str]) -> Vec<String> {
     one(parts.join(" "))
 }
 
-fn brew_commands() -> Vec<String> {
+fn brew_commands(c: &Command) -> Vec<String> {
     let fallback = || {
         [
             "info",
@@ -183,10 +182,10 @@ fn brew_commands() -> Vec<String> {
         .map(str::to_owned)
         .to_vec()
     };
-    let Some(prefix) = brew::get_brew_path_prefix() else {
+    let Some(prefix) = brew::get_brew_path_prefix(c) else {
         return fallback();
     };
-    let root = Path::new(prefix).join("Homebrew/Library");
+    let root = Path::new(&prefix).join("Homebrew/Library");
     let Ok(entries) = fs::read_dir(root.join("Homebrew/cmd")) else {
         return fallback();
     };
@@ -255,9 +254,8 @@ fn yarn_unknown_fix(c: &Command) -> Vec<String> {
     if broken == "require" {
         return one(replace_argument(&c.script, broken, "add"));
     }
-    let deps: Vec<_> = utils::which("yarn").into_iter().collect();
-    let options = utils::cached("yarn-commands", &deps, || {
-        run_stdout("yarn", &["--help"])
+    let options: Vec<_> = {
+        run_stdout(c, "yarn", &["--help"])
             .unwrap_or_default()
             .lines()
             .skip_while(|line| !line.contains("Commands:"))
@@ -266,7 +264,7 @@ fn yarn_unknown_fix(c: &Command) -> Vec<String> {
             .filter_map(|line| line.trim().split(' ').next_back())
             .map(str::to_owned)
             .collect()
-    });
+    };
     replace_command(c, broken, &options)
 }
 
@@ -274,9 +272,8 @@ fn yum_operation_fix(c: &Command) -> Vec<String> {
     if c.part(1) == "uninstall" {
         return one(c.script.replace("uninstall", "remove"));
     }
-    let deps: Vec<_> = utils::which("yum").into_iter().collect();
-    let operations = utils::cached("yum-commands", &deps, || {
-        run_stdout("yum", &[])
+    let operations: Vec<_> = {
+        run_stdout(c, "yum", &[])
             .unwrap_or_default()
             .lines()
             .skip_while(|line| !line.starts_with("List of Commands:"))
@@ -285,6 +282,6 @@ fn yum_operation_fix(c: &Command) -> Vec<String> {
             .filter_map(|line| line.trim().split(' ').next())
             .map(str::to_owned)
             .collect()
-    });
+    };
     replace_command(c, c.part(1), &operations)
 }

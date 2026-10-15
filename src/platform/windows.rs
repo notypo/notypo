@@ -98,17 +98,22 @@ fn resume(pid: u32) -> io::Result<()> {
             // SAFETY: OpenThread returns a new owned thread handle.
             let thread =
                 Handle::new(unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) })?;
-            // SAFETY: this is the primary thread of our suspended child.
-            if unsafe { ResumeThread(thread.0) } == u32::MAX {
-                return Err(io::Error::last_os_error());
+            // Windows or injected startup code can add another thread.
+            // Resuming an already running thread returns zero; it does not
+            // resume the primary thread created with CREATE_SUSPENDED.
+            // SAFETY: the owned handle belongs to this newly spawned child.
+            match unsafe { ResumeThread(thread.0) } {
+                u32::MAX => return Err(io::Error::last_os_error()),
+                0 => {}
+                1 => return Ok(()),
+                _ => return Err(io::Error::other("spawned thread remains suspended")),
             }
-            return Ok(());
         }
         // SAFETY: the snapshot and entry remain valid.
         found = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "spawned process has no primary thread",
+        "spawned process has no suspended primary thread",
     ))
 }

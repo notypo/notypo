@@ -29,6 +29,7 @@ pub mod app;
 pub mod args;
 pub mod corrector;
 pub mod difflib;
+pub mod engine;
 pub mod logs;
 pub mod output_readers;
 pub mod path_index;
@@ -43,5 +44,6 @@ mod terminal;
 pub mod types;
 pub mod ui;
 pub mod utils;
+pub mod workspace;
 
 pub use app::run;
