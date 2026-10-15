@@ -132,6 +132,14 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     output. Windows probe startup skips already-running threads until it
     resumes the suspended primary thread; production probe limits stay the
     same. These fixes await the next hosted validation run.
+    Windows follow-up: all 192 unit tests now pass on the hosted runner.
+    Portable PowerShell scripts allow time for multiple cold requests while
+    retaining their operation, context and cleanup assertions. Native probes
+    pass their callback through PowerShell's explicit completion options for
+    classic-shell compatibility. The filesystem-drive fixture uses a UTF-8
+    signature and ASCII setup text so classic PowerShell tests the intended
+    Unicode root. Zsh's plain-handler fixture owns its filesystem context and
+    surfaces completion errors directly. Hosted verification is still pending.
     Current release work: hosted CI verification, package validation and the
     final publication audit. All other unchecked features and inventories
     are deferred by the owner (2026-10-15).

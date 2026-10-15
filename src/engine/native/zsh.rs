@@ -657,7 +657,10 @@ mod tests {
             &format!("#compdef plain\nprint call >> {quoted}\n_files\n"),
         );
         let backend = Backend::new(Flavor::ZshFunction, "plain", zsh).with_helper(plain);
-        let _ = backend.complete(&[], "", &mut budget());
+        // _files must see only this fixture, not the runner's checkout.
+        backend
+            .complete(&[], "", &mut budget().with_cwd(Some(&dir.0)))
+            .unwrap_or_else(|error| panic!("plain handler completion failed: {error}"));
         assert_eq!(std::fs::read_to_string(&once).unwrap(), "call\n");
     }
 

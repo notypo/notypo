@@ -55,9 +55,8 @@ $global:NotypoCompleter = [scriptblock]::Create($env:NOTYPO_PS_COMPLETER)
 $global:NotypoPrefix = [string]$env:NOTYPO_PS_PREFIX
 $global:NotypoAnswered = $null
 $global:NotypoFailure = $null
-$registration = @{ CommandName = $env:NOTYPO_PS_NAME }
-if ($PSVersionTable.PSVersion.Major -ge 6) { $registration.Native = $true }
-Microsoft.PowerShell.Core\Register-ArgumentCompleter @registration -ScriptBlock {
+$nativeCompleters = @{}
+$nativeCompleters[$env:NOTYPO_PS_NAME] = {
     param($word, $ast, $cursor)
     $ErrorActionPreference = 'Stop'
     try {
@@ -73,7 +72,9 @@ $cursor = [int]$env:NOTYPO_PS_CURSOR
 foreach ($name in 'NOTYPO_PS_DEFINITIONS', 'NOTYPO_PS_COMPLETER', 'NOTYPO_PS_NAME', 'NOTYPO_PS_LINE', 'NOTYPO_PS_CURSOR', 'NOTYPO_PS_PREFIX') {
     [Environment]::SetEnvironmentVariable($name, $null)
 }
-$result = [System.Management.Automation.CommandCompletion]::CompleteInput($line, $cursor, $null)
+# Explicit options keep the registered callback in the completion runspace
+# on Windows PowerShell 5.1 as well as PowerShell 7.
+$result = [System.Management.Automation.CommandCompletion]::CompleteInput($line, $cursor, @{ NativeArgumentCompleters = $nativeCompleters })
 if ($null -ne $global:NotypoFailure) { __notypo_emit 'failed'; return }
 if ($null -eq $global:NotypoAnswered) { __notypo_emit 'unanswered'; return }
 __notypo_emit 'answered'

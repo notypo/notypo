@@ -57,6 +57,9 @@ fn run(shell: &Path, dir: &Path, input: &str) -> (Vec<u8>, Vec<u8>) {
         .env("THEFUCK_ALTER_HISTORY", "false")
         .env("THEFUCK_NO_COLORS", "true")
         .env("NOTYPO_NO_CACHE", "1")
+        // These scripts exercise several corrections and cold shell starts.
+        // Production defaults and the separate timeout fixtures stay bounded.
+        .env("NOTYPO_PROBE_TIMEOUT", "15")
         .env("NOTYPO_TRUSTED_COMPLETERS", r#"["Get-CoreFixture"]"#)
         .env("NOTYPO_DISABLED_SOURCES", "history:legacy:help:man")
         .env_remove("TF_HISTORY")
@@ -87,7 +90,7 @@ fn run(shell: &Path, dir: &Path, input: &str) -> (Vec<u8>, Vec<u8>) {
         .unwrap()
         .write_all(input.as_bytes())
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(180);
     loop {
         if child.try_wait().unwrap().is_some() {
             break;
@@ -95,7 +98,10 @@ fn run(shell: &Path, dir: &Path, input: &str) -> (Vec<u8>, Vec<u8>) {
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("PowerShell integration did not finish within 60 seconds");
+            panic!(
+                "PowerShell integration did not finish within 180 seconds: {}",
+                shell.display()
+            );
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -296,13 +302,25 @@ fn filesystem_session_drives_reach_metadata_and_parameter_callbacks() {
         let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
         let setup = workspace.0.join("setup.ps1");
         let operations = workspace.0.join("operations");
+        // Windows PowerShell reads script files without a BOM as ANSI.
         fs::write(&setup, format!(
-            "function Get-CoreFixture {{ [CmdletBinding()] param([string]$Target) [IO.File]::AppendAllText({},'original'); throw 'fixture failure' }}\nRegister-ArgumentCompleter -CommandName Get-CoreFixture -ParameterName Target -ScriptBlock {{ param($command,$parameter,$word,$ast,$bound) if ((Get-PSDrive -Name Work).Root -eq {}) {{ [System.Management.Automation.CompletionResult]::new(\"'Work:/west one'\",'West','ParameterValue','Drive context') }} }}\n",
+            "\u{feff}function Get-CoreFixture {{ [CmdletBinding()] param([string]$Target) [IO.File]::AppendAllText({},'original'); throw 'fixture failure' }}\nRegister-ArgumentCompleter -CommandName Get-CoreFixture -ParameterName Target -ScriptBlock {{ param($command,$parameter,$word,$ast,$bound) if ((Get-PSDrive -Name Work).Root -eq {}) {{ [System.Management.Automation.CompletionResult]::new(\"'Work:/west one'\",'West','ParameterValue','Drive context') }} }}\n",
             quote(operations.to_str().unwrap()), quote(root.to_str().unwrap())
         )).unwrap();
+        // Keep the stdin setup ASCII even on the classic console codepage;
+        // the actual filesystem root still contains Unicode and an apostrophe.
+        let root_expression = format!(
+            "([string]::new([char[]]@({})))",
+            root.to_str()
+                .unwrap()
+                .encode_utf16()
+                .map(|unit| unit.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         let input = format!(
             "Invoke-Expression ((& {} --alias corefix) -join \"BTn\")\n. {}\n$null = New-PSDrive -Name Work -PSProvider FileSystem -Root {}\nSet-Location Work:\nGet-ChildItem -Direcotry -LiteralPath 'Work:/'\ncorefix --json\nGet-CoreFixture -Target 'Work:/wesst one'\ncorefix --json\n[Console]::Out.WriteLine('drives-context-left:' + [bool]$env:NOTYPO_POWERSHELL_DRIVES)\nexit\n",
-            quote(env!("CARGO_BIN_EXE_notypo")), quote(setup.to_str().unwrap()), quote(root.to_str().unwrap())
+            quote(env!("CARGO_BIN_EXE_notypo")), quote(setup.to_str().unwrap()), root_expression
         ).replace("BT", &char::from(96).to_string());
         let (output, errors) = run(&shell, &workspace.0, &input);
         let detail = format!(
