@@ -50,6 +50,9 @@ fn run(shell: &Path, dir: &Path, input: &str) -> (Vec<u8>, Vec<u8>) {
         .env("XDG_CONFIG_HOME", dir)
         .env("XDG_CACHE_HOME", dir)
         .env("XDG_DATA_HOME", dir)
+        .env("TMPDIR", dir)
+        .env("TEMP", dir)
+        .env("TMP", dir)
         .env("THEFUCK_RULES", "")
         .env("THEFUCK_ALTER_HISTORY", "false")
         .env("THEFUCK_NO_COLORS", "true")
@@ -327,6 +330,76 @@ fn filesystem_session_drives_reach_metadata_and_parameter_callbacks() {
         assert!(
             String::from_utf8_lossy(&output).contains("drives-context-left:False"),
             "{detail}"
+        );
+    }
+}
+
+#[test]
+fn large_command_inventories_use_temporary_metadata_and_clean_it_up() {
+    for (index, shell) in runtimes().into_iter().enumerate() {
+        let workspace = Workspace(std::env::temp_dir().join(format!(
+            "notypo-core-large-names-{}-{index}",
+            std::process::id()
+        )));
+        let modules = workspace.0.join("modules");
+        let module = modules.join("LargeFixture");
+        fs::create_dir_all(&module).unwrap();
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let marker = workspace.0.join("module-imported");
+        let names: Vec<_> = (0..4000)
+            .map(|index| format!("Get-NotypoLargeFixtureCommandLongName{index:04}"))
+            .collect();
+        let definitions = names
+            .iter()
+            .map(|name| format!("function {name} {{ }}\n"))
+            .collect::<String>();
+        fs::write(
+            module.join("LargeFixture.psm1"),
+            format!(
+                "[IO.File]::WriteAllText({},'imported')\n{definitions}",
+                quote(marker.to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        fs::write(
+            module.join("LargeFixture.psd1"),
+            format!(
+                "@{{RootModule='LargeFixture.psm1';ModuleVersion='1.0.0';FunctionsToExport=@({})}}",
+                names
+                    .iter()
+                    .map(|name| quote(name))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        )
+        .unwrap();
+        let capture = workspace.0.join("capture.ps1");
+        fs::write(&capture, format!("{}\n[Console]::Out.WriteLine('large-names-snapshot:' + [bool]$env:NOTYPO_POWERSHELL_NAMES_FILE)\nif ($notypo_names_file) {{ [IO.File]::Delete($notypo_names_file) }}", include_str!("../src/shells/powershell_names.ps1"))).unwrap();
+        let input = format!("$env:PSModulePath = {} + [IO.Path]::PathSeparator + $env:PSModulePath\nInvoke-Expression ((& {} --alias corefix) -join \"BTn\")\n. {}\nGet-ChildItme -Name\ncorefix --json\n[Console]::Out.WriteLine('temporary-names-files:' + @([IO.Directory]::GetFiles([IO.Path]::GetTempPath(),'notypo-powershell-names-*.json')).Count)\nexit\n", quote(modules.to_str().unwrap()), quote(env!("CARGO_BIN_EXE_notypo")), quote(capture.to_str().unwrap())).replace("BT", &char::from(96).to_string());
+        let (output, errors) = run(&shell, &workspace.0, &input);
+        let detail = format!(
+            "{}\n{}\n{}",
+            shell.display(),
+            String::from_utf8_lossy(&output),
+            String::from_utf8_lossy(&errors)
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("large-names-snapshot:True"),
+            "{detail}"
+        );
+        let reports = reports(&output);
+        assert_eq!(reports.len(), 1, "{detail}");
+        assert_eq!(
+            reports[0]["candidates"][0]["command"], "Get-ChildItem -Name",
+            "{detail}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output).contains("temporary-names-files:0"),
+            "{detail}"
+        );
+        assert!(
+            !marker.exists(),
+            "module imported during discovery: {detail}"
         );
     }
 }

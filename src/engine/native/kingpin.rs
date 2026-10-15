@@ -659,6 +659,25 @@ esac
     }
 
     #[test]
+    fn upgrades_expose_new_commands_on_the_next_request() {
+        let dir = Dir::new("kingpin-upgrade");
+        let original = backend(&dir, &["fixture"]);
+        assert!(values(&original.complete(&[], "", &mut budget()).unwrap()).contains(&"deploy"));
+        std::fs::write(&original.completer, APP.replace("deploy", "release")).unwrap();
+        let mut fresh = Backend::new(Flavor::Kingpin, "fixture", original.completer.clone());
+        fresh.identity = Some(MODULE.into());
+        fresh.kingpin = Some(Box::new(Protocol {
+            trusted_help: vec!["fixture".into()],
+        }));
+        let words = fresh.complete(&[], "", &mut budget()).unwrap();
+        assert!(values(&words).contains(&"release"));
+        assert!(!values(&words).contains(&"deploy"));
+        assert_eq!(fresh.cache_identity(), None);
+        assert!(!dir.0.join("bin/operation-marker").exists());
+        assert!(!dir.0.join("bin/default-command-marker").exists());
+    }
+
+    #[test]
     fn leaf_aliases_and_options_never_query_argument_hints() {
         let dir = Dir::new("kingpin-leaf-hints");
         let backend = backend(&dir, &["fixture"]);

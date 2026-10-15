@@ -1271,6 +1271,33 @@ esac
     }
 
     #[test]
+    fn an_upgraded_selected_sdk_supplies_new_commands_and_schema() {
+        let dir = Dir::new("dotnet-upgrade");
+        let original = fixture(&dir);
+        assert!(!values(&original.complete(&[], "", &mut budget()).unwrap()).contains(&"release"));
+        sdk(&dir, "10.0.402", true);
+        std::fs::write(dir.0.join("selected"), "10.0.402\n").unwrap();
+        let mut schema: Value = serde_json::from_str(SCHEMA).unwrap();
+        schema["subcommands"]["release"] =
+            serde_json::json!({"name":"release","options":{},"arguments":{},"subcommands":{}});
+        std::fs::write(dir.0.join("schema"), schema.to_string()).unwrap();
+        std::fs::write(
+            &original.completer,
+            APP.replace("build\\nnuget\\n--help", "build\\nnuget\\nrelease\\n--help"),
+        )
+        .unwrap();
+        assert!(original.complete(&[], "", &mut budget()).is_err());
+        let Discovery::Found(mut fresh) =
+            discover("dotnet", &original.completer, &["dotnet:sdk".into()])
+        else {
+            panic!("upgraded SDK not discovered")
+        };
+        fresh.dotnet.as_mut().unwrap().original_home = dir.0.join("fixture-home");
+        assert!(values(&fresh.complete(&[], "", &mut budget()).unwrap()).contains(&"release"));
+        assert!(!dir.0.join("operation-marker").exists());
+    }
+
+    #[test]
     fn selected_sdk_in_another_root_is_verified_and_revalidated_by_path() {
         let host = Dir::new("dotnet-host-root");
         let selected = Dir::new("dotnet-selected-root");

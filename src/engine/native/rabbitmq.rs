@@ -767,6 +767,30 @@ esac
     }
 
     #[test]
+    fn enabled_plugin_commands_refresh_on_the_next_request() {
+        let dir = Dir::new("rabbitmq-upgrade");
+        let original = backend(&dir, &["rabbitmqctl"]);
+        assert!(
+            values(&original.complete(&[], "", &mut budget()).unwrap())
+                .contains(&"list_stream_connections")
+        );
+        std::fs::write(
+            dir.0.join("escript/rabbitmqctl.body"),
+            BODY.replace("list_stream_connections", "list_new_connections"),
+        )
+        .unwrap();
+        let mut fresh = super::backend("rabbitmqctl", &original.completer, "rabbitmqctl".into());
+        if let Some(super::super::Bridge::RabbitMQ(protocol)) = fresh.bridge.as_deref_mut() {
+            protocol.trusted_help = vec!["rabbitmqctl".into()];
+        }
+        let words = fresh.complete(&[], "", &mut budget()).unwrap();
+        assert!(values(&words).contains(&"list_new_connections"));
+        assert!(!values(&words).contains(&"list_stream_connections"));
+        assert_eq!(fresh.cache_identity(), None);
+        assert!(!dir.0.join("operation-marker").exists());
+    }
+
+    #[test]
     fn discovery_needs_both_trust_settings() {
         let dir = Dir::new("rabbitmq-discovery");
         let path = install(&dir);

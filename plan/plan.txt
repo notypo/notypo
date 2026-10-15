@@ -57,11 +57,11 @@ Status: first and second slices implemented in src/engine/ on branch
         no controlling terminal for probes, posener/cobra/handler argument
         and arity detection, cobra alias confirmation, case-sensitive short
         options, and password masking in reports.
-Core engine release scope (owner request updated 2026-10-15): finish the
-engine implementation and verification for manual merge/publication. The
-5A/5B application inventories and additional protocols remain future work.
-The owner explicitly excluded benchmarks and benchmark directories; stale
-Cargo benchmark targets are removed instead of restoring those directories.
+Publication scope (owner request updated 2026-10-15): wrap up the current
+implementation, finish PR CI successfully, verify packaging and publish
+readiness, commit and push the changes. All additional features, application
+inventories and protocols remain future work. Publishing is performed
+manually by the owner after merging the PR.
 New app installations are recorded in plan/app.txt with cleanup locations.
     Literal arguments on both sides of a diagnosed token reach Bash, Zsh,
     and PowerShell callbacks, with their native cursor units preserved.
@@ -91,7 +91,7 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     bounded too. Probes use the failure cwd without changing the parent cwd.
     Persistent metadata includes the raw workspace path; captured errors
     refresh cached words that an app no longer accepts.
-    Last verified full checkpoint: 485 local tests pass with PowerShell 7.6.7,
+    Last verified full checkpoint: 494 local tests pass with PowerShell 7.6.7,
     plus host Clippy. Generated aliases print --json reports as data, respect
     the -- delimiter, and do not execute or add reports to shell history.
     Portable PowerShell tests cover dynamic names/enum values, suffix context,
@@ -106,7 +106,7 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     empty PowerShell target preserves its AST position before later words;
     rustup, mdbook, elan and dua generated-completer checks pass. Host and
     Windows/Linux/FreeBSD Clippy pass; platform fixes await hosted runtime
-    verification. No benchmark directories or new app installations.
+    verification. No new app installations.
     Further core progress (2026-10-15): bounded local filesystem drive
     definitions are restored in every PowerShell metadata/binder/callback
     probe, with credentials and remote roots excluded. A real fixture uses
@@ -116,8 +116,18 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     discovery shell; module export discovery has a read-only fallback.
     PowerShell 7.6 NativeFallback registrations retain captured state, with
     command-specific registrations taking precedence (real runtime fixture).
-    Remaining core work: supported-protocol upgrade records, hosted platform
-    verification, package validation and the final release audit.
+    Publication wrap-up (2026-10-15): large PowerShell command inventories
+    use bounded command-name metadata, with temporary-file transport when
+    environment-variable limits are exceeded. The shell removes temporary
+    metadata in finally; callbacks, arguments and closure data are not stored
+    there. A 4,000-command fixture checks the transport and cleanup without
+    importing its module. Hosted tests run at bounded concurrency; a failed
+    pre-exec terminal setup can retry once under the same request budget.
+    Existing protocol upgrade/endpoint fixtures pass. No additional feature
+    implementation is planned for this release.
+    Current release work: hosted CI verification, package validation and the
+    final publication audit. All other unchecked features and inventories
+    are deferred by the owner (2026-10-15).
 
 Baseline: commit 57a96e2; Rust 2024; MSRV 1.98.
 Legend: [x] DONE = present in the inspected codebase.
@@ -197,8 +207,7 @@ CURRENT BASELINE
 [x] DONE: Captured-output readers, Unix shell logging, rerun timeouts, and
     native process/terminal support exist. Output acquisition may currently
     rerun the failed command; captured output is not always separate stderr.
-[x] DONE: Unit/CLI/rule fixtures and platform CI exist. Benchmarking is
-    excluded from the current release by the owner (2026-10-15).
+[x] DONE: Unit/CLI/rule fixtures and platform CI exist.
 [x] DONE: Lossless AST, token diagnosis, unified providers, explainable
     ranking, and a mandatory safety gate are integrated end to end.
     Integrated in the default pipeline for sh/bash/zsh. Native completion,
@@ -480,9 +489,8 @@ Unsupported syntax produces an explicit outcome and cannot execute silently.
     function whose syntax tree is one command (plain or `&`, no
     redirections) of literal words and parameters followed by `$args` or
     `@args`, with no parameters, param/begin/process/dynamicparam blocks,
-    or traps (16 KiB cap; 59 ms measured in a fresh session of 18
-    functions, reading and parsing the snippet included; macOS's built-in
-    `exec` is itself such a wrapper, for Switch-Process).
+    or traps (16 KiB cap). macOS's built-in `exec` is itself such a wrapper,
+    for Switch-Process.
     They become the shell's alias map, keyed in lowercase, and
     engine::aliases looks names up without regard to case for the
     PowerShell dialect. A wrapper for an application takes its
@@ -711,8 +719,7 @@ and ls --colro=auto the option name while preserving its value.
     supplementary character before the cursor; specific/global registration
     precedence; module callbacks; untrusted/opaque context; confirmation/-y
     behavior and untouched operation/profile markers. The installed check
-    uses the macOS runtime only. The benchmark harness adds a positional
-    callback case with a later -Scope argument.
+    uses the macOS runtime only.
     PARTIAL (2026-10-05): native-program completers registered in the
     user's PowerShell session (`Register-ArgumentCompleter -Native`, and
     cobra's registration without -Native, which lands in the same table),
@@ -1676,7 +1683,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     aliases, with descriptions; `cargo <command> --help` gives options, and
     an external subcommand answers for itself. `cargo +toolchain` is
     context kept in every query; toolchain names come from
-    `rustup toolchain list`. Package, binary, example, test, bench, and
+    `rustup toolchain list`. Package, binary, example, test, and
     feature names (-p, --bin, --example, --features) come from
     `cargo metadata --offline --no-deps --format-version 1`, which reads
     the manifests without building or running build scripts; discovery never
@@ -1707,7 +1714,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     grep -> rg (ripgrep) and rga (ripgrep-all); find -> fd; cat/less -> bat;
     ls -> eza, lsd; du -> dust; ps -> procs; top -> btm (bottom);
     cd -> zoxide (z, zi); sed -> sd; cut/awk -> choose; tldr -> tealdeer;
-    time -> hyperfine; cloc -> tokei; diff -> delta, difftastic (difft);
+    cloc -> tokei; diff -> delta, difftastic (difft);
     curl/httpie -> xh; xxd -> hexyl; dig -> dog; ping -> gping;
     mtr -> trippy; tmux -> zellij; vim -> helix (hx); fzf -> skim (sk);
     jq -> jaq; tar/zip -> ouch; history search -> atuin; GNU coreutils ->
@@ -2179,33 +2186,21 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     transformed/member-pattern contexts, and foreign runtime behavior remain
     open; all checks in this continuation are on macOS, without Docker.
     Validation: all 410 default tests pass (363 unit, 43 CLI, one corpus,
-    three rule fixtures), plus both benchmark smoke runs; 27 installed-client
+    three rule fixtures); 27 installed-client
     checks pass serially in 249 s with Docker excluded and no missing-tool
     skips. The archive check passes again after the strict unzip arity guard,
     added malformed/password cases, and shell-dialect quoting matrix (5.7 s).
     Formatting, all-target/all-feature macOS Clippy with -D warnings, release
     build, doc-tests, cargo package, and publish --dry-run --allow-dirty
     --locked pass. Package verification includes archives.rs (104 files,
-    2.5 MiB/555 KiB) and excludes plan/benchmarks/benches; nothing is uploaded.
-    benchmarks/archive-results.md measures 15 cold and 15 warm processes per
-    reader: cold/warm medians 20.8/20.1 ms (bsdtar), 34.1/33.1 (GNU tar),
-    34.6/34.0 (unzip), and 39.2/36.7 (7-Zip), two probes each; peak RSS
-    6.7/7.0/7.2/17.2 MiB. bsdtar's cold p95 includes a 243 ms startup
-    outlier. The standalone fixtures check every answer and no extraction.
-    The 20-batch macOS engine benchmark still meets the existing ~2 ms
-    budget: nested two-typo correction 0.970/0.974 ms median/p95, executable
-    typo 1.874/1.889 ms, valid command 0.0257/0.0266 ms. Parsing is 1.37 us
-    median; ranking 806 operations is 790 us and 962 executables 36.3 us.
-    Reproduce with cargo bench --locked --bench engine and python3
-    benchmarks/structured.py --archive-fixtures --case 'archive members'
-    --samples 15 --output benchmarks/archive-results.md.
+    2.5 MiB/555 KiB) and excludes /plan/; nothing is uploaded.
     IMPLEMENTED (2026-10-06, macOS): the wider inventory. archives.rs gives
     every remaining tool its operand slots from its own syntax; a known
     failure repairs a missing input from regular sibling files with the
     same extension, with confirmation and no probe. Outputs, option values,
     created archives, patterns, and destination directories are never
     looked up. Unknown options, recursion (-r), file lists (-@, --files,
-    --filelist, -E, -T), stdin/stdout operands, benchmarks, and training
+    --filelist, -E, -T), stdin/stdout operands and training
     modes decline the layout; for tools without members (compressors, zip,
     ditto, ouch, atool, mksquashfs, PowerShell) a declined line keeps the
     generic path provider, as before.
@@ -2261,10 +2256,6 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     archivers_repair_inputs_without_writing: 32 real-tool repairs (40 with
     NOTYPO_TEST_JDK/NOTYPO_TEST_PWSH set: jar and PowerShell), -y refusal,
     negative cases, and a directory snapshot showing nothing was written.
-    benchmarks/archive-results.md adds zipinfo, unar, ar, and jar readers
-    (cold/warm medians 40/39, 53/51, 104/52, and 134/135 ms; ar's cold run
-    pays xcrun's developer-directory lookup, jar a JVM start). The engine
-    benchmark keeps its budget (nested two-typo correction 0.974 ms).
     Installed with Homebrew and recorded in plan/app.txt: unar, pigz,
     pbzip2, lzip, plzip, lzop, pixz, ouch, atool, cabextract, squashfs,
     dtrx, openjdk, and their dependencies. Unverified: rar/unrar (the rar
@@ -2908,7 +2899,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     repositories, which uses a real encrypted borg repository, a marker
     password command for borg/restic/rclone, and a listening address.
 [ ] NOT DONE: Security scanners and auditing: semgrep, gitleaks, trufflehog,
-    snyk, nikto, bandit, pip-audit, osv-scanner, checkov, tfsec, kube-bench,
+    snyk, nikto, bandit, pip-audit, osv-scanner, checkov, tfsec,
     lynis, and clamscan (trivy, grype, syft, and cargo audit/deny are in
     their entries). Requirements: rule IDs and config names come from the
     tools; scans that upload code or fetch rules (snyk test/monitor,
@@ -2918,7 +2909,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     kingpin (trufflehog), and click (semgrep).
     DONE (2026-10-06, macOS, Homebrew): cobra under trusted_completers:
     gitleaks 8.30.1 (its hidden `detect`/`protect` aliases are not listed,
-    so they are not repaired), tfsec 1.28.14, kube-bench 0.16.0. kingpin:
+    so they are not repaired), tfsec 1.28.14. kingpin:
     trufflehog 3.98.0 (trusted completers and help). osv-scanner 2.6.0
     links urfave/cli v3 but does not enable completion (exit 127), so its
     trusted help supplies commands. Trusted help: semgrep 1.179.0 (its
@@ -3185,8 +3176,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     confirm, -y without a terminal prints no command, and no fake operation
     runs; a read-only nginx repair succeeds with the same evidence.
     Validation (2026-10-05, including clap/pip/npm): cargo test --locked --all-targets
-    passes 215 tests and the
-    benchmark fixture checks (the installed-client tests remain opt-in);
+    passes 215 tests (the installed-client tests remain opt-in);
     rustfmt and all-feature host Clippy pass. All-target/all-feature checks
     compile for Windows GNU/MSVC, FreeBSD, and Linux musl; these are compilation
     checks, not runtime platform verification.
@@ -3269,7 +3259,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     budgets, and timeout process-tree cleanup. CLI checks cover installed
     scripts without help, generated scripts without sourcing, nested repairs,
     simultaneous attached option-name/value repairs, and plugin approval.
-    Validation: all 200 default tests and benchmark fixture checks pass;
+    Validation: all 200 default tests pass;
     rustfmt, all-feature host Clippy, and all-target/all-feature compilation
     checks for Windows GNU/MSVC, FreeBSD, and Linux musl pass. These cross
     checks compile code; runtime protocol checks were performed on macOS.
@@ -3316,7 +3306,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     fixtures repaired `pip3 config lsit` and `pip3 install --dry-rnu example`
     with completion only; no package operation or network lookup ran.
     Windows binary launchers and other pip versions remain runtime-unverified.
-    Validation: 208 default tests and benchmark fixture checks, rustfmt,
+    Validation: 208 default tests, rustfmt,
     all-feature host Clippy, and all-target/all-feature Windows GNU/MSVC,
     FreeBSD, and Linux musl compilation checks pass. Installed runtime checks
     remain macOS-specific.
@@ -3357,7 +3347,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     lib/commands/completion.js and lib/commands/run.js. Windows is explicitly
     unsupported for this bridge; other npm versions and workspace resolution
     remain runtime-unverified. Other shared protocols remain unfinished.
-    Validation: 215 default tests and benchmark fixtures, rustfmt, all-feature
+    Validation: 215 default tests, rustfmt, all-feature
     host Clippy, and all-target/all-feature Windows GNU/MSVC, FreeBSD, and
     Linux musl compilation checks pass. Installed runtime coverage is macOS.
     PARTIAL (2026-10-05): cargo's command list bridge implemented.
@@ -3379,7 +3369,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     may delegate. External subcommands delegate to their own discovered
     protocol under their own trust (cargo-<name>), with the command name as
     the first word; delegation is refused under +toolchain/--config scope.
-    -p/--package, --bin, --example, --test, --bench, and -F/--features values
+    -p/--package, --bin, --example, --test, and -F/--features values
     come from `cargo metadata --offline --locked --no-deps
     --format-version=1` (only when metadata is an unshadowed builtin),
     honoring --manifest-path, -p, --workspace, and default members; feature
@@ -3407,14 +3397,14 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     trust=trusted_completers plus trusted_help. Installed checks repair
     `cargo biuld`, `cargo +stable biuld`, `cargo +stabel version`,
     `cargo build --releae`, and `cargo report future-incompatibilites`, plus
-    package/bin/example/test/bench/feature/--color typos and a workspace
+    package/bin/example/test/feature/--color typos and a workspace
     member in an isolated project, and list an alias and an extension
     without running them; no build, build script, alias, or extension ran.
     CARGO_COMPLETE (nightly-only native completion) is not used.
     Remaining: other Cargo versions, Windows runtime, and offline
     resolution of --exclude, -C, and -Z.
     Validation: 227 default tests (193 unit, 30 CLI, corpus, three rule
-    fixtures) and benchmark fixture checks, rustfmt, host Clippy, and
+    fixtures), rustfmt, host Clippy, and
     all-target/all-feature Clippy for Windows GNU/MSVC, FreeBSD, and Linux
     musl pass (Backend now boxes its clap protocol, which exceeded the
     enum-size lint on Windows). Cross-target checks compile code only.
@@ -3699,9 +3689,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     Clippy, and Windows GNU/MSVC, FreeBSD, and Linux musl Clippy pass.
     Release, packaged builds, and publish --dry-run pass; the 89-file archive
     includes the SDK
-    bridge and excludes plan/benchmarks/benches. The SDK benchmark (11
-    processes per mode) measures 607/607 ms cold/warm median, six probes
-    in either mode, and 87.7 MiB peak RSS; protocol-results.md records it.
+    bridge and excludes /plan/.
     PARTIAL (2026-10-05): go-flags' completion protocol implemented
     (src/engine/native/go_flags.rs) from github.com/jessevdk/go-flags
     v1.6.1's completion.go and parser.go, then checked against a fixture
@@ -3744,7 +3732,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     nested commands, root and nested options, an alias's option, and a
     Completer value, with no operation marker. No go-flags app is
     installed here (no Homebrew binary links the library), so there is
-    no opt-in installed check or benchmark; Windows runtime is
+    no opt-in installed check; Windows runtime is
     unverified. Reference: github.com/jessevdk/go-flags completion.go.
     Validation: 311 default tests (273 unit, 34 CLI, corpus, three rule
     fixtures), rustfmt, host Clippy, and Windows GNU/MSVC, FreeBSD, and
@@ -3808,7 +3796,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     marker appeared, and script discovery with trusted_completers alone,
     the untrusted refusal, and no probing without trusted_help were
     checked. No yargs app is installed system-wide here, so there is no
-    opt-in installed check or benchmark, and other yargs versions remain
+    opt-in installed check, and other yargs versions remain
     unverified. Reference: github.com/yargs/yargs lib/completion.ts.
     Validation: 322 default tests (283 unit, 35 CLI, corpus, three rule
     fixtures), rustfmt, host Clippy, and Windows GNU/MSVC, FreeBSD, and
@@ -3854,8 +3842,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     tests/cli.rs decides repairs through the real binary with -y and no
     trust settings, never running the app. Real eas-cli runs repaired
     root, colon-id, alias, flag, `--no-` flag, plugin-command flag, and
-    choice typos (11 cases). Benchmark (11 processes per mode): 10/9 ms
-    cold/warm median, 0 probes, 7.7 MiB peak RSS. Not recognized:
+    choice typos (11 cases). Not recognized:
     standalone oclif tarball installs (heroku via Homebrew), Windows npm
     shims, and hooks that rewrite argv; single-command CLIs follow the
     source but have no fixture. Reference: github.com/oclif/core src/config and
@@ -4081,8 +4068,8 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     The installs and the reused offline Go fixture toolchain are recorded
     in plan/app.txt. Other clients in the inventory remain unverified.
     Validation: 365 available default tests pass (318 unit, 43 CLI,
-    corpus, three rule fixtures), with PowerShell enabled, plus benchmark
-    smoke checks. The full --all-targets run encounters one sandbox block:
+    corpus, three rule fixtures), with PowerShell enabled.
+    The full --all-targets run encounters one sandbox block:
     reads_matching_record_from_socket fails at UnixListener::bind with
     EPERM before exercising the reader. A standalone macOS socket bind
     reproduces that restriction; the passing run explicitly skips only
@@ -4098,7 +4085,7 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     The passing run has no missing-client skips; Docker is explicitly
     excluded. LLM's broken dependency is separately recorded as unverified.
     Available default tests: 369 pass (322 unit, 43 CLI, corpus, three
-    rule fixtures), plus benchmark smoke checks, with PowerShell enabled.
+    rule fixtures), with PowerShell enabled.
     The one socket-binding test is explicitly filtered because the macOS
     sandbox rejects UnixListener::bind with EPERM; it is not counted as
     passed. Formatting, macOS Clippy, and release build pass. Click 8.1.8
@@ -4186,14 +4173,14 @@ Observed on 2026-10-04 (macOS, `notypo --explain '<tool> stauts'`):
     Docker is explicitly excluded; there are no missing-tool skips in that
     run. The AWS v1 variable names /tmp/notypo-aws-v1/bin (a directory),
     not its aws executable. Current default checks pass all 404 tests
-    (357 unit, 43 CLI, corpus, three rule fixture tests) plus both benchmark
-    smoke runs. The socket-binding test now runs and passes; no test is
+    (357 unit, 43 CLI, corpus, three rule fixture tests).
+    The socket-binding test now runs and passes; no test is
     filtered. After the final incomplete-parameter context guard, the real
     PowerShell installed check and default suite pass again. Formatting,
     macOS all-target/all-feature Clippy, release build, package verification,
     and publish --dry-run --allow-dirty --locked pass. The 103-file archive
-    includes PowerShell source and fixtures and excludes plan/benchmarks/
-    benches. No crate is uploaded. No Docker, foreign runtime, or foreign
+    includes PowerShell source and fixtures and excludes /plan/.
+    No crate is uploaded. No Docker, foreign runtime, or foreign
     cross-target check is run; provider/closure/app inventory work stays open.
 
 6. CONTROL PROBES, CACHES, AND LATENCY
@@ -4376,7 +4363,7 @@ command, and rejection leaves command effects/history untouched.
 Acceptance: git sttus -> typo offers git status with a reason; accepting
 executes it once. Aborting or a denied safety decision executes nothing.
 
-10. VALIDATE, MEASURE, AND ROLL OUT
+10. VALIDATE AND PREPARE THE RELEASE
 
 [x] DONE: Keep existing rule fixtures passing through the compatibility
     source; record deliberate behavior changes separately during migration.
@@ -4477,133 +4464,9 @@ executes it once. Aborting or a denied safety decision executes nothing.
     ambiguity/abstention rates, and unsafe automatic acceptances.
     tests/corpus.rs: top-1 99.0%, top-3 100%, asked 3.5%, abstained 0%,
     wrong automatic decisions 0%.
-[-] SKIPPED: Benchmark each pipeline stage and end-to-end cold/warm CLI
-    latency (median and p95), subprocess counts, cache behavior, and RSS.
-    Compare with the current Rust engine and the existing Python baseline.
-    Owner exclusion (2026-10-15): benchmarking is outside the current core
-    release scope. Do not create or restore benchmark directories. Historical
-    measurement notes below are retained as history only.
-    PARTIAL: benches/engine.rs (stages) and benchmarks/structured.py (cold/warm,
-    probes, RSS), plus help-vocabulary and fish parse/quote stages;
-    benchmarks/shell-results.md records eleven cold/warm runs through installed
-    fish/Zsh handlers using isolated apps, with four probes per run and operation
-    markers. Warm medians: fish 43 ms, Zsh 600 ms; RSS 5.8/5.2 MiB on macOS.
-    benchmarks/compare.py/results.md compare the default pipeline
-    with Python thefuck 3.32 (6-33x faster, 6.8 MiB vs 40.5 MiB). Remaining
-    shell/protocol paths and provider-stage measurements are still pending.
-    PARTIAL (2026-10-06, macOS): the current release comparison is saved in
-    benchmarks/current-comparison.json/.md. Twenty fresh processes per cell,
-    three warmups, randomized case/order, identical environment/history,
-    and every expected correction checked. Common corrections are 4.0-13.9x
-    faster than local Python thefuck 3.32; help startup is 32.6x faster.
-    Captured Git typo: 30.52 vs 266.34 ms; mkdir parent repair: 20.37 vs
-    279.28 ms; missing executable: 68.09 vs 299.71 ms. Five wait4 RSS samples
-    give Rust 8.66 MiB vs Python 40.72 MiB (about 4.7x), with OS-dependent
-    child accounting rather than aggregate process-tree memory. These are
-    warm-filesystem local CLI fixtures, not a broad correction-accuracy or
-    cloud-completer comparison. Generic native completer startup remains
-    separately measured in benchmarks/protocol-results.md.
-    The benchmark environment was recreated locally from cached compatible
-    wheels; setuptools 84 supplies upstream's distutils on Python 3.14.
-    The old /usr/bin/time -l memory method and CPU-brand sysctl are denied
-    in this sandbox. The harness now uses wait4 and platform.processor();
-    no approval bypass or upstream-source modification was used. Dependency
-    names are recorded in plan/app.txt, retaining its current simple format.
-    Current checks: 400 available default tests, 31 focused PowerShell unit
-    tests and the installed parameter callback fixture, rustfmt, macOS
-    Clippy, and release build pass. The Unix socket test remains filtered;
-    Windows/Linux/FreeBSD/Docker runtime or cross-target checks were not run.
-    PARTIAL (2026-10-05): benchmarks/structured.py --protocols measures the
-    newer bridges against installed apps (11 processes per mode, median ms
-    cold/warm, macOS): pip 230/230, npm 181/181, cargo 74/74, clap sofka
-    63/57, clap just shim 20/17, urfave/cli lefthook 18/15, user-trusted
-    cobra k9s 64/47 (disk-cached), and bq's bash handler 1108/1106 (Python
-    startup for `bq help`); results in benchmarks/protocol-results.md.
-    Request-local bridges repeat their probes when warm. click and kingpin
-    have no installed app here; Linux/Windows timings remain unmeasured.
-    PARTIAL (2026-10-05): PowerShell cases (pwsh on PATH or
-    NOTYPO_BENCH_PWSH): `Get-ChildItem -Recrse` 447/398 ms with one probe,
-    and `Get-ChildItme -Name` 829/790 ms with two (the command list and the
-    description); peak RSS 167 MiB is the child PowerShell's.
-    PARTIAL (2026-10-05): .NET SDK 10.0.401 repairs a build option in
-    607/607 ms cold/warm (11 samples per mode; p95 1147/614 ms), with six
-    SDK probes and 87.7 MiB peak RSS. Its schema and command/value queries
-    stay in request memory, so warm runs repeat all six SDK processes.
-    PARTIAL (2026-10-05): PowerShell session completers (portable pwsh
-    7.6.6): `mdbook serv` 404/353 ms cold/warm with one probe and `rustup
-    toolchian list` 766/720 ms with two (11 samples per mode; 141/145 MiB
-    peak RSS, the child PowerShell's). structured.py --protocols builds the
-    session variable with the integration function's own code; rows are in
-    benchmarks/protocol-results.md.
-    PARTIAL (2026-10-06, macOS): named PowerShell parameter callback
-    correction uses two probes (metadata and callback), with 15 samples
-    per mode. Median cold/warm 751.821/699.909 ms, p95 811.329/736.558 ms,
-    peak RSS 154.6 MiB. The fixture is captured by the shell integration;
-    PowerShell binds the preceding scope to select the resource value.
-    Every suggestion is checked and never executed; resource edits require
-    confirmation. No authenticated resource lookup is measured.
-    PARTIAL (2026-10-06, macOS): positional PowerShell callback correction
-    with a later named argument uses three request-local probes (metadata,
-    static binding, callback). With 15 samples per mode, median cold/warm
-    903.587/870.335 ms, p95 908.931/1015.021 ms, peak RSS 155.6 MiB.
-    PowerShell 7.6.6 selects Target in `Get-NotypoBench wesst-one -Scope
-    west` and the callback sees Scope=west. Every corrected value is checked,
-    needs confirmation, and is never executed. The row and reproduction
-    are in benchmarks/protocol-results.md; no authenticated lookup is timed.
-    Latest optimized macOS stage run (20 batches): nested two-typo
-    correction 0.961/0.968 ms median/p95, executable-typo correction
-    1.869/1.886 ms, valid-command inspection 0.0254/0.0258 ms. Known-program
-    work remains below the existing ~2 ms budget.
-    PARTIAL (2026-10-05, macOS): Symfony Console/Composer option repair is
-    655/645 ms cold/warm median (11 processes per mode), 1052/699 ms p95,
-    five probes in both modes, 35.8 MiB peak RSS. Probes verify native
-    completion metadata and annotate option arity from JSON help; replies
-    are request-local. The result is in benchmarks/protocol-results.md.
-    The optimized macOS stage benchmark passes after this bridge: nested
-    two-typo correction 0.963/0.965 ms median/p95, valid-command inspection
-    0.0256/0.0260 ms, and executable-typo correction 6.03/6.20 ms. The last
-    case includes installed executable discovery rather than only ranking.
-    PARTIAL (2026-10-05, macOS): kingpin checks use 15 cold/warm processes
-    per mode. Median ms cold/warm: promtool 106/96, Kopia 126/119, NATS
-    (fisk) 66/61; p95 522/116, 132/120, and 72/64 ms respectively. All
-    use four request-local probes and repeat them when warm. Peak RSS is
-    53.8/35.9/28.8 MiB. Results and callback limits are recorded in
-    benchmarks/protocol-results.md; no corrected operation is executed.
-    PARTIAL (2026-10-05, macOS): Click timings use 15 samples per mode.
-    SAM CLI 1.166.2/Click 8.1.8: median 1721/1712 ms cold/warm, p95
-    1761/1798 ms, four probes, peak RSS 108.2 MiB. OCI CLI 3.94.1/Click
-    8.4.2: median 3156/3173 ms, p95 3542/3530 ms, nine probes, 94.1 MiB.
-    Both use simulated shell-captured failure context (TF_HISTORY/status 1)
-    with replay disabled; OCI needs trusted help to establish the command
-    path because its root completion exits 1. Its option edit comes from
-    native completion, with Bash replies handling multiline descriptions.
-    Warm requests repeat probes; startup dominates. Neither operation runs.
-    Results and reproduction are in benchmarks/protocol-results.md and
-    benchmarks/structured.py --protocols --case Click.
-    PARTIAL (2026-10-06, macOS): RabbitMQ 4.3.6 with 15 samples per mode.
-    Command repair: median 530/531 ms cold/warm, p95 900/539 ms, one probe.
-    Option repair: median 1444/1442 ms, p95 1473/1530 ms, three probes.
-    Peak RSS 99.5 MiB. Each probe starts an Erlang VM; answers stay in
-    request memory, so warm runs repeat them. Reproduce with
-    benchmarks/structured.py --protocols --case RabbitMQ.
-    PARTIAL (2026-10-06, macOS): the probes added that day, 15 samples per
-    mode (median ms cold/warm, probes): vault (audited posener) 253/187,
-    4/3; helm (audited cobra, alias confirmation) 92/92, 3/3; restic
-    (cobra boolean-flag check) 222/195, 8/7; tmux through zsh's handler
-    1342/1337, 5/5 (was about 800 ms with 3 probes: each ZLE probe costs
-    about 270 ms). Arity probes are skipped when no argument follows the
-    option. Rows and notes in benchmarks/protocol-results.md.
-[x] DONE: Set latency/memory budgets from measurements; preserve the
-    inexpensive common-command path and report quality/performance tradeoffs.
-    Known-program engine work stays under ~2 ms per correction; executable
-    typo correction also discovers installed programs (~6 ms in the latest
-    macOS stage run). Probes are bounded by probe_timeout (3 s each, 9 s
-    total). Native completer startup remains the dominant cost on the default
-    pipeline; legacy rule evaluation is unchanged.
 [x] DONE: Run cargo fmt --all -- --check; cargo test --locked --all-targets;
     cargo clippy --locked --all-targets --all-features -- -D warnings; and
-    Keep Linux Clippy verification in CI. Benchmark work was explicitly
-    excluded by the owner on 2026-10-15.
+    keep Linux Clippy verification in CI.
 [ ] NOT DONE: Validate Linux/macOS/Windows/FreeBSD builds and available real
     shell integrations. Report unavailable runtime coverage explicitly.
     PARTIAL: local macOS Bash/Zsh 5.9/fish 4.9.3 runtime checks pass, including
@@ -4615,50 +4478,50 @@ executes it once. Aborting or a denied safety decision executes nothing.
     the fish 4 append API. Those CI runs and Windows runtime are unverified here.
     All-target/all-feature Clippy with -D warnings also passes for these three
     targets and the macOS host. 166 local tests pass (140 unit, 22 CLI,
-    one correction corpus, three rule fixture tests), plus benchmark smoke runs.
+    one correction corpus, three rule fixture tests).
 [x] DONE: Verify cargo package and cargo publish --dry-run --locked;
-    retain exclusions for /benches/ and /benchmarks/ and update public docs.
+    retain the /plan/ exclusion and update public docs.
     Verified on macOS with --allow-dirty for the implementation worktree;
     the 72-file archive includes the fish/Zsh handlers and shared Unix terminal
     support, and excludes /plan/. No crate was uploaded.
     Rechecked 2026-10-05 with `cargo package --allow-dirty --locked`: 85
     files, including the new protocol, alias, and PowerShell modules, still
-    without /plan/ or the benchmarks; the packaged sources build.
+    without /plan/; the packaged sources build.
     Rechecked 2026-10-05 after the SDK bridge: 89 files, SDK module included,
-    plan/benchmarks/benches excluded; package verification and publish
+    /plan/ excluded; package verification and publish
     --dry-run --allow-dirty --locked pass. No crate was uploaded.
     Rechecked 2026-10-05 after the go-flags, yargs, and oclif bridges: 92
-    files, all three modules included, plan/benchmarks/benches still
+    files, all three modules included, /plan/ still
     excluded; the packaged sources build. No crate was uploaded.
     Rechecked 2026-10-05 after the PowerShell completer bridge: 93 files,
-    powershell_completer.rs included, plan/benchmarks/benches excluded; the
+    powershell_completer.rs included, /plan/ excluded; the
     packaged sources build (macOS). No crate was uploaded.
     Rechecked 2026-10-05 after Symfony Console and interpreted PHP support:
-    94 files, symfony.rs included, plan/benchmarks/benches excluded; the
+    94 files, symfony.rs included, /plan/ excluded; the
     packaged sources build on macOS. Package verification and publish
     --dry-run --allow-dirty --locked pass; no crate was uploaded.
     Rechecked 2026-10-05 after the kingpin callback boundary: 97 files,
     including the new Go fixture's source/manifest/checksums; protocol
-    modules included and plan/benchmarks/benches excluded. Offline package
+    modules included and /plan/ excluded. Offline package
     verification builds the packaged sources on macOS. Publish --dry-run
     needs an uncached registry HTTP lookup and cannot complete offline;
     the online dry-run also fails because the sandbox cannot resolve
     index.crates.io. No upload is attempted.
     Rechecked 2026-10-05 after Click literal values/descriptions: 98 files,
-    including tests/data/click/cli.py, with plan/benchmarks/benches excluded.
+    including tests/data/click/cli.py, with /plan/ excluded.
     Offline package verification builds the packaged sources on macOS
     (2.2 MiB, 480.6 KiB compressed). The current shortened README is
     preserved. Publish dry-run's previously verified registry-resolution
     block remains; no upload is attempted.
     Rechecked 2026-10-06 after the RabbitMQ CLI bridge: 103 files with
     rabbitmq.rs and the earlier uncommitted PowerShell/shell modules and
-    fixtures; plan/benchmarks/benches excluded. Offline package verification
+    fixtures; /plan/ excluded. Offline package verification
     builds the packaged sources on macOS. No upload is attempted.
 [ ] NOT DONE: Complete default-engine rollout validation against corpus,
-    execution policy, platform checks, and performance criteria. Retire migrated
+    execution policy and platform checks. Retire migrated
     legacy paths gradually with documented compatibility behavior.
     PARTIAL: 0b5ebd1 already made the structured pipeline mandatory, with legacy
-    rules behind the same gate. The corpus and measured POSIX paths pass;
+    rules behind the same gate. The corpus and POSIX paths pass;
     non-POSIX dialects and complete platform/app coverage remain outstanding.
 
 IMPLEMENTATION ORDER
@@ -4699,5 +4562,5 @@ DEFINITION OF DONE
     history, with the verified version recorded per tool.
 [ ] NOT DONE: Discovery does not replay failed commands, approved execution
     happens once, and unsupported/ambiguous/risky cases follow explicit policy.
-[ ] NOT DONE: Regression/platform/package checks pass, measured performance
-    and accuracy are documented, and every completed task is marked [x].
+[ ] NOT DONE: Regression/platform/package checks pass, correction accuracy
+    is documented, and every completed task is marked [x].

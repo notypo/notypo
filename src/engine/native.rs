@@ -3496,6 +3496,38 @@ esac
     }
 
     #[test]
+    fn explicit_provider_endpoints_and_regions_remain_literal_query_context() {
+        let dir = Dir::new("provider-endpoints");
+        let helper = dir.script(
+            "aws_completer",
+            r#"#!/bin/sh
+[ "$HTTPS_PROXY" = http://127.0.0.1:9 ] || exit 8
+[ "$AWS_EC2_METADATA_DISABLED" = true ] || exit 8
+case "$COMP_LINE" in
+  'aws --endpoint-url http://alpha.invalid --region west ec2 ') printf 'describe-alpha\n';;
+  'aws --endpoint-url http://beta.invalid --region east ec2 ') printf 'describe-beta\n';;
+  *) touch "$(dirname "$0")/unexpected-query"; exit 9;;
+esac
+"#,
+        );
+        for (endpoint, region, expected) in [
+            ("http://alpha.invalid", "west", "describe-alpha"),
+            ("http://beta.invalid", "east", "describe-beta"),
+        ] {
+            let backend = Backend::new(Flavor::AwsCompleter, "aws", helper.clone());
+            let words = backend
+                .complete(
+                    &["--endpoint-url", endpoint, "--region", region, "ec2"],
+                    "",
+                    &mut budget(),
+                )
+                .unwrap();
+            assert_eq!(words[0].value, expected);
+        }
+        assert!(!dir.0.join("unexpected-query").exists());
+    }
+
+    #[test]
     fn offline_probes_cannot_reach_hashicorp_servers_tokens_or_token_helpers() {
         use std::ffi::OsStr;
         let socket = Some(OsString::from("unix:///nonexistent/notypo-offline.sock"));

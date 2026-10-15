@@ -1015,6 +1015,30 @@ mod tests {
     }
 
     #[test]
+    fn matching_app_and_manifest_upgrades_expose_new_commands() {
+        let app = app("oclif-upgrade", None);
+        let original = protocol(&app);
+        assert!(!values(&original.complete(&[], "").unwrap()).contains(&"newly-added"));
+        let package_path = app.package.join("package.json");
+        let mut package: Value =
+            serde_json::from_slice(&std::fs::read(&package_path).unwrap()).unwrap();
+        package["version"] = "2.2.0".into();
+        let mut manifest: Value = serde_json::from_str(ROOT_MANIFEST).unwrap();
+        manifest["version"] = "2.2.0".into();
+        manifest["commands"]["newly-added"] =
+            serde_json::json!({"id":"newly-added","flags":{},"args":{}});
+        std::fs::write(package_path, package.to_string()).unwrap();
+        std::fs::write(
+            app.package.join("oclif.manifest.json"),
+            manifest.to_string(),
+        )
+        .unwrap();
+        assert!(original.complete(&[], "").is_err());
+        assert!(values(&protocol(&app).complete(&[], "").unwrap()).contains(&"newly-added"));
+        assert!(!app.package.join("bin/run.ran").exists());
+    }
+
+    #[test]
     fn the_engine_decides_repairs_from_complete_manifests() {
         use crate::engine::{self, FailureContext, Outcome};
         use crate::settings::Settings;

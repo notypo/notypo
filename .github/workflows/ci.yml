@@ -26,6 +26,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Real shell and PowerShell fixtures launch subprocesses with wall-clock
+  # budgets. Bound concurrent fixtures on the small hosted runners.
+  RUST_TEST_THREADS: 2
   BINARY_NAME: notypo
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -172,7 +175,7 @@ jobs:
           copyback: false
           mem: '6144'
           cache-after-prepare: true
-          envs: CARGO_TERM_COLOR RUST_BACKTRACE CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
+          envs: CARGO_TERM_COLOR RUST_BACKTRACE RUST_TEST_THREADS CARGO_INCREMENTAL CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG
           prepare: |
             set -e
             pkg install -y curl ca_root_nss bash zsh fish git

@@ -167,6 +167,40 @@ complete -o filenames -o nospace -o bashdefault -F _node_complete node node_g
         assert!(!arity.contains_key("FORCE_COLOR"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn upgraded_node_option_lists_refresh_on_the_next_request() {
+        use super::super::{Backend, Flavor, NativeCompletionBackend, tests::Dir};
+        let dir = Dir::new("node-upgrade");
+        let source = format!(
+            "#!/bin/sh\ncase \"$1\" in\n--completion-bash) cat <<'NOTYPO_COMPLETION'\n{SCRIPT}NOTYPO_COMPLETION\n;;\n--help) printf 'Options:\\n  --run  Run a task\\n';;\n*) touch \"$(dirname \"$0\")/ran\"; exit 1;;\nesac\n"
+        );
+        let path = dir.script("node", &source);
+        let budget = || {
+            Budget::new(
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(5),
+                8,
+            )
+        };
+        let original = Backend::new(Flavor::Node, "node", path.clone());
+        let identity = original.cache_identity();
+        assert!(
+            original
+                .complete(&[], "-", &mut budget())
+                .unwrap()
+                .iter()
+                .any(|item| item.value == "--run")
+        );
+        std::fs::write(&path, source.replace("--run", "--new-option")).unwrap();
+        let fresh = Backend::new(Flavor::Node, "node", path);
+        assert_ne!(fresh.cache_identity(), identity);
+        let words = fresh.complete(&[], "-", &mut budget()).unwrap();
+        assert!(words.iter().any(|item| item.value == "--new-option"));
+        assert!(!words.iter().any(|item| item.value == "--run"));
+        assert!(!dir.0.join("ran").exists());
+    }
+
     #[test]
     fn installed_node_answers_offline() {
         let Some(node) = crate::utils::which("node") else {

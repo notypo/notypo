@@ -275,6 +275,19 @@ fn run_inner(
     #[cfg(windows)]
     process.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
     let spawned = process.spawn();
+    #[cfg(unix)]
+    let (spawned, timeout) = if completion_terminal
+        && spawned
+            .as_ref()
+            .is_err_and(|error| error.raw_os_error() == Some(libc::EPERM))
+    {
+        // A failed pre-exec session/terminal setup has not run the query.
+        // Retry once with a fresh child id, within the same request budget.
+        let timeout = budget.reserve()?;
+        (process.spawn(), timeout)
+    } else {
+        (spawned, timeout)
+    };
     drop(extra_writer);
     let mut child = spawned.map_err(ProbeError::Spawn)?;
     #[cfg(windows)]

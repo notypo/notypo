@@ -469,7 +469,12 @@ pub fn commands(shell: &Path, budget: &mut Budget) -> Result<Vec<String>, Comple
     if let Ok(snapshot) = std::env::var("NOTYPO_POWERSHELL_NAMES")
         && !snapshot.is_empty()
     {
-        return command_snapshot(&snapshot, budget.max_candidates);
+        // Command names are discovery metadata. Candidate limits apply
+        // after the executable provider ranks this bounded vocabulary.
+        return command_snapshot(&snapshot, 65_536);
+    }
+    if let Some(path) = std::env::var_os("NOTYPO_POWERSHELL_NAMES_FILE") {
+        return command_snapshot_file(Path::new(&path));
     }
     let text = run(shell, &[("NOTYPO_PS_QUERY", "list")], budget)?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
@@ -482,9 +487,6 @@ pub fn commands(shell: &Path, budget: &mut Budget) -> Result<Vec<String>, Comple
             ["command", name] if is_command_name(name) => {
                 if seen.insert(name.to_ascii_lowercase()) {
                     names.push((*name).to_owned());
-                }
-                if names.len() > budget.max_candidates {
-                    return Err(super::over_limit());
                 }
             }
             // Script names (`cd..`) and other odd names aren't offered.
@@ -501,7 +503,7 @@ pub fn commands(shell: &Path, budget: &mut Budget) -> Result<Vec<String>, Comple
 
 fn command_snapshot(text: &str, limit: usize) -> Result<Vec<String>, CompletionError> {
     let invalid = || CompletionError::Failed("invalid PowerShell command-name snapshot".into());
-    if text.len() > 64 * 1024 {
+    if text.len() > 1024 * 1024 {
         return Err(invalid());
     }
     let root: serde_json::Value = serde_json::from_str(text).map_err(|_| invalid())?;
@@ -524,6 +526,18 @@ fn command_snapshot(text: &str, limit: usize) -> Result<Vec<String>, CompletionE
         }
     }
     Ok(names)
+}
+
+fn command_snapshot_file(path: &Path) -> Result<Vec<String>, CompletionError> {
+    use std::io::Read;
+    let failed =
+        |error| CompletionError::Failed(format!("PowerShell command-name snapshot: {error}"));
+    let file = std::fs::File::open(path).map_err(failed)?;
+    let mut text = String::new();
+    file.take(1024 * 1024 + 1)
+        .read_to_string(&mut text)
+        .map_err(failed)?;
+    command_snapshot(&text, 65_536)
 }
 
 /// The trust entries the probe understands: `*`, `module:<Module>` from
@@ -1345,6 +1359,26 @@ pub(crate) mod tests {
         ] {
             assert!(command_snapshot(snapshot, 10).is_err(), "{snapshot}");
         }
+    }
+
+    #[test]
+    fn large_command_name_files_are_bounded_data() {
+        let dir = FixtureDirectory::new();
+        let path = dir.0.join("names.json");
+        let names: Vec<_> = (0..6000)
+            .map(|index| format!("Get-InstalledFixture{index}"))
+            .collect();
+        std::fs::write(
+            &path,
+            serde_json::json!({"version":1,"names":names}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(command_snapshot_file(&path).unwrap().len(), 6000);
+        std::fs::write(&path, " ".repeat(1024 * 1024 + 1)).unwrap();
+        assert!(command_snapshot_file(&path).is_err());
+        std::fs::write(&path, "{\"version\":1,\"names\":[\"bad name\"]}").unwrap();
+        assert!(command_snapshot_file(&path).is_err());
+        assert!(command_snapshot_file(&dir.0.join("missing")).is_err());
     }
 
     struct FixtureDirectory(PathBuf);

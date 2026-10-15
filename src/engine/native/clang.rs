@@ -260,4 +260,17 @@ esac
             assert!(!is_candidate(name), "{name}");
         }
     }
+
+    #[test]
+    fn upgraded_drivers_supply_new_options_without_compiling() {
+        let dir = Dir::new("clang-upgrade");
+        let clang = dir.script("clang", CLANG);
+        let old = complete(&clang, &[], "-", Vec::new(), &mut budget()).unwrap();
+        assert!(old.iter().any(|item| item.value == "-Wextra"));
+        std::fs::write(&clang, CLANG.replace("-Wextra", "-Wnew-option")).unwrap();
+        let fresh = complete(&clang, &[], "-", Vec::new(), &mut budget()).unwrap();
+        assert!(fresh.iter().any(|item| item.value == "-Wnew-option"));
+        assert!(!fresh.iter().any(|item| item.value == "-Wextra"));
+        assert!(!dir.0.join("compiled").exists());
+    }
 }

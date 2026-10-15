@@ -706,6 +706,8 @@ impl Shell {
                  $notypo_event = Get-History -Count 1;\n    \
                  $history = $notypo_event.CommandLine;\n    \
                  if (-not [string]::IsNullOrWhiteSpace($history)) {{\n        \
+                 $notypo_names_file = $null;\n        \
+                 try {{\n        \
                  $env:NOTYPO_POWERSHELL_LOCATION = [string]$ExecutionContext.SessionState.Path.CurrentLocation;\n        \
                  {POWERSHELL_DRIVES}\n        \
                  {POWERSHELL_NAMES}\n        \
@@ -733,7 +735,10 @@ impl Shell {
                  $notypo_report = $false;\n        \
                  foreach ($notypo_argument in $args) {{ if ($notypo_argument -eq '--') {{ break }}; if ($notypo_argument -in @('--json', '--explain')) {{ $notypo_report = $true }} }};\n        \
                  $fuck = $(& {exe} $args);\n        \
-                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_POWERSHELL_COMPLETIONS, Env:NOTYPO_POWERSHELL_PARAMETERS, Env:NOTYPO_POWERSHELL_WRAPPERS, Env:NOTYPO_POWERSHELL_LOCATION, Env:NOTYPO_POWERSHELL_DRIVES, Env:NOTYPO_POWERSHELL_NAMES, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
+                 }} finally {{\n        \
+                 if ($notypo_names_file -and [IO.File]::Exists($notypo_names_file)) {{ [IO.File]::Delete($notypo_names_file) }};\n        \
+                 Remove-Item Env:NOTYPO_EXIT_STATUS, Env:NOTYPO_POWERSHELL_ERRORS, Env:NOTYPO_POWERSHELL_COMMANDS, Env:NOTYPO_POWERSHELL_COMPLETIONS, Env:NOTYPO_POWERSHELL_PARAMETERS, Env:NOTYPO_POWERSHELL_WRAPPERS, Env:NOTYPO_POWERSHELL_LOCATION, Env:NOTYPO_POWERSHELL_DRIVES, Env:NOTYPO_POWERSHELL_NAMES, Env:NOTYPO_POWERSHELL_NAMES_FILE, Env:NOTYPO_CURRENT_COMMAND -ErrorAction Ignore;\n        \
+                 }}\n        \
                  if ($notypo_report) {{ $fuck }} elseif (-not [string]::IsNullOrWhiteSpace($fuck)) {{\n            \
                  Microsoft.PowerShell.Utility\\Invoke-Expression -Command $fuck;\n        }}\n    }}\n    [Console]::ResetColor() \n}}\n"
             ),
