@@ -145,6 +145,12 @@ New app installations are recorded in plan/app.txt with cleanup locations.
     completion scope/dispatch compatibility. The native fallback invokes only
     the captured callback with the installed parser's AST and cursor; it does
     not replay the application's operation or module initialization.
+    Final classic-shell correction: dynamic function parameter names use the
+    installed static binder and Get-Command metadata when the old completion
+    path omits them. Each proposed dynamic name is checked with the entire
+    original literal argument list. A real-shell fixture covers context on
+    both sides, quoted dash data, Unicode cursor ranges, invalid/opaque
+    context, and an untouched operation marker. No command catalog is added.
     Current release work: hosted CI verification, package validation and the
     final publication audit. All other unchecked features and inventories
     are deferred by the owner (2026-10-15).

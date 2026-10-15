@@ -29,6 +29,9 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+#[cfg(test)]
+const CLASSIC_OPTIONS: &str = include_str!("powershell_options.ps1");
+
 /// Passed with `-Command`, so it holds no double quotes: Windows argument
 /// quoting can't then change it. Output is one tab-separated record per
 /// line; a record with a control character in any field is left out.
@@ -97,6 +100,9 @@ if (-not ($shipped -or $trusted -contains '*' -or $trusted -contains ('module:' 
 }
 $lookup = @{ Name = $command.Name; CommandType = $command.CommandType }
 if ($command.Module) { $lookup.Module = $module }
+"#,
+    include_str!("powershell_options.ps1"),
+    r#"
 if ($env:NOTYPO_PS_QUERY -eq 'options') {
     # Classic completion resolves function names in the runspace's global
     # scope. Publish only this trusted restored definition inside the probe.
@@ -105,9 +111,20 @@ if ($env:NOTYPO_PS_QUERY -eq 'options') {
     }
     $null = Microsoft.PowerShell.Core\Get-Command @lookup
     $result = [System.Management.Automation.CommandCompletion]::CompleteInput($env:NOTYPO_PS_LINE, [int]$env:NOTYPO_PS_CURSOR, $null)
+    $matches = @($result.CompletionMatches)
+    $start = $result.ReplacementIndex
+    $length = $result.ReplacementLength
+    if ($PSVersionTable.PSVersion.Major -lt 6 -and $command -is [System.Management.Automation.FunctionInfo]) {
+        $extra = __notypo_classic_options $command $lookup $env:NOTYPO_PS_LINE ([int]$env:NOTYPO_PS_CURSOR)
+        if ($extra) {
+            $matches += $extra.matches
+            $start = $extra.start
+            $length = $extra.length
+        }
+    }
     __notypo_emit 'answered'
-    __notypo_emit 'range', ([string]$result.ReplacementIndex), ([string]$result.ReplacementLength)
-    foreach ($match in $result.CompletionMatches) {
+    __notypo_emit 'range', ([string]$start), ([string]$length)
+    foreach ($match in $matches) {
         if ([string]$match.ResultType -eq 'ParameterName') {
             __notypo_emit 'match', $match.CompletionText, 'ParameterName', ([string]$match.ToolTip -replace '[\x00-\x1f\x7f]', ' ')
         }
@@ -1549,6 +1566,59 @@ pub(crate) mod tests {
         assert_eq!(scope.value, "-Flavor");
         assert_eq!(scope.takes_value, Some(true));
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn classic_dynamic_options_validate_the_full_literal_command_without_running_it() {
+        let Some(shell) = pwsh() else { return };
+        let dir = FixtureDirectory::new();
+        let marker = dir.0.join("operation");
+        let definitions = r#"function Get-ClassicFixture {
+ [CmdletBinding()] param([string]$Scope, [string]$Note)
+ dynamicparam {
+  $set = [System.Management.Automation.RuntimeDefinedParameterDictionary]::new()
+  if ($Scope -in @('west','-west')) {
+   $attributes = [System.Collections.ObjectModel.Collection[System.Attribute]]::new()
+   $attributes.Add([System.Management.Automation.ParameterAttribute]::new())
+   $set.Add('Flavor', [System.Management.Automation.RuntimeDefinedParameter]::new('Flavor',[string],$attributes))
+  }
+  $set
+ }
+ process { [IO.File]::WriteAllText('OPERATION_MARKER','ran') }
+}"#
+        .replace("OPERATION_MARKER", &marker.to_string_lossy().replace('\'', "''"));
+        let lines = [
+            "Get-ClassicFixture - one -Scope west",
+            "Get-ClassicFixture '-west' - two",
+            "Get-ClassicFixture - one -Scope east",
+            "Get-ClassicFixture - one -Scope west -Unbound x",
+            "Get-ClassicFixture - one -Scope $team",
+            "Get-ClassicFixture -Note '🦀' - one -Scope west",
+        ];
+        let script = dir.0.join("classic.ps1");
+        std::fs::write(&script, format!(
+            "{definitions}\n{CLASSIC_OPTIONS}\n$ErrorActionPreference = 'Stop'\n$command = Get-Command Get-ClassicFixture\n$lookup = @{{ Name = 'Get-ClassicFixture'; CommandType = 'Function' }}\nforeach ($line in $env:NOTYPO_TEST_LINES -split [char]10) {{ $cursor = $line.IndexOf(' - ') + 2; $extra = __notypo_classic_options $command $lookup $line $cursor; if ($extra -and ($extra.start -ne $cursor - 1 -or $extra.length -ne 1)) {{ throw 'wrong target range' }}; [Console]::Out.WriteLine((@($extra.matches | ForEach-Object CompletionText) -join ',')) }}"
+        )).unwrap();
+        let mut env = environment(&[]);
+        env.push(("NOTYPO_TEST_LINES".into(), Some(lines.join("\n").into())));
+        let answer = run_stdout(
+            &shell,
+            vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-File".into(),
+                script.into_os_string(),
+            ],
+            env,
+            &mut budget(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            answer.lines().collect::<Vec<_>>(),
+            ["-Flavor", "-Flavor", "", "", "", "-Flavor"]
+        );
+        assert!(!marker.exists(), "metadata discovery ran the command body");
     }
 
     #[test]
