@@ -3432,8 +3432,11 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
         let report = correct(&f, &ctx);
         assert!(
             matches!(report.outcome, Outcome::Ambiguous(_)),
-            "{:?}",
-            report.outcome
+            "{:?} notes={:?} probes={} man={:?}",
+            report.outcome,
+            report.notes,
+            report.probes,
+            ctx.which("man")
         );
         assert_eq!(scripts(&report.outcome)[0], "ls --color=auto -a");
         assert!(

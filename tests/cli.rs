@@ -2009,7 +2009,9 @@ fn powershell_wrapper_functions_use_their_commands_vocabulary_and_safety_policy(
     let mut child = workspace
         .program(&pwsh, "")
         .env("PATH", system_path(&bin))
+        .env("NOTYPO_TRUSTED_COMPLETERS", "")
         .env("NOTYPO_TRUSTED_HELP", "")
+        .env("NOTYPO_TRUSTED_WORKSPACES", "")
         .env("NOTYPO_DISABLED_SOURCES", "history:legacy")
         .args(["-NoProfile", "-NoLogo", "-Command", "-"])
         .stdin(Stdio::piped())
