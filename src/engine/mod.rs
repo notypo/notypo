@@ -3424,15 +3424,16 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
         let fake = fake_aws();
         let man = fake.dir.script(
             "bin/man",
-            "#!/bin/sh\ncase \"$1\" in ls|*/ls.1|*/ls.1.gz) ;; *) exit 1;; esac\nprintf 'LS(1)\\n     -\\b-a\\ba      all\\n     -\\b--\\b-c\\bco\\bol\\blo\\bor\\br[=when]   colorize\\n'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"$(dirname \"$0\")/man-calls\"\ncase \"$1\" in ls|*/ls.1|*/ls.1.gz) ;; *) exit 1;; esac\nprintf 'LS(1)\\n     -\\b-a\\ba      all\\n     -\\b--\\b-c\\bco\\bol\\blo\\bor\\br[=when]   colorize\\n'\n",
         );
         let ctx = context(&fake).with_which("man", Some(man.to_str().unwrap()));
         let mut f = failure("ls --colro=auto -a");
         f.exit_status = Some(2);
         let report = correct(&f, &ctx);
+        let man_calls = fs::read_to_string(fake.dir.0.join("bin/man-calls")).unwrap_or_default();
         assert!(
             matches!(report.outcome, Outcome::Ambiguous(_)),
-            "{:?} notes={:?} probes={} man={:?}",
+            "{:?} notes={:?} probes={} man={:?} calls={man_calls:?}",
             report.outcome,
             report.notes,
             report.probes,
