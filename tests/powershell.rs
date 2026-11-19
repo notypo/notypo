@@ -61,6 +61,8 @@ fn run(shell: &Path, dir: &Path, input: &str) -> (Vec<u8>, Vec<u8>) {
         // Production defaults and the separate timeout fixtures stay bounded.
         .env("NOTYPO_PROBE_TIMEOUT", "15")
         .env("NOTYPO_TRUSTED_COMPLETERS", r#"["Get-CoreFixture"]"#)
+        .env("NOTYPO_TRUSTED_HELP", "")
+        .env("NOTYPO_TRUSTED_WORKSPACES", "")
         .env("NOTYPO_DISABLED_SOURCES", "history:legacy:help:man")
         .env_remove("TF_HISTORY")
         .env_remove("NOTYPO_CURRENT_COMMAND")
