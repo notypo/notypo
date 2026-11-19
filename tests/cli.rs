@@ -2620,6 +2620,7 @@ complete -c fishcli -n '__fish_seen_subcommand_from list' -l format -x -a "'alph
                 ),
             )
             .env("NOTYPO_TRUSTED_COMPLETERS", "fishcli")
+            .env("NOTYPO_TRUSTED_HELP", "")
             .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy");
         command
     };
@@ -2744,6 +2745,7 @@ esac
                 ),
             )
             .env("NOTYPO_TRUSTED_COMPLETERS", "zshcli")
+            .env("NOTYPO_TRUSTED_HELP", "")
             .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy");
         command
     };

@@ -3156,7 +3156,17 @@ ec2 *-instances* --output|json\nec2 *-instances* --output|table\nec2 *-instances
     }
 
     fn context(fake: &Fake) -> Context {
-        context_with(fake, Settings::default())
+        // Tests opt into trust explicitly, so the default-everything policy
+        // does not make a fixture's app run behind a test's back.
+        context_with(
+            fake,
+            Settings {
+                trusted_completers: Vec::new(),
+                trusted_help: Vec::new(),
+                trusted_workspaces: Vec::new(),
+                ..Settings::default()
+            },
+        )
     }
 
     fn context_with(fake: &Fake, settings: Settings) -> Context {
@@ -3839,6 +3849,8 @@ esac
         fs::write(fake.dir.0.join("docs/reports.txt"), "unrelated local file").unwrap();
         let settings = Settings {
             trusted_completers: vec!["tar".into()],
+            trusted_help: Vec::new(),
+            trusted_workspaces: Vec::new(),
             disabled_sources: vec!["help".into(), "man".into(), "history".into()],
             ..Settings::default()
         };
@@ -4288,11 +4300,18 @@ esac
         let helper = fake.dir.script("_tool.bash", "_tool() { [ -f completion-context ] && COMPREPLY=(build deploy); }\ncomplete -F _tool tool\n");
         let backend =
             native::Backend::new(native::Flavor::BashFunction, "tool", bash).with_helper(helper);
-        let ctx = Context::new(Settings::default(), Shell::Bash, "typo".into())
-            .with_which("tool", Some(app.to_str().unwrap()))
-            .with_which("man", None)
-            .with_aliases(&[])
-            .with_history::<&str>(&[]);
+        let ctx = Context::new(
+            Settings {
+                trusted_help: Vec::new(),
+                ..Settings::default()
+            },
+            Shell::Bash,
+            "typo".into(),
+        )
+        .with_which("tool", Some(app.to_str().unwrap()))
+        .with_which("man", None)
+        .with_aliases(&[])
+        .with_history::<&str>(&[]);
         let mut failed = failure("tool biuld");
         failed.cwd = Some(cwd.clone());
         let parent = std::env::current_dir().unwrap();
@@ -4332,6 +4351,9 @@ esac
         let fake = fake_aws();
         let tool = fake.dir.script("bin/tool", NESTED_HELP);
         let settings = Settings {
+            // Keep native discovery out, so the help queries below are the
+            // only probes the fixture records.
+            trusted_completers: Vec::new(),
             trusted_help: vec!["tool".into()],
             ..Settings::default()
         };
@@ -5137,10 +5159,17 @@ esac
                     .with_helper(script.clone())
                     .with_application(app.clone())
             };
-            let ctx = Context::new(Settings::default(), shell, "fuck".into())
-                .with_which("app", Some(app.to_str().unwrap()))
-                .with_which("man", None)
-                .with_history::<&str>(&[]);
+            let ctx = Context::new(
+                Settings {
+                    trusted_help: Vec::new(),
+                    ..Settings::default()
+                },
+                shell,
+                "fuck".into(),
+            )
+            .with_which("app", Some(app.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
             let run = |source: &str| {
                 correct_with_backends(
                     &failure(source),
@@ -5471,6 +5500,7 @@ esac
         let fake = fake_aws();
         let settings = Settings {
             disabled_sources: vec!["native".into()],
+            trusted_help: Vec::new(),
             ..Settings::default()
         };
         let ctx = Context::new(settings, Shell::Bash, "fuck".into())

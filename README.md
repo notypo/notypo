@@ -42,7 +42,7 @@ For fish, use `notypo --alias | source`. For PowerShell, use ``Invoke-Expression
 | `git status --shrot -- 'src/**/*.rs' \| head -n 5` | `git status --short -- 'src/**/*.rs' \| head -n 5` |
 | `if test -d .git; then git status --shrot; fi` | `if test -d .git; then git status --short; fi` |
 
-Tools must be installed. Cargo examples need `cargo` in `trusted_completers` and `trusted_help`; package names also need this repository in `trusted_workspaces`.
+Tools must be installed. Every app and workspace is trusted by default, so the examples above work with no configuration.
 
 Inspect a command directly:
 
@@ -54,7 +54,7 @@ notypo --json 'git sttus'      # get a JSON report
 
 Direct calls print results; the shell functions run your selected correction after confirmation.
 
-Settings: `~/.config/thefuck/settings.py`. Generic and shell completers require `trusted_completers`; help probes require `trusted_help`. Only trust tools you would run yourself. More options: `notypo --help`.
+Settings: `~/.config/thefuck/settings.py`. All apps and workspaces are trusted by default, so no configuration is needed. To opt out, set `trusted_completers`, `trusted_help`, or `trusted_workspaces` to `[]`; generic completion, help probes, or project evaluation then require explicit entries again. More options: `notypo --help`.
 
 ## License
 

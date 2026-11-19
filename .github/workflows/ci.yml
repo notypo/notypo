@@ -287,6 +287,12 @@ jobs:
       - name: Build binary
         if: matrix.mode != 'freebsd-vm'
         run: cargo build --locked --release --target ${{ matrix.target }} --bin ${{ env.BINARY_NAME }}
+      - name: Smoke test release binary
+        if: matrix.mode == 'native' && matrix.target != 'aarch64-pc-windows-msvc'
+        shell: bash
+        env:
+          BINARY_PATH: target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: '"$BINARY_PATH" --version'
       - name: Build binary in FreeBSD VM
         if: matrix.mode == 'freebsd-vm'
         uses: vmactions/freebsd-vm@v1
@@ -309,6 +315,7 @@ jobs:
             . "$HOME/.cargo/env"
             rustc -vV
             cargo build --locked --release --target ${{ matrix.target }} --bin "$BINARY_NAME"
+            "./target/${{ matrix.target }}/release/$BINARY_NAME" --version
       - name: Package artifact
         shell: bash
         env:
@@ -322,6 +329,23 @@ jobs:
             tar -czf "dist/$ASSET_NAME" \
               -C "$BINARY_DIR" "$BINARY_NAME" \
               -C "$GITHUB_WORKSPACE" README.md LICENSE-MIT LICENSE-APACHE NOTICE
+          fi
+      - name: Verify packaged artifact
+        shell: bash
+        env:
+          ASSET_NAME: ${{ env.BINARY_NAME }}-${{ matrix.os-arch }}${{ matrix.asset_ext }}
+        run: |
+          set -e
+          if [ "$RUNNER_OS" = Windows ]; then
+            test -s "dist/$ASSET_NAME"
+          else
+            tar -tzf "dist/$ASSET_NAME" > artifact-contents.txt
+            for entry in "$BINARY_NAME" README.md LICENSE-MIT LICENSE-APACHE NOTICE; do
+              if ! grep -Fxq "$entry" artifact-contents.txt; then
+                echo "::error::$ASSET_NAME is missing $entry"
+                exit 1
+              fi
+            done
           fi
       - name: Upload artifact for release
         uses: actions/upload-artifact@v4

@@ -553,10 +553,19 @@ exit 0
         let dir = Dir::new("go-flags-engine");
         let backend = backend(&dir, &[MODULE]);
         let path = backend.completer.clone();
-        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
-            .with_which("fixture", Some(path.to_str().unwrap()))
-            .with_which("man", None)
-            .with_history::<&str>(&[]);
+        let ctx = Context::new(
+            Settings {
+                trusted_completers: Vec::new(),
+                trusted_help: Vec::new(),
+                trusted_workspaces: Vec::new(),
+                ..Settings::default()
+            },
+            Shell::Bash,
+            "fuck".into(),
+        )
+        .with_which("fixture", Some(path.to_str().unwrap()))
+        .with_which("man", None)
+        .with_history::<&str>(&[]);
         let first = |source: &str| {
             let backend: std::rc::Rc<dyn NativeCompletionBackend> =
                 std::rc::Rc::new(backend.clone());
