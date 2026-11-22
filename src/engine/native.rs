@@ -3284,6 +3284,15 @@ impl Backend {
                 .borrow_mut()
                 .insert(words.iter().map(|word| word.to_string()).collect());
         }
+        // ShellCompDirectiveFilterFileExt (bit 8) and
+        // ShellCompDirectiveFilterDirs (bit 16) make the answer words file
+        // filters. They are not values: `kubectl apply -f x.yaml` must keep
+        // its path instead of becoming `-f yaml`.
+        if directive & (8 | 16) != 0 {
+            return Err(CompletionError::Unsupported(
+                "the app filters files or directories here, not finite values".into(),
+            ));
+        }
         normalize_bounded(lines.into_iter(), Flavor::Cobra, budget.max_candidates)
     }
 }
@@ -4003,7 +4012,7 @@ esac
         let dir = Dir::new("go-protocols");
         let cobra = dir.script(
             "bin/app",
-            "#!/bin/sh\n[ \"$KUBECONFIG\" = /dev/null ] || exit 7\n[ \"$1\" = __complete ] || { touch \"$(dirname \"$0\")/ran\"; exit 1; }\nshift\ncase \"$*\" in\n  \"\") printf 'get\\tDisplay one or many\\ncreate\\tCreate \\033]0;title\\007it\\n:4\\n';;\n  \"get -\") printf -- '--namespace\\tns\\n-n\\tns\\n--watch\\twatch\\n:4\\n';;\n  \"get pods \") printf ':1\\n';;\n  *) printf 'garbage\\n';;\nesac\n",
+            "#!/bin/sh\n[ \"$KUBECONFIG\" = /dev/null ] || exit 7\n[ \"$1\" = __complete ] || { touch \"$(dirname \"$0\")/ran\"; exit 1; }\nshift\ncase \"$*\" in\n  \"\") printf 'get\\tDisplay one or many\\ncreate\\tCreate \\033]0;title\\007it\\n:4\\n';;\n  \"get -\") printf -- '--namespace\\tns\\n-n\\tns\\n--watch\\twatch\\n:4\\n';;\n  \"get pods \") printf ':1\\n';;\n  \"apply -f \") printf 'json\\nyaml\\n:8\\n';;\n  *) printf 'garbage\\n';;\nesac\n",
         );
         let backend = Backend::new(Flavor::Cobra, "app", cobra);
         let mut budget = budget();
@@ -4040,6 +4049,13 @@ esac
                 Err(CompletionError::Unsupported(_))
             ),
             "the error directive marks a position the app can't complete"
+        );
+        assert!(
+            matches!(
+                backend.complete(&["apply", "-f"], "", &mut budget),
+                Err(CompletionError::Unsupported(why)) if why.contains("files or directories")
+            ),
+            "file-extension filters are paths, not option values"
         );
         assert!(!dir.0.join("bin/ran").exists());
 
