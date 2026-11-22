@@ -549,6 +549,9 @@ impl Shell {
                     ""
                 }
             ),
+            // No `exit` inside `$(...)`: an explicit exit runs zsh's
+            // zshexit hooks in the subshell, and macOS Terminal's hook then
+            // saves the session and truncates history on every invocation.
             Shell::Zsh => format!(
                 "
             {name} () {{
@@ -574,9 +577,10 @@ impl Shell {
                         notypo_names+=( $notypo_f )
                         [[ -n $notypo_src ]] && notypo_names+=( ${{(k)functions_source[(R)${{(b)notypo_src}}]}} )
                     done
-                    [[ -n $notypo_specs ]] || exit 0
-                    notypo_text=\"$notypo_specs#notypo-functions\"$'\\n'\"$(functions -- ${{(u)notypo_names}})\"
-                    (( ${{#notypo_text}} <= 65536 )) && print -rn -- \"$notypo_text\"
+                    if [[ -n $notypo_specs ]]; then
+                        notypo_text=\"$notypo_specs#notypo-functions\"$'\\n'\"$(functions -- ${{(u)notypo_names}})\"
+                        (( ${{#notypo_text}} <= 65536 )) && print -rn -- \"$notypo_text\"
+                    fi
                 )\";
                 local -x NOTYPO_CURRENT_COMMAND=\"${{history[$HISTCMD]-}}\";
                 export TF_SHELL=zsh;

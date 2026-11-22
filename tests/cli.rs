@@ -416,6 +416,53 @@ fn zsh_alias_corrects_command_from_current_multiline_history_event() {
     }
 }
 
+#[test]
+fn zsh_alias_does_not_save_the_session_from_completion_capture() {
+    let Some(zsh) = notypo::utils::which("zsh") else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let output = finish(
+        workspace
+            .command("git_not_command")
+            .env("TF_SHELL", "zsh")
+            .arg("--alias")
+            .spawn()
+            .unwrap(),
+    );
+    assert!(output.status.success());
+    let alias = String::from_utf8(output.stdout).unwrap();
+    let marker = workspace.0.join("zshexit");
+    // An explicit `exit` inside `$(...)` runs zshexit in that subshell. On
+    // macOS Terminal the hook saves the session and truncates history, so
+    // the alias must leave the completion capture without exiting.
+    let script = format!(
+        "zshexit() {{ print -r -- $ZSH_SUBSHELL >> {} }}\n\
+         {alias}\
+         print -s -- 'not-a-command-xyz'\n\
+         t --json\n",
+        notypo::shlex::quote(&marker.to_string_lossy()),
+    );
+    let output = finish(
+        workspace
+            .program(&zsh, "git_not_command")
+            .env("TF_SHELL", "zsh")
+            .args(["-f", "-i", "-c", &script])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exits = fs::read_to_string(&marker).unwrap();
+    assert_eq!(
+        exits, "0\n",
+        "the alias saved the session from a subshell: {exits}"
+    );
+}
+
 /// A fake `aws` whose `aws_completer` answers from a small command tree.
 /// Running `aws` itself would leave a `ran` marker.
 fn fake_aws(workspace: &Workspace) -> PathBuf {
