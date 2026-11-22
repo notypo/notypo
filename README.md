@@ -19,7 +19,8 @@ A Rust port of [thefuck](https://github.com/nvbn/thefuck) that goes further: nat
 Homebrew (macOS and Linux):
 
 ```sh
-brew install notypo/notypo/notypo
+brew tap notypo/notypo
+brew install notypo
 ```
 
 Prebuilt binaries for macOS, Linux, Windows, and FreeBSD are on [Releases](https://github.com/notypo/notypo/releases). From source (Rust 1.98+):
