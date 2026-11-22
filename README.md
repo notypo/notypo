@@ -1,6 +1,6 @@
 # notypo
 
-**Mistype a command? Type `typo`.**
+**Mistype a command? Type `typo` or `t` or old school `fuck`
 
 A Rust port of [thefuck](https://github.com/nvbn/thefuck) that goes further: native completions, precise edits inside complex shell commands, and safer execution. Runs on macOS, Linux, Windows, and FreeBSD.
 
@@ -43,8 +43,6 @@ For fish, use `notypo --alias | source`. For PowerShell, use ``Invoke-Expression
 | `cargo build -p notyop --release` | `cargo build -p notypo --release` (in this repo) |
 | `git status --shrot -- 'src/**/*.rs' \| head -n 5` | `git status --short -- 'src/**/*.rs' \| head -n 5` |
 | `if test -d .git; then git status --shrot; fi` | `if test -d .git; then git status --short; fi` |
-
-Tools must be installed. Every app and workspace is trusted by default, so the examples above work with no configuration.
 
 Inspect a command directly:
 
