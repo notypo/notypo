@@ -62,6 +62,50 @@ pub fn strip_formatting(text: &str) -> String {
     out
 }
 
+/// Option names inside `[...]`/`{...}` groups, as usage lines and some man
+/// pages print them: `[--prefix|--exec-prefix]`, `[-o output]`, `{-h --help}`.
+/// Only the names are taken here; a real declaration elsewhere supplies the
+/// arity, so an optional synopsis value does not make an option valued.
+fn group_options(line: &str) -> Vec<&str> {
+    let option = regex!(r"(?:^|[\s\[\{,|=])(-{1,2}[A-Za-z][A-Za-z0-9_.:@%-]*)");
+    let mut names = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, c) in line.char_indices() {
+        match c {
+            '[' | '{' => {
+                if depth == 0 {
+                    start = index + c.len_utf8();
+                }
+                depth += 1;
+            }
+            ']' | '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let group = &line[start..index];
+                    // `{fast,--other,slow}` is an enum value list, not an
+                    // option group; option aliases put a dash in every
+                    // comma-separated part.
+                    if group.contains(',')
+                        && group
+                            .split(',')
+                            .any(|part| !part.trim_start().starts_with('-'))
+                    {
+                        continue;
+                    }
+                    names.extend(
+                        option
+                            .captures_iter(group)
+                            .map(|caps| caps.get(1).unwrap().as_str()),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
 /// Options documented in `text`. A line starting with options defines them:
 /// an option followed only by spacing takes no value, one followed by a
 /// placeholder takes one, and so does one whose description carries yargs's
@@ -70,6 +114,8 @@ pub fn strip_formatting(text: &str) -> String {
 pub fn options(text: &str) -> Vec<CompletionItem> {
     // The type, then only other tags (`[required]`, `[choices: ...]`).
     let yargs_value = regex!(r"\[(?:string|number|array)\](?:\s+\[[^\[\]]*\])*\s*$");
+    let error_line =
+        regex!(r"(?i)\b(?:unrecognized|unknown|invalid|illegal|bad) (?:option|flag)\b");
     // The options of the declaration being read, its indent, and those
     // yargs types as taking a value.
     let mut block: Vec<String> = Vec::new();
@@ -113,6 +159,9 @@ pub fn options(text: &str) -> Vec<CompletionItem> {
         }
     };
     for line in text.lines() {
+        for name in group_options(line) {
+            add(name, None);
+        }
         if let Some(head) = option_declaration(line) {
             // `-l, --long=VALUE   Description` or `-D format`.
             let declarations: Vec<(String, bool)> = aliases(head)
@@ -147,9 +196,11 @@ pub fn options(text: &str) -> Vec<CompletionItem> {
         if yargs_value.is_match(line) {
             typed.extend(block.iter().cloned());
         }
-        for word in line.split(|c: char| c.is_whitespace() || "[]()'\"`".contains(c)) {
-            if word.starts_with("--") {
-                add(word.split('=').next().unwrap_or(word), None);
+        if !error_line.is_match(line) {
+            for word in line.split(|c: char| c.is_whitespace() || "[]()'\"`".contains(c)) {
+                if word.starts_with("--") {
+                    add(word.split('=').next().unwrap_or(word), None);
+                }
             }
         }
     }
@@ -668,6 +719,31 @@ mod tests {
             "an optional value is attached"
         );
         assert_eq!(items[2].takes_value, Some(true));
+    }
+
+    #[test]
+    fn usage_groups_and_braces_supply_option_names() {
+        let text = "Usage: python3-config [--prefix|--exec-prefix|--includes|--extension-suffix]\nOptions:\n  {-h --help}\n  {-o output}\n  { --json }\n  -o FILE  Write output\n";
+        let items = options(text);
+        let names = names(&items);
+        for name in [
+            "--prefix",
+            "--exec-prefix",
+            "--includes",
+            "--extension-suffix",
+            "-h",
+            "--help",
+            "-o",
+            "--json",
+        ] {
+            assert!(names.contains(&name), "{name}: {names:?}");
+        }
+        assert!(!names.contains(&"python3-config"));
+        let output = items.iter().find(|item| item.value == "-o").unwrap();
+        assert_eq!(output.takes_value, Some(true));
+        // A synopsis value does not make an otherwise undeclared option valued.
+        let json = items.iter().find(|item| item.value == "--json").unwrap();
+        assert_eq!(json.takes_value, None);
     }
 
     #[test]
