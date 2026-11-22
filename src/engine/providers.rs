@@ -1432,25 +1432,70 @@ fn multicall_dispatcher(program: &str) -> bool {
 fn usage_document(data: &[u8], program: &str, path: &Path) -> bool {
     let text = super::docs::strip_formatting(&String::from_utf8_lossy(data));
     let error = regex!(r"(?i)\b(?:error|unknown|invalid|unrecognized|illegal)\b");
+    let usage = regex!(r"(?i)^\s*usage\s*:\s*(.*)$");
     let base = |name: &str| name.rsplit(['/', '\\']).next().map(str::to_owned);
-    for line in text.lines().filter(|line| !line.trim().is_empty()).take(40) {
-        let named = line
-            .trim_start()
-            .strip_prefix("Usage:")
-            .or_else(|| line.trim_start().strip_prefix("usage:"))
-            .map(|rest| rest.split_whitespace().next());
-        // httpd names itself by the path it was run as.
-        if let Some(named) = named {
-            return named.and_then(base).is_some_and(|named| {
-                Some(&named) == base(program).as_ref()
-                    || path.file_name().and_then(|name| name.to_str()) == Some(named.as_str())
-            });
+    let names = |named: Option<&str>| {
+        let Some(named) = named.and_then(base) else {
+            return false;
+        };
+        let program = base(program);
+        program.as_deref().is_some_and(|program| {
+            named == program
+                // Scripts often print bq.py for the bq entry point, or
+                // pod2text5.34 for the versioned pod2text entry point.
+                || named
+                    .strip_prefix(program)
+                    .is_some_and(|rest| rest.starts_with('.'))
+                || program.strip_prefix(&named).is_some_and(|rest| {
+                    rest.starts_with('.') || rest.starts_with(|c: char| c.is_ascii_digit())
+                })
+        }) || path.file_name().and_then(|name| name.to_str()) == Some(named.as_str())
+    };
+    let options_heading = regex!(r"(?i)^\s*(?:options?|flags?)\s*(?:\([^)]*\))?\s*:\s*$");
+    let help_option = regex!(r"(?:^|[\s,])-h\b|--help\b");
+    let mut first = true;
+    let mut named_first = false;
+    let mut options = false;
+    let mut help = false;
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty()).take(60);
+    while let Some(line) = lines.next() {
+        if first {
+            first = false;
+            named_first = names(line.split_whitespace().next());
+        }
+        if let Some(caps) = usage.captures(line) {
+            let rest = caps[1].trim();
+            if let Some(named) = rest.split_whitespace().next() {
+                if names(Some(named)) {
+                    return true;
+                }
+                continue;
+            }
+            // afinfo prints "Usage:" and names itself on the next line.
+            if let Some(named) = lines.next().and_then(|line| line.split_whitespace().next())
+                && names(Some(named))
+            {
+                return true;
+            }
+            continue;
         }
         if error.is_match(line) {
+            // Some tools report the help flag itself as unrecognized and
+            // print their usage below it (ibv_devinfo).
+            if line.contains("--help") {
+                continue;
+            }
             return false;
         }
+        if options_heading.is_match(line) {
+            options = true;
+        } else if options && help_option.is_match(line) {
+            help = true;
+        }
     }
-    false
+    // xcdebug exits 1 after a prose description and an Options section
+    // instead of printing a usage line.
+    named_first && options && help
 }
 
 impl CandidateProvider for HelpText<'_> {
@@ -1841,6 +1886,51 @@ mod help_tests {
     use std::time::Duration;
 
     #[test]
+    fn usage_documents_accept_case_next_line_and_script_names() {
+        let doc = |text: &str, program: &str| {
+            usage_document(
+                text.as_bytes(),
+                program,
+                Path::new("/opt/bin").join(program).as_path(),
+            )
+        };
+        // snmptable and bq print uppercase USAGE and exit 1.
+        assert!(doc(
+            "USAGE: snmptable [OPTIONS] AGENT TABLE-OID\n",
+            "snmptable"
+        ));
+        assert!(doc(
+            "Python script.\n\nUSAGE: bq.py [--global_flags] <command>\n",
+            "bq"
+        ));
+        // afinfo prints the program name on the line after Usage:.
+        assert!(doc(
+            "Audio File Info\n\nUsage:\nafinfo [option...] audio_file(s)\n",
+            "afinfo"
+        ));
+        // Versioned scripts name themselves without the suffix.
+        assert!(doc(
+            "Usage:\n    pod2text [-aclostu] [--code] [input]\n",
+            "pod2text5.34"
+        ));
+        // ibv_devinfo rejects the help flag itself, then prints usage.
+        assert!(doc(
+            "ibv_devinfo: unrecognized option `--help'\nUsage: ibv_devinfo\n\nOptions:\n  -l, --list\n",
+            "ibv_devinfo"
+        ));
+        // xcdebug exits 1 with prose and an Options section, no usage line.
+        assert!(doc(
+            "xcdebug -- Start a debugging session.\n\nOptions (general):\n    -h, --help   Show this information.\n",
+            "xcdebug"
+        ));
+        assert!(!doc("USAGE: other-tool [OPTIONS]\n", "snmptable"));
+        assert!(!doc(
+            "error: bad option\nUSAGE: snmptable [OPTIONS]\n",
+            "snmptable"
+        ));
+    }
+
+    #[test]
     fn man_pages_installed_with_the_binary_come_first() {
         let dir = Dir::new("own-man-page");
         let tool = dir.script("prefix/bin/tool", "#!/bin/sh\n");
@@ -2052,7 +2142,7 @@ fi
     }
 
     #[test]
-    fn help_that_exits_nonzero_is_used_only_when_its_usage_comes_before_any_error() {
+    fn help_that_exits_nonzero_ignores_only_the_help_flag_error() {
         let trusted = vec!["tool".into()];
         let options = |script: &str| {
             let dir = Dir::new("help-usage-exit");
@@ -2084,8 +2174,15 @@ fi
             ),
             ["-p", "--port"]
         );
+        // ibv_devinfo reports the help flag itself, then prints usage.
+        assert_eq!(
+            options(
+                "#!/bin/sh\nprintf 'tool: unrecognized option --help\\nUsage: tool [options]\\n    -p, --port <port>   Port\\n'\nexit 255\n"
+            ),
+            ["-p", "--port"]
+        );
         for script in [
-            "#!/bin/sh\nprintf 'tool: unknown option --help\\nUsage: tool [options]\\n    -p, --port <port>   Port\\n'\nexit 2\n",
+            "#!/bin/sh\nprintf 'tool: cannot start: configuration error\\nUsage: tool [options]\\n    -p, --port <port>   Port\\n'\nexit 2\n",
             "#!/bin/sh\nprintf 'Usage: other [options]\\n    -p, --port <port>   Port\\n'\nexit 1\n",
         ] {
             assert!(options(script).is_empty(), "{script}");
