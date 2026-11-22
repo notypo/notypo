@@ -379,5 +379,6 @@ jobs:
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
           draft: true
+          generate_release_notes: true
           files: release-artifacts/*
           fail_on_unmatched_files: true
