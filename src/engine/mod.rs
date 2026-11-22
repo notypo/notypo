@@ -1944,7 +1944,15 @@ impl<'a> Run<'a> {
                         // A partial handler that lists nothing here (zsh's
                         // _swift completes files after `swift`) says nothing:
                         // ask documentation, as for apps without a completer.
-                        let fallback = self.fallback_check(state, role, typed);
+                        // Past a known subcommand the empty level is usually
+                        // an argument or resource list, not another command.
+                        let fallback_role =
+                            if role == TokenRole::Subcommand && !state.command_path.is_empty() {
+                                TokenRole::ArgumentValue
+                            } else {
+                                role
+                            };
+                        let fallback = self.fallback_check(state, fallback_role, typed);
                         if matches!(fallback, Check::Valid { .. } | Check::Invalid(_)) {
                             return fallback;
                         }
@@ -2060,6 +2068,10 @@ impl<'a> Run<'a> {
             } else {
                 Check::Unknown
             };
+        }
+        // An argument past a leaf command changes what the command acts on.
+        if role == TokenRole::ArgumentValue {
+            merged.resources = merged.words.iter().map(|w| w.value.clone()).collect();
         }
         match merged.words.iter().find(|w| w.value == typed) {
             Some(word) => Check::Valid {
@@ -2704,6 +2716,14 @@ impl<'a> Run<'a> {
                 let mut next = state.clone();
                 let listed = vocabulary.words.iter().find(|v| v.value == to);
                 let takes_value = listed.and_then(|v| v.takes_value);
+                let resource = vocabulary.resources.iter().any(|r| r == to);
+                // A resource or argument is not the next subcommand, even
+                // when it was checked at a command level (kubectl resources).
+                let role = if resource && role == TokenRole::Subcommand {
+                    TokenRole::ArgumentValue
+                } else {
+                    role
+                };
                 next.context.push(format!("{to}{suffix}"));
                 if role == TokenRole::Subcommand {
                     next.command_path.push(to.to_owned());
@@ -2727,7 +2747,7 @@ impl<'a> Run<'a> {
                     to: to.to_owned(),
                     via: vocabulary.via.clone(),
                     description: listed.and_then(|v| v.description.clone()),
-                    resource: vocabulary.resources.iter().any(|r| r == to),
+                    resource,
                     score,
                 });
                 (next, takes_value)
@@ -5095,6 +5115,50 @@ esac
             report.outcome
         );
         assert_eq!(scripts(&report.outcome)[0], "app copy web:a web:b/c");
+    }
+
+    #[test]
+    fn cobra_resource_arguments_fall_back_to_history() {
+        use super::native::{Backend, Flavor};
+        let dir = Dir::new("cobra-resources");
+        // `get` is a leaf: its empty completion means resource names, which
+        // this fake (like kubectl offline) cannot list.
+        let app = dir.script(
+            "app",
+            r#"#!/bin/sh
+[ "$1" = __complete ] || exit 1
+shift
+case "$*" in
+  "") printf 'get\tGet resources\n:4\n';;
+  *) printf ':4\n';;
+esac
+"#,
+        );
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("app", Some(app.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history(&["app get pods -A", "app get nodes"]);
+        let run = |source: &str| {
+            let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+                std::rc::Rc::new(Backend::new(Flavor::Cobra, "app", app.clone()));
+            correct_with_backends(&failure(source), &ctx, vec![("app".into(), backend)])
+        };
+        let report = run("app get pids");
+        assert_eq!(
+            scripts(&report.outcome),
+            ["app get pods"],
+            "{:?}",
+            report.notes
+        );
+        assert!(matches!(report.outcome, Outcome::Ambiguous(_)));
+        let candidate = &report.outcome.candidates()[0];
+        assert_eq!(candidate.edits[0].role, TokenRole::ArgumentValue);
+        assert_eq!(candidate.edits[0].via, "shell history");
+        assert_eq!(candidate.safety.decision, Decision::Confirm);
+        assert!(matches!(
+            run("app get pods").outcome,
+            Outcome::NoCorrection(_)
+        ));
     }
 
     #[test]

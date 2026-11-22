@@ -754,13 +754,18 @@ impl CandidateProvider for NativeCompletion<'_> {
                 } else {
                     Vec::new()
                 };
+                let authoritative = if options {
+                    capabilities.complete_options
+                } else {
+                    // A deeper command can return no words because it
+                    // completes resources the app cannot list offline. Treat
+                    // that empty answer as partial so history can still
+                    // suggest a word used in the same slot before.
+                    capabilities.complete_subcommands && (!words.is_empty() || context.is_empty())
+                };
                 Answer::Words(Vocabulary {
                     words,
-                    authoritative: if options {
-                        capabilities.complete_options
-                    } else {
-                        capabilities.complete_subcommands
-                    },
+                    authoritative,
                     via,
                     source: Source::NativeCompletion,
                     cached,
