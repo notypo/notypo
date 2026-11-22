@@ -38,14 +38,17 @@ pub struct Settings {
     pub disabled_sources: Vec<String>,
     /// Programs whose generic completion protocol may be probed; `*` trusts
     /// every program that declares one. Built-in backends need no entry.
+    /// Defaults to `*`: every app is trusted, so no configuration is needed.
     pub trusted_completers: Vec<String>,
     /// Programs the engine may run with `--help`, including documented nested
     /// subcommands, to read options and values; `*` trusts all. Running a
-    /// program is never free of risk.
+    /// program is never free of risk. Defaults to `*`, like
+    /// `trusted_completers`.
     pub trusted_help: Vec<String>,
     /// Directories (and everything below them) where programs may evaluate
     /// project files to list their commands, such as make reading a
     /// Makefile; `*` trusts every directory (see [`crate::workspace`]).
+    /// Defaults to `*`: every workspace is trusted.
     pub trusted_workspaces: Vec<String>,
     /// Seconds a single discovery probe (such as a native completer) may run.
     pub probe_timeout: f64,
@@ -86,9 +89,11 @@ impl Default for Settings {
             fixlinecmd: "{editor} {file} +{line}".into(),
             fixcolcmd: None,
             disabled_sources: Vec::new(),
-            trusted_completers: Vec::new(),
-            trusted_help: Vec::new(),
-            trusted_workspaces: Vec::new(),
+            // Trust every app and workspace by default, so corrections work
+            // without configuration. Set these to `[]` to opt out.
+            trusted_completers: strings(&["*"]),
+            trusted_help: strings(&["*"]),
+            trusted_workspaces: strings(&["*"]),
             probe_timeout: 3.0,
             replay_for_diagnosis: false,
             network_completion: false,
@@ -125,9 +130,9 @@ const DEFAULTS_DOC: &str = "# rules = [<const: All rules enabled>]
 # env = {'LC_ALL': 'C', 'LANG': 'C', 'GIT_TRACE': '1'}
 # excluded_search_path_prefixes = []
 # disabled_sources = []
-# trusted_completers = []
-# trusted_help = []
-# trusted_workspaces = []
+# trusted_completers = ['*']
+# trusted_help = ['*']
+# trusted_workspaces = ['*']
 # probe_timeout = 3
 # replay_for_diagnosis = False
 # network_completion = False
@@ -849,6 +854,17 @@ no_colors = True
         ] {
             assert_eq!(completion_trust_from_env(value), expected, "{value}");
         }
+    }
+
+    #[test]
+    fn defaults_trust_every_app_and_workspace() {
+        let s = Settings::default();
+        assert_eq!(s.trusted_completers, ["*"]);
+        assert_eq!(s.trusted_help, ["*"]);
+        assert_eq!(s.trusted_workspaces, ["*"]);
+        assert!(DEFAULTS_DOC.contains("trusted_completers = ['*']"));
+        assert!(DEFAULTS_DOC.contains("trusted_help = ['*']"));
+        assert!(DEFAULTS_DOC.contains("trusted_workspaces = ['*']"));
     }
 
     #[test]

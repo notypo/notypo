@@ -197,11 +197,13 @@ mod tests {
     fn context(path: &std::path::Path, program: &str, trusted: bool) -> Context {
         Context::new(
             Settings {
+                trusted_completers: Vec::new(),
                 trusted_help: if trusted {
                     vec![program.into()]
                 } else {
                     Vec::new()
                 },
+                trusted_workspaces: Vec::new(),
                 ..Settings::default()
             },
             Shell::Bash,

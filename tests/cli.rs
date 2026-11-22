@@ -2009,6 +2009,9 @@ fn powershell_wrapper_functions_use_their_commands_vocabulary_and_safety_policy(
     let mut child = workspace
         .program(&pwsh, "")
         .env("PATH", system_path(&bin))
+        .env("NOTYPO_TRUSTED_COMPLETERS", "")
+        .env("NOTYPO_TRUSTED_HELP", "")
+        .env("NOTYPO_TRUSTED_WORKSPACES", "")
         .env("NOTYPO_DISABLED_SOURCES", "history:legacy")
         .args(["-NoProfile", "-NoLogo", "-Command", "-"])
         .stdin(Stdio::piped())
@@ -2090,8 +2093,10 @@ fn powershell_passes_session_argument_completers_without_running_their_script() 
     let mut child = workspace
         .program(&pwsh, "")
         .env("PATH", system_path(&bin))
+        .env("NOTYPO_TRUSTED_COMPLETERS", "")
+        .env("NOTYPO_TRUSTED_HELP", "")
+        .env("NOTYPO_TRUSTED_WORKSPACES", "")
         .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy")
-        .env_remove("NOTYPO_TRUSTED_COMPLETERS")
         .args(["-NoProfile", "-NoLogo", "-Command", "-"])
         .stdin(Stdio::piped())
         .spawn()
@@ -2620,6 +2625,7 @@ complete -c fishcli -n '__fish_seen_subcommand_from list' -l format -x -a "'alph
                 ),
             )
             .env("NOTYPO_TRUSTED_COMPLETERS", "fishcli")
+            .env("NOTYPO_TRUSTED_HELP", "")
             .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy");
         command
     };
@@ -2744,6 +2750,7 @@ esac
                 ),
             )
             .env("NOTYPO_TRUSTED_COMPLETERS", "zshcli")
+            .env("NOTYPO_TRUSTED_HELP", "")
             .env("NOTYPO_DISABLED_SOURCES", "help:man:history:legacy");
         command
     };

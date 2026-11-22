@@ -679,13 +679,15 @@ impl Shell {
             // event travels in the environment as one word: backquotes in
             // double quotes aren't globbed, while text inside backquotes
             // would be lexed again. `\!*` forwards the alias's arguments.
+            // A sentinel keeps a leading `--` from being eaten as printf's
+            // option terminator (uutils coreutils on Ubuntu 26.04).
             Shell::Tcsh => {
                 let body = format!(
                     "setenv NOTYPO_EXIT_STATUS $status; \
                      setenv TF_SHELL tcsh; setenv TF_ALIAS {name}; \
                      setenv NOTYPO_CURRENT_COMMAND \"`history -h 2 | head -n 1`\"; \
                      setenv TF_SHELL_ALIASES \"`alias | /usr/bin/tr '\\n' '\\036'`\"; \
-                     set notypo_report = `printf '%s\\n' \\!* | /usr/bin/awk 'BEGIN {{r=0}} $0==\"--\" {{exit}} $0==\"--json\" || $0==\"--explain\" {{r=1}} END {{print r}}'`; \
+                     set notypo_report = `printf '%s\\n' notypo-report-start \\!* | /usr/bin/awk 'BEGIN {{r=0}} $0==\"--\" {{exit}} $0==\"--json\" || $0==\"--explain\" {{r=1}} END {{print r}}'`; \
                      set notypo_result = \"`{exe} {PLACEHOLDER} \\!*`\"; \
                      if ( $notypo_report == 1 ) printf '%s\\n' \"$notypo_result\"; \
                      if ( $notypo_report == 0 ) eval \"$notypo_result\"; \
@@ -1432,6 +1434,12 @@ mod tests {
                 .app_alias("fuck", "notypo", false)
                 .contains("history -s")
         );
+    }
+
+    #[test]
+    fn tcsh_report_scan_keeps_a_leading_double_dash() {
+        let alias = Shell::Tcsh.app_alias("fuck", "notypo", true);
+        assert!(alias.contains("notypo-report-start \\!*"), "{alias}");
     }
 
     #[test]
