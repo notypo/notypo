@@ -4,6 +4,12 @@
 
 A Rust port of [thefuck](https://github.com/nvbn/thefuck) that goes further: native completions, precise edits inside complex shell commands, and safer execution. Runs on macOS, Linux, Windows, and FreeBSD.
 
+<picture>
+  <source srcset="demo/notypo-demo.avif" type="image/avif">
+  <source srcset="demo/notypo-demo.webp" type="image/webp">
+  <img src="demo/notypo-demo.gif" alt="notypo correcting git sttus with the t alias">
+</picture>
+
 ## Beyond thefuck
 
 | Capability | notypo | thefuck |
