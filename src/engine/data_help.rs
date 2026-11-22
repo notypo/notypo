@@ -1,5 +1,5 @@
-//! App-owned documentation for data tools whose root help omits their verbs,
-//! and for FFmpeg, whose basic help omits most of its options. Fixed
+//! App-owned documentation for tools whose root help omits their verbs or
+//! options, including data tools, FFmpeg, Go, Terraform, and npm. Fixed
 //! list/help requests run in a private directory without user data, startup
 //! configuration, scripts, passwords, or output paths.
 
@@ -12,6 +12,9 @@ pub(crate) enum Tool {
     Miller,
     Qsv,
     Ffmpeg,
+    Go,
+    Terraform,
+    Npm,
 }
 
 pub(crate) fn tool(program: &str) -> Option<Tool> {
@@ -19,50 +22,92 @@ pub(crate) fn tool(program: &str) -> Option<Tool> {
         "mlr" => Some(Tool::Miller),
         "qsv" | "qsvlite" | "qsvdp" => Some(Tool::Qsv),
         "ffmpeg" | "ffprobe" | "ffplay" => Some(Tool::Ffmpeg),
+        "go" => Some(Tool::Go),
+        "terraform" | "tofu" => Some(Tool::Terraform),
+        "npm" => Some(Tool::Npm),
         _ => None,
     }
 }
 
-fn env(dir: &Path) -> Vec<(OsString, Option<OsString>)> {
+fn env(tool: Tool, dir: &Path) -> Vec<(OsString, Option<OsString>)> {
     let mut env = super::native::help_env();
     env.extend([
         ("HOME".into(), Some(dir.as_os_str().to_owned())),
-        ("MLRRC".into(), Some("__none__".into())),
-        // qsv's documented switch; an empty path is loaded and fails.
-        ("QSV_DOTENV_PATH".into(), Some("<NONE>".into())),
-        ("QSV_LOG_LEVEL".into(), Some("off".into())),
-        ("QSV_MCP_LOG_LEVEL".into(), Some("off".into())),
-        ("QSV_LOG_DIR".into(), Some(dir.as_os_str().to_owned())),
         ("NO_COLOR".into(), Some("1".into())),
     ]);
+    match tool {
+        Tool::Miller | Tool::Qsv | Tool::Ffmpeg => env.extend([
+            ("MLRRC".into(), Some("__none__".into())),
+            // qsv's documented switch; an empty path is loaded and fails.
+            ("QSV_DOTENV_PATH".into(), Some("<NONE>".into())),
+            ("QSV_LOG_LEVEL".into(), Some("off".into())),
+            ("QSV_MCP_LOG_LEVEL".into(), Some("off".into())),
+            ("QSV_LOG_DIR".into(), Some(dir.as_os_str().to_owned())),
+        ]),
+        Tool::Go => env.extend([
+            // Never download a toolchain or module to print help.
+            ("GOTOOLCHAIN".into(), Some("local".into())),
+            ("GOPROXY".into(), Some("off".into())),
+            ("GOSUMDB".into(), Some("off".into())),
+            ("GOWORK".into(), Some("off".into())),
+            ("GOFLAGS".into(), None),
+        ]),
+        Tool::Terraform => env.extend([
+            ("CHECKPOINT_DISABLE".into(), Some("1".into())),
+            ("TF_IN_AUTOMATION".into(), Some("1".into())),
+            ("TF_CLI_ARGS".into(), None),
+            ("TF_WORKSPACE".into(), None),
+            (
+                "TF_CLI_CONFIG_FILE".into(),
+                Some(if cfg!(windows) { "NUL" } else { "/dev/null" }.into()),
+            ),
+            (
+                "TF_DATA_DIR".into(),
+                Some(dir.join("terraform-data").into_os_string()),
+            ),
+        ]),
+        Tool::Npm => {
+            env.extend(super::native::offline_env(super::native::Flavor::Npm));
+            env.push((
+                "npm_config_cache".into(),
+                Some(dir.join("npm-cache").into_os_string()),
+            ));
+        }
+    }
     env
 }
 
-fn query(path: &Path, args: &[&str], budget: &mut Budget) -> Result<String, String> {
-    query_up_to(path, args, budget, budget.max_output)
+fn query(tool: Tool, path: &Path, args: &[&str], budget: &mut Budget) -> Result<String, String> {
+    query_up_to(tool, path, args, budget, budget.max_output)
 }
 
 /// [`query`] with its own output limit: FFmpeg's full help is about 1 MiB.
 fn query_up_to(
+    tool: Tool,
     path: &Path,
     args: &[&str],
     budget: &mut Budget,
     limit: usize,
 ) -> Result<String, String> {
     let usual = std::mem::replace(&mut budget.max_output, limit);
-    let text = query_once(path, args, budget);
+    let text = query_once(tool, path, args, budget);
     budget.max_output = usual;
     text
 }
 
-fn query_once(path: &Path, args: &[&str], budget: &mut Budget) -> Result<String, String> {
+fn query_once(
+    tool: Tool,
+    path: &Path,
+    args: &[&str],
+    budget: &mut Budget,
+) -> Result<String, String> {
     let dir = crate::utils::cache_dir().join("data-help-probes");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let output = probe::run_in(
         &Probe {
             program: path,
             args: args.iter().map(OsString::from).collect(),
-            env: env(&dir),
+            env: env(tool, &dir),
             capture: Capture::Combined,
         },
         &dir,
@@ -75,6 +120,158 @@ fn query_once(path: &Path, args: &[&str], budget: &mut Budget) -> Result<String,
     String::from_utf8(output.data)
         .map(|text| super::docs::strip_formatting(&text))
         .map_err(|_| "data-tool metadata is not UTF-8".into())
+}
+
+/// `npm -l` is the all-commands listing, but npm exits 1 after printing it.
+fn query_npm_listing(path: &Path, budget: &mut Budget) -> Result<String, String> {
+    let dir = crate::utils::cache_dir().join("data-help-probes");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let output = probe::run_in(
+        &Probe {
+            program: path,
+            args: vec!["-l".into()],
+            env: env(Tool::Npm, &dir),
+            capture: Capture::Combined,
+        },
+        &dir,
+        budget,
+    )
+    .map_err(|e| e.to_string())?;
+    if output.truncated || !matches!(output.status, Some(0) | Some(1)) {
+        return Err("npm command listing failed or exceeded the probe limit".into());
+    }
+    let text = String::from_utf8(output.data)
+        .map_err(|_| "npm command listing is not UTF-8".to_owned())?;
+    let text = super::docs::strip_formatting(&text);
+    if !text.contains("All commands:") {
+        return Err("unrecognized npm command listing".into());
+    }
+    Ok(text)
+}
+
+/// npm's command names and aliases from `npm -l`. Command entries are the
+/// four-space names; the `alias:`/`aliases:` lines below each add more.
+fn npm_commands(text: &str, limit: usize) -> Result<String, String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut in_commands = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed == "All commands:" {
+            in_commands = true;
+            continue;
+        }
+        if !in_commands {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        let alias = trimmed
+            .strip_prefix("alias:")
+            .or_else(|| trimmed.strip_prefix("aliases:"));
+        if let Some(aliases) = alias {
+            for alias in aliases.split(',').map(str::trim) {
+                if name(alias) && !names.iter().any(|known| known == alias) {
+                    names.push(alias.to_owned());
+                }
+            }
+        } else if indent == 4
+            && let Some(command) = trimmed.split_whitespace().next()
+            && name(command)
+            && !names.iter().any(|known| known == command)
+        {
+            names.push(command.to_owned());
+        }
+    }
+    if names.len() < 20 {
+        return Err("unrecognized npm command listing".into());
+    }
+    let mut output = String::from("\nCommands:\n");
+    for name in names.into_iter().take(limit) {
+        output.push_str("    ");
+        output.push_str(&name);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+/// Long CLI flags from `npm config ls -l --json`. Every npm config key can
+/// be passed as `--key`, and the listing includes aliases such as `call`
+/// and `package`.
+fn npm_option_names(value: &serde_json::Value, limit: usize) -> Result<Vec<String>, String> {
+    let keys = value.as_object().ok_or("npm config is not an object")?;
+    let mut names: Vec<String> = keys
+        .keys()
+        .filter(|key| name(key))
+        .map(|key| format!("--{key}"))
+        .take(limit)
+        .collect();
+    if names.len() < 20 {
+        return Err("unrecognized npm configuration listing".into());
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn npm_options(path: &Path, budget: &mut Budget) -> Result<String, String> {
+    let text = query(Tool::Npm, path, &["config", "ls", "-l", "--json"], budget)?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "malformed npm configuration JSON".to_owned())?;
+    let names = npm_option_names(&value, budget.max_candidates)?;
+    let mut output = String::from("\nOptions:\n");
+    for name in names {
+        output.push_str("    ");
+        output.push_str(&name);
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+/// Go documents some flags only in its `usage:` line, as bracketed groups:
+/// `usage: go env [-json] [-changed] [-w] [var ...]`. Add the option groups
+/// (`[build flags]` and `[packages]` are not options).
+fn go_usage_options(text: &str) -> String {
+    let mut options: Vec<(String, bool)> = Vec::new();
+    for line in text.lines() {
+        let Some(usage) = line.trim().strip_prefix("usage:") else {
+            continue;
+        };
+        let mut rest = usage;
+        while let Some(start) = rest.find('[') {
+            rest = &rest[start + 1..];
+            let Some(end) = rest.find(']') else {
+                break;
+            };
+            let group = rest[..end].trim();
+            rest = &rest[end + 1..];
+            if !group.starts_with('-') {
+                continue;
+            }
+            let (name, rest) = group
+                .split_once(|c: char| c.is_whitespace() || c == '=')
+                .unwrap_or((group, ""));
+            let name = name.trim_end_matches(|c: char| ",;:".contains(c));
+            if name.len() < 2
+                || !name.starts_with('-')
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
+            {
+                continue;
+            }
+            if !options.iter().any(|(known, _)| known == name) {
+                options.push((name.to_owned(), !rest.trim().is_empty()));
+            }
+        }
+    }
+    let mut output = String::new();
+    for (name, valued) in options {
+        output.push_str("    ");
+        output.push_str(&name);
+        if valued {
+            output.push_str(" VALUE");
+        }
+        output.push('\n');
+    }
+    output
 }
 
 fn name(word: &str) -> bool {
@@ -217,30 +414,30 @@ pub(crate) fn read(
 ) -> Result<String, String> {
     match (tool, commands_path) {
         (Tool::Qsv, []) => {
-            let help = query(path, &["--help"], budget)?;
-            let listing = query(path, &["--list"], budget)?;
+            let help = query(tool, path, &["--help"], budget)?;
+            let listing = query(tool, path, &["--list"], budget)?;
             Ok(help + &commands(tool, &listing, budget.max_candidates)?)
         }
         (Tool::Qsv, path_words) => {
             let mut args: Vec<&str> = path_words.iter().map(String::as_str).collect();
             args.push("--help");
-            query(path, &args, budget)
+            query(tool, path, &args, budget)
         }
         (Tool::Miller, []) => {
-            let verbs = query(path, &["help", "list-verbs"], budget)?;
+            let verbs = query(tool, path, &["help", "list-verbs"], budget)?;
             let listing = commands(tool, &verbs, budget.max_candidates)?;
-            let flags = match query(path, &["help", "flag", "--as-json"], budget) {
+            let flags = match query(tool, path, &["help", "flag", "--as-json"], budget) {
                 Ok(text) => {
                     let value: serde_json::Value =
                         serde_json::from_str(&text).map_err(|_| "malformed Miller JSON flags")?;
                     json_options(&value, true, budget.max_candidates)?
                 }
-                Err(_) => indent_options(&query(path, &["help", "flags"], budget)?),
+                Err(_) => indent_options(&query(tool, path, &["help", "flags"], budget)?),
             };
             Ok(listing + &flags)
         }
         (Tool::Miller, [verb]) => {
-            match query(path, &["help", "verb", verb, "--as-json"], budget) {
+            match query(tool, path, &["help", "verb", verb, "--as-json"], budget) {
                 Ok(text) => {
                     let value: serde_json::Value =
                         serde_json::from_str(&text).map_err(|_| "malformed Miller JSON verb")?;
@@ -266,6 +463,7 @@ pub(crate) fn read(
                         + &json_options(options, false, budget.max_candidates)?)
                 }
                 Err(_) => Ok(indent_options(&query(
+                    tool,
                     path,
                     &["help", "verb", verb],
                     budget,
@@ -274,15 +472,70 @@ pub(crate) fn read(
         }
         (Tool::Ffmpeg, []) => {
             let full = query_up_to(
+                tool,
                 path,
                 &["-hide_banner", "-h", "full"],
                 budget,
                 FFMPEG_HELP_LIMIT,
             )?;
-            let codecs = query(path, &["-hide_banner", "-codecs"], budget)?;
+            let codecs = query(tool, path, &["-hide_banner", "-codecs"], budget)?;
             ffmpeg_options(&full, &codecs, budget.max_candidates)
         }
         (Tool::Ffmpeg, _) => Err("FFmpeg has no subcommands".into()),
+        // Go's own help subcommand is the only source: `go --help` exits 2.
+        // `go help <command>` and `go help <command> <subcommand>` work.
+        (Tool::Go, []) => {
+            let text = query(tool, path, &["help"], budget)?;
+            let options = go_usage_options(&text);
+            Ok(text + &options)
+        }
+        (Tool::Go, path_words) => {
+            let mut args = vec!["help"];
+            args.extend(path_words.iter().map(String::as_str));
+            let mut text = query(tool, path, &args, budget)?;
+            // The build flags are shared by build, clean, get, install, list,
+            // run, test, and vet; test's own flags live in testflag.
+            if path_words.len() == 1
+                && matches!(
+                    path_words[0].as_str(),
+                    "build" | "clean" | "get" | "install" | "list" | "run" | "test" | "vet"
+                )
+            {
+                if path_words[0] != "build" {
+                    text.push_str(&query(tool, path, &["help", "build"], budget)?);
+                }
+                if path_words[0] == "test" {
+                    text.push_str(&query(tool, path, &["help", "testflag"], budget)?);
+                }
+            }
+            text.push_str(&go_usage_options(&text));
+            Ok(text)
+        }
+        // Terraform rejects nothing here, but its -help spelling is stable
+        // for every command level: `terraform state list -help`.
+        (Tool::Terraform, []) => query(tool, path, &["-help"], budget),
+        (Tool::Terraform, path_words) => {
+            let mut args: Vec<&str> = path_words.iter().map(String::as_str).collect();
+            args.push("-help");
+            let mut text = query(tool, path, &args, budget)?;
+            // destroy is apply -destroy: its own page points at plan but
+            // also accepts apply's flags, including -auto-approve.
+            if path_words.len() == 1 && path_words[0] == "destroy" {
+                text.push_str(&query(tool, path, &["plan", "-help"], budget)?);
+                text.push_str(&query(tool, path, &["apply", "-help"], budget)?);
+            }
+            Ok(text)
+        }
+        // npm -l prints commands and their aliases but exits 1; its config
+        // listing is the full option vocabulary. Deeper levels only need
+        // the options: command nesting comes from the root commands and
+        // npm's own completion.
+        (Tool::Npm, []) => {
+            let listing = query_npm_listing(path, budget)?;
+            let listing = npm_commands(&listing, budget.max_candidates)?;
+            Ok(listing + &npm_options(path, budget)?)
+        }
+        (Tool::Npm, _) => npm_options(path, budget),
         _ => Err("Miller verbs do not contain subcommands".into()),
     }
 }
@@ -608,7 +861,7 @@ mod tests {
 
     #[test]
     fn probes_disable_startup_files_with_each_tools_own_switch() {
-        let env = env(Path::new("/private/probe"));
+        let env = env(Tool::Qsv, Path::new("/private/probe"));
         let value = |name: &str| {
             env.iter()
                 .rev()
@@ -620,6 +873,148 @@ mod tests {
         assert_eq!(value("QSV_DOTENV_PATH"), Some("<NONE>".into()));
         assert_eq!(value("MLRRC"), Some("__none__".into()));
         assert_eq!(value("HOME"), Some("/private/probe".into()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn go_terraform_and_npm_read_their_own_documentation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("notypo-data-help-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let go = script(
+            "go",
+            "#!/bin/sh\ncase \"$*\" in\n  \"help\") printf 'usage: go <command>\\n\\nThe commands are:\\n\\n    build  compile\\n';;\n  \"help build\") printf 'usage: go build [-o output] [packages]\\n';;\n  *) exit 1;;\nesac\n",
+        );
+        let terraform = script(
+            "terraform",
+            "#!/bin/sh\ncase \"$*\" in\n  \"-help\") printf 'Main commands:\\n  destroy  Destroy\\n';;\n  \"destroy -help\") printf 'Usage: terraform destroy\\n';;\n  \"plan -help\") printf '  -out=path  Write plan\\n';;\n  \"apply -help\") printf '  -auto-approve  Skip approval\\n';;\n  *) exit 1;;\nesac\n",
+        );
+        let npm = script(
+            "npm",
+            "#!/bin/sh\ncase \"$*\" in\n  \"-l\") printf 'All commands:\\n\\n    access  Access\\n    adduser  Add\\n    audit  Audit\\n    cache  Cache\\n    ci  CI\\n    config  Config\\n    dedupe  Dedupe\\n    exec  Exec\\n    init  Init\\n    install  Install\\n    link  Link\\n    publish  Publish\\n    run  Run\\n    test  Test\\n    uninstall  Uninstall\\n    update  Update\\n    version  Version\\n    view  View\\n    whoami  Who\\n    workspace  Workspace\\n                    aliases: tst, i\\n'; exit 1;;\n  \"config ls -l --json\") printf '{\"access\":false,\"all\":false,\"audit\":true,\"cache\":false,\"call\":\"\",\"ci\":false,\"depth\":0,\"dry-run\":false,\"force\":false,\"global\":false,\"json\":true,\"link\":false,\"location\":\"\",\"omit\":[],\"package\":\"\",\"package-lock-only\":true,\"prefix\":\"\",\"save-dev\":false,\"version\":false,\"workspace\":\"\"}\\n';;\n  *) exit 1;;\nesac\n",
+        );
+        let mut budget = Budget::for_timeout(5.0);
+        let go_text = read(Tool::Go, &go, &["build".to_owned()], &mut budget).unwrap();
+        assert!(go_text.contains("-o"), "{go_text}");
+        let terraform_text = read(
+            Tool::Terraform,
+            &terraform,
+            &["destroy".to_owned()],
+            &mut budget,
+        )
+        .unwrap();
+        assert!(terraform_text.contains("-auto-approve"), "{terraform_text}");
+        let npm_text = read(Tool::Npm, &npm, &[], &mut budget).unwrap();
+        assert!(npm_text.contains("tst"), "{npm_text}");
+        assert!(npm_text.contains("--save-dev"), "{npm_text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn npm_listing_keeps_commands_and_aliases() {
+        let mut listing = String::from("npm <command>\n\nAll commands:\n\n");
+        for command in [
+            "access",
+            "adduser",
+            "audit",
+            "cache",
+            "ci",
+            "config",
+            "dedupe",
+            "exec",
+            "init",
+            "install",
+            "link",
+            "publish",
+            "run",
+            "test",
+            "uninstall",
+            "update",
+            "version",
+            "view",
+            "whoami",
+            "workspace",
+        ] {
+            listing.push_str(&format!("    {command}          description\n"));
+        }
+        listing.push_str("                    aliases: x, i\n");
+        let commands = npm_commands(&listing, 100).unwrap();
+        let options = super::super::docs::subcommands(&commands, "npm");
+        for name in ["install", "x", "i", "test"] {
+            assert!(
+                options.iter().any(|item| item.value == name),
+                "{name}: {commands}"
+            );
+        }
+    }
+
+    #[test]
+    fn go_usage_lines_supply_option_groups() {
+        let text = "usage: go env [-json] [-changed] [-u] [-w] [var ...]\nusage: go build [-o output] [build flags] [packages]\n";
+        let output = go_usage_options(text);
+        let options = super::super::docs::options(&output);
+        let arity = |name: &str| {
+            options
+                .iter()
+                .find(|item| item.value == name)
+                .unwrap_or_else(|| panic!("{name}: {output}"))
+                .takes_value
+        };
+        assert_eq!(arity("-json"), Some(false));
+        assert_eq!(arity("-changed"), Some(false));
+        assert_eq!(arity("-o"), Some(true));
+        assert!(!options.iter().any(|item| item.value == "build"));
+    }
+
+    #[test]
+    fn npm_config_keys_become_long_options() {
+        let mut value = serde_json::Map::new();
+        for key in [
+            "access",
+            "all",
+            "audit",
+            "cache",
+            "call",
+            "ci",
+            "depth",
+            "dry-run",
+            "force",
+            "global",
+            "json",
+            "link",
+            "location",
+            "omit",
+            "package",
+            "package-lock-only",
+            "prefix",
+            "save-dev",
+            "version",
+            "workspace",
+        ] {
+            value.insert(key.into(), serde_json::Value::Bool(false));
+        }
+        value.insert("init.author.email".into(), "".into());
+        value.insert("//registry.example/:_authToken".into(), "secret".into());
+        let value = serde_json::Value::Object(value);
+        let names = npm_option_names(&value, 100).unwrap();
+        for name in [
+            "--audit",
+            "--call",
+            "--package",
+            "--package-lock-only",
+            "--save-dev",
+        ] {
+            assert!(names.iter().any(|known| known == name), "{name}: {names:?}");
+        }
+        assert!(!names.iter().any(|known| known.contains("authToken")));
+        assert!(!names.iter().any(|known| known.contains("init.")));
     }
 
     #[test]

@@ -2351,7 +2351,8 @@ impl NativeCompletionBackend for Backend {
                     | Flavor::Node
             ),
             // git's helper and hand-written completion scripts omit options;
-            // node's list omits V8 flags it passes through.
+            // posener completes commands but not their flags; node's list
+            // omits V8 flags it passes through.
             complete_options: !matches!(
                 self.flavor,
                 Flavor::Git
@@ -2362,6 +2363,7 @@ impl NativeCompletionBackend for Backend {
                     | Flavor::Pip
                     | Flavor::Npm
                     | Flavor::Node
+                    | Flavor::Posener
             ),
             complete_subcommands: !matches!(
                 self.flavor,
@@ -4052,6 +4054,10 @@ esac
         assert_eq!(
             backend.complete(&["apply"], "-", &mut budget).unwrap()[0].value,
             "-auto-approve"
+        );
+        assert!(
+            !backend.capabilities().complete_options,
+            "posener's answers never list every command's flags"
         );
         assert!(!dir.0.join("bin/ran").exists());
     }
