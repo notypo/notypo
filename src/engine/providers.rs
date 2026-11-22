@@ -727,10 +727,24 @@ impl CandidateProvider for NativeCompletion<'_> {
         let via = format!("{} completion", backend.id());
         match result {
             Ok(items) => {
-                let words: Vec<_> = items
+                let mut words: Vec<_> = items
                     .into_iter()
                     .filter(|i| backend.is_option(&context, i) == options)
                     .collect();
+                if options {
+                    // Bash handlers pad option candidates with the space the
+                    // shell would insert (`--section `). It is not part of
+                    // the name and must never be quoted into the command.
+                    for word in &mut words {
+                        let trimmed = word.value.trim();
+                        if trimmed.len() != word.value.len() {
+                            word.value = trimmed.to_owned();
+                        }
+                    }
+                    words.retain(|word| {
+                        word.value.len() > 1 && !word.value.contains(char::is_whitespace)
+                    });
+                }
                 let resources = if !options {
                     words
                         .iter()
@@ -1432,7 +1446,7 @@ fn multicall_dispatcher(program: &str) -> bool {
 fn usage_document(data: &[u8], program: &str, path: &Path) -> bool {
     let text = super::docs::strip_formatting(&String::from_utf8_lossy(data));
     let error = regex!(r"(?i)\b(?:error|unknown|invalid|unrecognized|illegal)\b");
-    let usage = regex!(r"(?i)^\s*usage\s*:\s*(.*)$");
+    let usage = regex!(r"(?i)^\s*(?:usage|syntax)\s*:\s*(.*)$");
     let base = |name: &str| name.rsplit(['/', '\\']).next().map(str::to_owned);
     let names = |named: Option<&str>| {
         let Some(named) = named.and_then(base) else {
@@ -1471,11 +1485,16 @@ fn usage_document(data: &[u8], program: &str, path: &Path) -> bool {
                 }
                 continue;
             }
-            // afinfo prints "Usage:" and names itself on the next line.
-            if let Some(named) = lines.next().and_then(|line| line.split_whitespace().next())
-                && names(Some(named))
-            {
-                return true;
+            // afinfo prints "Usage:" and names itself on the next line;
+            // tailspin puts the program several usage lines lower.
+            for _ in 0..5 {
+                let Some(named) = lines.next().and_then(|line| line.split_whitespace().next())
+                else {
+                    break;
+                };
+                if names(Some(named)) {
+                    return true;
+                }
             }
             continue;
         }
@@ -1922,6 +1941,16 @@ mod help_tests {
         assert!(doc(
             "xcdebug -- Start a debugging session.\n\nOptions (general):\n    -h, --help   Show this information.\n",
             "xcdebug"
+        ));
+        // x265 uses Syntax: rather than Usage:.
+        assert!(doc(
+            "x265 [info]: HEVC encoder\n\nSyntax: x265 [options] infile\n    -h/--help  Show help\n",
+            "x265"
+        ));
+        // tailspin's usage block names the program several lines lower.
+        assert!(doc(
+            "usage:\n\tTo view current tailspin status:\n\t\ttailspin info\n",
+            "tailspin"
         ));
         assert!(!doc("USAGE: other-tool [OPTIONS]\n", "snmptable"));
         assert!(!doc(

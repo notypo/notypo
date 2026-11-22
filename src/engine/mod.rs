@@ -5098,6 +5098,32 @@ esac
     }
 
     #[test]
+    fn handler_option_padding_is_not_part_of_the_name() {
+        use super::native::{Backend, Flavor};
+        let Some(bash) = crate::utils::which("bash") else {
+            return;
+        };
+        let dir = Dir::new("handler-option-padding");
+        let app = dir.script("opts", "#!/bin/sh\nexit 0\n");
+        let helper = dir.script(
+            "completion",
+            "_opts() { COMPREPLY=(\"--section \" \"--other\"); }\ncomplete -F _opts opts\n",
+        );
+        let ctx = Context::new(Settings::default(), Shell::Bash, "fuck".into())
+            .with_which("opts", Some(app.to_str().unwrap()))
+            .with_which("man", None)
+            .with_history::<&str>(&[]);
+        let backend: std::rc::Rc<dyn native::NativeCompletionBackend> =
+            std::rc::Rc::new(Backend::new(Flavor::BashFunction, "opts", bash).with_helper(helper));
+        let report = correct_with_backends(
+            &failure("opts --seciton=x"),
+            &ctx,
+            vec![("opts".into(), backend)],
+        );
+        assert_eq!(scripts(&report.outcome), ["opts --section=x"]);
+    }
+
+    #[test]
     fn handler_values_repeated_in_every_slot_are_resources() {
         use super::native::{Backend, Flavor};
         let Some(bash) = crate::utils::which("bash") else {
