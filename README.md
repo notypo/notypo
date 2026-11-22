@@ -23,11 +23,13 @@ cargo install --path .
 eval "$(notypo --alias)"
 ```
 
-Add the `eval` line to `~/.bashrc` or `~/.zshrc` to keep it. Both `typo` and `fuck` work:
+Add the `eval` line to `~/.bashrc` or `~/.zshrc` to keep it. `typo`, `fuck`, and `t` all work:
 
 ```sh
 git sttus
 typo        # suggests git status; press Enter to run it
+fuck        # same correction under the familiar name
+t           # and the shortest alias
 ```
 
 For fish, use `notypo --alias | source`. For PowerShell, use ``Invoke-Expression ((notypo --alias) -join "`n")``.

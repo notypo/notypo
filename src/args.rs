@@ -263,7 +263,7 @@ pub fn help(prog: &str) -> String {
         ("-v, --version", "show program's version number and exit"),
         (
             "-a [ALIAS], --alias [ALIAS]",
-            "print fuck and typo functions, or a custom alias, for the current shell",
+            "print fuck, typo, and t functions, or a custom alias, for the current shell",
         ),
         (
             "-l SHELL_LOGGER, --shell-logger SHELL_LOGGER",
