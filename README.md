@@ -1,6 +1,6 @@
 # notypo
 
-**Mistype a command? Type `typo` or `t` or old school `fuck`
+**Mistype a command? Type `typo`, `t`, or old-school `fuck`.**
 
 A Rust port of [thefuck](https://github.com/nvbn/thefuck) that goes further: native completions, precise edits inside complex shell commands, and safer execution. Runs on macOS, Linux, Windows, and FreeBSD.
 
@@ -8,22 +8,33 @@ A Rust port of [thefuck](https://github.com/nvbn/thefuck) that goes further: nat
 
 | Capability | notypo | thefuck |
 |---|---|---|
-| Finding corrections | CLI/shell completions, help, history, and rules | [Rules and error output](https://github.com/nvbn/thefuck#how-it-works) |
+| Finding corrections | CLI/shell completions, help, man pages, history, and rules | [Rules and error output](https://github.com/nvbn/thefuck#how-it-works) |
 | Shell edits | Parses, edits mistaken words, then reparses | [Rule-specific rewrites](https://github.com/nvbn/thefuck/blob/master/thefuck/types.py) |
 | Inspection | `--explain`; `--json` with evidence and safety decisions | [`--debug` logs](https://github.com/nvbn/thefuck/blob/master/thefuck/argument_parser.py) |
 | Risky corrections | Confirmation required even with `-y` | [`-y` skips confirmation](https://github.com/nvbn/thefuck#installation) |
 | Replaying failed commands | Off by default | [Reruns to capture output unless logging is enabled](https://github.com/nvbn/thefuck/blob/master/thefuck/output_readers/__init__.py) |
 
-## Quick start
+## Install
 
-From this repository, with Rust 1.98+ (Bash or Zsh):
+Homebrew (macOS and Linux):
 
 ```sh
-cargo install --path .
+brew install notypo/notypo/notypo
+```
+
+Prebuilt binaries for macOS, Linux, Windows, and FreeBSD are on [Releases](https://github.com/notypo/notypo/releases). From source (Rust 1.98+):
+
+```sh
+cargo install --git https://github.com/notypo/notypo
+```
+
+Then install the shell aliases (Bash/Zsh):
+
+```sh
 eval "$(notypo --alias)"
 ```
 
-Add the `eval` line to `~/.bashrc` or `~/.zshrc` to keep it. `typo`, `fuck`, and `t` all work:
+Add that line to `~/.bashrc` or `~/.zshrc`. `typo`, `fuck`, and `t` all work:
 
 ```sh
 git sttus
