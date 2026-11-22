@@ -1,64 +1,58 @@
 # notypo
 
-**Mistype a command? Type `typo`.**
+**Mistype a command? Type `typo` or `t`.**
 
-A Rust port of [thefuck](https://github.com/nvbn/thefuck) that goes further: native completions, precise edits inside complex shell commands, and safer execution. Runs on macOS, Linux, Windows, and FreeBSD.
+A Rust port of [thefuck](https://github.com/nvbn/thefuck) with native completions for npm, Go, Terraform, and other CLIs, precise edits, and safer execution. Runs on macOS, Linux, Windows, and FreeBSD.
 
 ## Beyond thefuck
 
 | Capability | notypo | thefuck |
 |---|---|---|
-| Finding corrections | CLI/shell completions, help, history, and rules | [Rules and error output](https://github.com/nvbn/thefuck#how-it-works) |
-| Shell edits | Parses, edits mistaken words, then reparses | [Rule-specific rewrites](https://github.com/nvbn/thefuck/blob/master/thefuck/types.py) |
-| Inspection | `--explain`; `--json` with evidence and safety decisions | [`--debug` logs](https://github.com/nvbn/thefuck/blob/master/thefuck/argument_parser.py) |
-| Risky corrections | Confirmation required even with `-y` | [`-y` skips confirmation](https://github.com/nvbn/thefuck#installation) |
-| Replaying failed commands | Off by default | [Reruns to capture output unless logging is enabled](https://github.com/nvbn/thefuck/blob/master/thefuck/output_readers/__init__.py) |
+| Corrections | Completions, help, man pages, history, and rules | Rules and error output |
+| Edits | Parses, edits, reparses | Rule-specific rewrites |
+| Inspection | `--explain`, `--json` | `--debug` logs |
+| Risky fixes | Always confirmed | `-y` skips confirmation |
 
 ## Quick start
 
-From this repository, with Rust 1.98+ (Bash or Zsh):
+Rust 1.98+:
 
 ```sh
 cargo install --path .
 eval "$(notypo --alias)"
 ```
 
-Add the `eval` line to `~/.bashrc` or `~/.zshrc` to keep it. `typo`, `fuck`, and `t` all work:
+Add it to `~/.bashrc` or `~/.zshrc`. `typo`, `fuck`, and `t` all work:
 
 ```sh
 git sttus
 typo        # suggests git status; press Enter to run it
-fuck        # same correction under the familiar name
-t           # and the shortest alias
+t           # shortest alias
 ```
 
-For fish, use `notypo --alias | source`. For PowerShell, use ``Invoke-Expression ((notypo --alias) -join "`n")``.
+Fish: `notypo --alias | source`. PowerShell: ``Invoke-Expression ((notypo --alias) -join "`n")``.
 
 ## Examples
 
-| You typed | Suggested correction |
+| You typed | Suggested |
 |---|---|
 | `env RUST_LOG=debug cargo biuld --color=alwyas` | `env RUST_LOG=debug cargo build --color=always` |
 | `kubectl get pods --ouptut=jsno` | `kubectl get pods --output=json` |
-| `cargo build -p notyop --release` | `cargo build -p notypo --release` (in this repo) |
 | `git status --shrot -- 'src/**/*.rs' \| head -n 5` | `git status --short -- 'src/**/*.rs' \| head -n 5` |
 | `if test -d .git; then git status --shrot; fi` | `if test -d .git; then git status --short; fi` |
 
-Tools must be installed. Every app and workspace is trusted by default, so the examples above work with no configuration.
+Tools must be installed. Apps and workspaces are trusted by default.
 
-Inspect a command directly:
+Inspect:
 
 ```sh
-notypo -y 'git sttus'          # print the correction
-notypo --explain 'git sttus'   # show the evidence
-notypo --json 'git sttus'      # get a JSON report
+notypo -y 'git sttus'          # print fix
+notypo --explain 'git sttus'   # evidence
+notypo --json 'git sttus'      # JSON
 ```
 
-Direct calls print results; the shell functions run your selected correction after confirmation.
-
-Settings: `~/.config/thefuck/settings.py`. All apps and workspaces are trusted by default, so no configuration is needed. To opt out, set `trusted_completers`, `trusted_help`, or `trusted_workspaces` to `[]`; generic completion, help probes, or project evaluation then require explicit entries again. More options: `notypo --help`.
+Settings: `~/.config/thefuck/settings.py`. Trust is on by default; set `trusted_completers`, `trusted_help`, or `trusted_workspaces` to `[]` for explicit entries. More: `notypo --help`.
 
 ## License
 
-MIT or Apache-2.0
-The original app was created by Vladimir Iakovlev; see [NOTICE](NOTICE).
+MIT or Apache-2.0. Created by Vladimir Iakovlev; see [NOTICE](NOTICE).
