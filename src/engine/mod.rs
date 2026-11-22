@@ -5032,8 +5032,9 @@ shift
 case "$*" in
   "") printf 'copy\tCopy files\nlsd\tList directories\n:0\n';;
   "-") printf -- '--config\tConfig file\n:4\n';;
-  "copy -") printf -- '--dry-run\tTrial run\n--transfers\tParallel transfers\n:4\n';;
+  "copy -") printf -- '--dry-run\tTrial run\n--transfers\tParallel transfers\n--file\tInput file\n:4\n';;
   "copy --transfers ") printf ':0\n';;
+  "copy --file ") printf 'json\nyaml\n:8\n';;
   "lsd -"|"ls -") printf -- '--config\tConfig file\n--recursive\tRecurse\n:4\n';;
   "copy "*|"lsd "*|"ls "*) printf 'web:\nloc:\n:0\n';;
   *) printf ':0\n';;
@@ -5053,6 +5054,9 @@ esac
             // `--dry-run` takes no value: `web:a` and `b` are arguments.
             "app copy --dry-run web:a b",
             "app copy --transfers 4 web:a b",
+            // A file-extension filter (directive 8) is a path, not a value
+            // vocabulary: `x.yaml` must keep its name.
+            "app copy --file x.yaml web:a b",
         ] {
             let report = run(valid);
             assert!(
@@ -5064,6 +5068,8 @@ esac
         }
         let report = run("app copy --dry-rnu web:a b");
         assert_eq!(scripts(&report.outcome), ["app copy --dry-run web:a b"]);
+        let report = run("app cpoy --file x.yaml web:a b");
+        assert_eq!(scripts(&report.outcome), ["app copy --file x.yaml web:a b"]);
         // The root's commands are complete; a misspelled one is decided.
         let report = run("app lsdd web:");
         assert!(
