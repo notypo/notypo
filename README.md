@@ -20,6 +20,7 @@ Homebrew (macOS and Linux):
 
 ```sh
 brew tap notypo/notypo
+brew trust --formula notypo/notypo/notypo
 brew install notypo
 ```
 
