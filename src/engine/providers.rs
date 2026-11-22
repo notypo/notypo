@@ -1544,6 +1544,9 @@ impl CandidateProvider for HelpText<'_> {
                 Some(super::data_help::Tool::Miller) => "mlr help",
                 Some(super::data_help::Tool::Qsv) => "qsv --list and --help",
                 Some(super::data_help::Tool::Ffmpeg) => "-h full and -codecs",
+                Some(super::data_help::Tool::Go) => "go help",
+                Some(super::data_help::Tool::Terraform) => "terraform -help",
+                Some(super::data_help::Tool::Npm) => "npm -l and config listing",
                 None => "--help output",
             }
             .into(),
