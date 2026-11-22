@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
-pub const DEFAULT_ALIASES: &[&str] = &["fuck", "typo"];
+pub const DEFAULT_ALIASES: &[&str] = &["fuck", "typo", "t"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shell {

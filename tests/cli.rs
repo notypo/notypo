@@ -334,6 +334,7 @@ fn instant_alias_is_valid_for_bash_and_zsh() {
         assert!(alias.contains(USER_COMMAND_MARK));
         assert!(alias.contains("TF_ALIAS=fuck"));
         assert!(alias.contains("TF_ALIAS=typo"));
+        assert!(alias.contains("TF_ALIAS=t;"));
         assert_eq!(alias.matches("export PS1=").count(), 1);
         if notypo::utils::which(shell).is_some() {
             let output = Command::new(shell)
@@ -364,7 +365,7 @@ fn zsh_alias_corrects_command_from_current_multiline_history_event() {
     )
     .unwrap();
     fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
-    for name in ["fuck", "typo", "fix"] {
+    for name in ["fuck", "typo", "t", "fix"] {
         let mut command = workspace.command("git_not_command");
         command.env("TF_SHELL", "zsh").env("TF_ALIAS", "typo");
         if name == "fix" {
@@ -378,9 +379,11 @@ fn zsh_alias_corrects_command_from_current_multiline_history_event() {
         if name == "fix" {
             assert!(!alias.contains("TF_ALIAS=fuck"));
             assert!(!alias.contains("TF_ALIAS=typo"));
+            assert!(!alias.contains("TF_ALIAS=t;"));
         } else {
             assert!(alias.contains("TF_ALIAS=fuck"));
             assert!(alias.contains("TF_ALIAS=typo"));
+            assert!(alias.contains("TF_ALIAS=t;"));
         }
         // A bracketed paste is one history event. Seed the real zsh history
         // array with that event: fc renders its newlines as backslash-n pairs.
