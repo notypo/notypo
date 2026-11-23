@@ -101,12 +101,7 @@ fn show(choice: &Choice) {
         .reason
         .iter()
         .cloned()
-        .chain(
-            choice
-                .concerns
-                .iter()
-                .map(|c| format!("needs approval: {c}")),
-        )
+        .chain(choice.concerns.iter().map(|c| format!("warning: {c}")))
         .collect();
     if details.is_empty() {
         logs::confirm_text(&choice.script, choice.side_effect.is_some());
