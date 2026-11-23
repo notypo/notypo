@@ -568,6 +568,7 @@ impl Shell {
                     local notypo_word notypo_f notypo_src notypo_specs=
                     local -a notypo_names
                     for notypo_word in ${{(z)\"$(fc -ln -2 2>/dev/null)\"}}; do
+                        [[ $notypo_word == [A-Za-z0-9_.:+@%-]* ]] || continue
                         notypo_f=${{_comps[$notypo_word]-}}
                         [[ -n $notypo_f && $notypo_specs != *\"compdef $notypo_f $notypo_word\"* ]] || continue
                         [[ -n ${{functions[$notypo_f]-}} && ${{functions[$notypo_f]}} != *'builtin autoload -X'* ]] || continue

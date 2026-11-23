@@ -96,13 +96,20 @@ impl Suggestions for Corrector<'_, '_> {
     }
 }
 
-fn show(choice: &Choice) {
-    let details: Vec<String> = choice
+fn describe(choice: &Choice, include_details: bool) -> Vec<String> {
+    if !include_details {
+        return Vec::new();
+    }
+    choice
         .reason
         .iter()
         .cloned()
         .chain(choice.concerns.iter().map(|c| format!("warning: {c}")))
-        .collect();
+        .collect()
+}
+
+fn show(choice: &Choice, include_details: bool) {
+    let details = describe(choice, include_details);
     if details.is_empty() {
         logs::confirm_text(&choice.script, choice.side_effect.is_some());
     } else {
@@ -142,7 +149,10 @@ pub fn select_command(
         }
     }
 
-    show(&first);
+    // With confirmation required, Enter is the approval: no separate
+    // reasons or warnings. Details still explain a prompt that appears only
+    // because confirmation is off and the choice has concerns.
+    show(&first, !require_confirmation);
     let raw = RawMode::enter();
     let mut keys = std::io::stdin().lock().bytes().map_while(Result::ok);
     let mut commands = vec![first];
@@ -174,7 +184,7 @@ pub fn select_command(
                 } else {
                     (index + 1) % n
                 };
-                show(&commands[index]);
+                show(&commands[index], !require_confirmation);
             }
         }
     }
@@ -235,6 +245,20 @@ mod tests {
             reason: None,
             concerns: concerns.iter().map(|c| c.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn quiet_prompt_omits_reasons_and_warnings() {
+        let mut suggested = choice("kubectl get pods", &["acts on the resource `pods`"]);
+        suggested.reason = Some("kubectll → kubectl, pids → pods".into());
+        assert!(describe(&suggested, false).is_empty());
+        assert_eq!(
+            describe(&suggested, true),
+            [
+                "kubectll → kubectl, pids → pods",
+                "warning: acts on the resource `pods`"
+            ]
+        );
     }
 
     #[test]

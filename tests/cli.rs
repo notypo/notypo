@@ -463,6 +463,51 @@ fn zsh_alias_does_not_save_the_session_from_completion_capture() {
     );
 }
 
+#[test]
+fn zsh_alias_ignores_shell_operators_in_completion_capture() {
+    let Some(zsh) = notypo::utils::which("zsh") else {
+        return;
+    };
+    let workspace = Workspace::new();
+    let output = finish(
+        workspace
+            .command("git_not_command")
+            .env("TF_SHELL", "zsh")
+            .arg("--alias")
+            .spawn()
+            .unwrap(),
+    );
+    assert!(output.status.success());
+    let alias = String::from_utf8(output.stdout).unwrap();
+    // A history event containing `;` is split into words by ${(z)}. A
+    // separator must not be used as an associative-array subscript, which
+    // zsh reports as a bad math expression.
+    let script = format!(
+        "unset _comps\n\
+         {alias}\
+         print -s -- 'echo a; echo b'\n\
+         t --json\n"
+    );
+    let output = finish(
+        workspace
+            .program(&zsh, "git_not_command")
+            .env("TF_SHELL", "zsh")
+            .args(["-f", "-i", "-c", &script])
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("bad math expression"),
+        "zsh reported an error while reading history: {stderr}"
+    );
+}
+
 /// A fake `aws` whose `aws_completer` answers from a small command tree.
 /// Running `aws` itself would leave a `ran` marker.
 fn fake_aws(workspace: &Workspace) -> PathBuf {
